@@ -58,13 +58,12 @@ INDEX_CONFIGS = {
 }
 
 STRATEGIES = [
-    StrategyConfig("S0920", "09:20:00", 1, 20.0, 16000.0),
-    StrategyConfig("S1001", "11:12:00", 1, 20.0, 30000.0),
-    StrategyConfig("S1240", "12:40:00", 1, 35.0, 16000.0),
-    StrategyConfig("S1350", "13:50:00", 1, 35.0, 16000.0),
+    StrategyConfig("S0921", "09:21:00", 2, 20.0, 4000.0),
+    StrategyConfig("S1001", "10:01:00", 4, 25.0, 8000.0),
+    StrategyConfig("S1255", "12:55:00", 2, 35.0, 4000.0)
 ]
 
-PORTFOLIO_SL_LIMIT = -80000.0
+PORTFOLIO_SL_LIMIT = -16000.0
 SOURCE = "WEBAPI"
 DEMO_MODE = os.getenv("DEMO_MODE", "False").lower() in ("true", "1", "yes")  # Reads from environment variable
 SSM_BASE_PATH = "/trade/config"
