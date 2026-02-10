@@ -321,7 +321,7 @@ def main() -> None:
         _schedule_jobs(client, index_config, expiry)
 
     from threading import Thread
-    ui_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=8001, debug=False, use_reloader=False))
+    ui_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False))
     ui_thread.daemon = True
     ui_thread.start()
 
