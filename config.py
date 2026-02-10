@@ -72,7 +72,7 @@ ACC_NAME = os.getenv("ACC_NAME")
 
 
 def _get_ssm_param(param_name: str) -> str:
-    client = boto3.client("ssm")
+    client = boto3.client("ssm", region_name="ap-south-1")
     response = client.get_parameter(Name=param_name, WithDecryption=True)
     return response["Parameter"]["Value"]
 
