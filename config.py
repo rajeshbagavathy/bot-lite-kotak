@@ -58,16 +58,23 @@ INDEX_CONFIGS = {
 }
 
 STRATEGIES = [
-    StrategyConfig("S0921", "09:21:00", 2, 20.0, 4000.0),
-    StrategyConfig("S1001", "10:01:00", 4, 25.0, 8000.0),
-    StrategyConfig("S1255", "12:55:00", 2, 35.0, 4000.0)
+    StrategyConfig("S0921", "09:21:00", 5, 20.0, 10000.0),
+    StrategyConfig("S0955", "09:55:00", 5, 30.0, 10000.0),
+    StrategyConfig("S1005", "10:05:00", 5, 30.0, 10000.0),
+    StrategyConfig("S1045", "10:45:00", 5, 35.0, 10000.0),
+    StrategyConfig("S1305", "13:05:00", 5, 35.0, 10000.0),
 ]
 
-PORTFOLIO_SL_LIMIT = -16000.0
+PORTFOLIO_SL_LIMIT = -50000.0
 SOURCE = "WEBAPI"
 DEMO_MODE = os.getenv("DEMO_MODE", "False").lower() in ("true", "1", "yes")  # Reads from environment variable
 SSM_BASE_PATH = "/trade/config"
 ACC_NAME = os.getenv("ACC_NAME")
+
+# Database configuration
+DB_PATH = os.getenv("DB_PATH", "trades.db")
+DB_RETENTION_DAYS = int(os.getenv("DB_RETENTION_DAYS", "30"))
+DB_ENABLE_MTM_SNAPSHOTS = os.getenv("DB_ENABLE_MTM_SNAPSHOTS", "false").lower() in ("true", "1", "yes")
 
 
 def _get_ssm_param(param_name: str) -> str:
@@ -91,11 +98,11 @@ def _get_env_or_ssm(env_key: str, ssm_key: str) -> str:
 
 def load_credentials() -> dict:
     return {
-        "api_key": _get_env_or_ssm("XTS_API_KEY_5P", "apikey"),
-        "api_secret": _get_env_or_ssm("XTS_API_SECRET_5P", "apisecret"),
-        "client_id": _get_env_or_ssm("XTS_5P_CLIENTID_5P", "clientid"),
-        "market_api_key": _get_env_or_ssm("XTS_MARKET_API_KEY_5P", "marketdataapikey"),
-        "market_api_secret": _get_env_or_ssm("XTS_MARKET_API_SECRET_5P", "marketdataapisecret"),
+        "api_key": _get_env_or_ssm("XTS_API_KEY_5P_S", "apikey"),
+        "api_secret": _get_env_or_ssm("XTS_API_SECRET_5P_S", "apisecret"),
+        "client_id": _get_env_or_ssm("XTS_5P_CLIENTID_5P_S", "clientid"),
+        "market_api_key": _get_env_or_ssm("XTS_MARKET_API_KEY_5P_S", "marketdataapikey"),
+        "market_api_secret": _get_env_or_ssm("XTS_MARKET_API_SECRET_5P_S", "marketdataapisecret"),
         "login_username": _get_env_or_ssm("LOGIN_USERNAME_5P", "loginusername"),
         "login_password": _get_env_or_ssm("LOGIN_PASSWORD_5P", "loginpassword"),
     }

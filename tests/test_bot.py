@@ -187,7 +187,7 @@ class TestPlaceLegSLOrders(unittest.TestCase):
         """Test successful SL order placement."""
         self.client.place_sl_order.side_effect = ["SL_ORDER_1", "SL_ORDER_2"]
         
-        sl_orders = bot._place_leg_sl_orders(
+        sl_orders, tag_map = bot._place_leg_sl_orders(
             self.client,
             self.index_config,
             self.filled_orders,
@@ -199,6 +199,10 @@ class TestPlaceLegSLOrders(unittest.TestCase):
         self.assertEqual(sl_orders[0]["app_order_id"], "SL_ORDER_1")
         self.assertIn("S0920_SL_NIFTY26FEB21900CE", sl_orders[0]["tag"])
         
+        # Verify tag map is populated
+        self.assertEqual(len(tag_map), 2)
+        self.assertIn(sl_orders[0]["tag"], tag_map)
+        
         # Verify SL price calculations
         # CE: 150.50 * 1.20 = 180.60
         # PE: 145.75 * 1.20 = 174.90
@@ -208,7 +212,7 @@ class TestPlaceLegSLOrders(unittest.TestCase):
         """Test SL order placement when some orders fail."""
         self.client.place_sl_order.side_effect = ["SL_ORDER_1", None]
         
-        sl_orders = bot._place_leg_sl_orders(
+        sl_orders, tag_map = bot._place_leg_sl_orders(
             self.client,
             self.index_config,
             self.filled_orders,
@@ -219,6 +223,7 @@ class TestPlaceLegSLOrders(unittest.TestCase):
         # Only the successful order should be in the list
         self.assertEqual(len(sl_orders), 1)
         self.assertEqual(sl_orders[0]["app_order_id"], "SL_ORDER_1")
+        self.assertEqual(len(tag_map), 1)
 
 
 class TestGetFilledOrders(unittest.TestCase):
@@ -327,7 +332,7 @@ class TestExecuteStrategy(unittest.TestCase):
         self.client.place_market_order.side_effect = ["CE_ORDER_ID", "PE_ORDER_ID"]
         self.client.get_order_book.return_value = []
         mock_filled.return_value = []
-        mock_place_sl.return_value = []
+        mock_place_sl.return_value = ([], {})  # Return tuple: (sl_orders, tag_map)
         
         strategy = {
             "status": "PENDING",
@@ -342,9 +347,9 @@ class TestExecuteStrategy(unittest.TestCase):
         # Verify orders placed
         self.assertEqual(self.client.place_market_order.call_count, 2)
         
-        # Verify strategy updated
+        # Verify strategy updated (3 times: OPEN, db_id, sl_orders)
         update_calls = [call for call in mock_update.call_args_list]
-        self.assertEqual(len(update_calls), 2)  # Once for OPEN, once for sl_orders
+        self.assertEqual(len(update_calls), 3)
 
 
 class TestClosePositionsForInstruments(unittest.TestCase):

@@ -17,6 +17,19 @@ from config import (
     get_basic_auth_creds,
     load_credentials,
 )
+from db import (
+    init_db,
+    log_strategy_execution,
+    log_position,
+    log_order,
+    update_order_status,
+    update_position_exit,
+    log_trade_closed,
+    log_mtm_snapshot,
+    cleanup_old_data,
+    restore_todays_strategies,
+    get_ist_timestamp,
+)
 from mtm import calculate_mtm, calculate_strategy_mtm
 from state import init_state, set_index, set_spot, update_portfolio, update_strategy
 from ui import create_app
@@ -71,8 +84,10 @@ def _place_leg_sl_orders(
     filled_orders: List[dict],
     leg_sl_pct: float,
     strategy_name: str,
-) -> List[dict]:
+) -> Tuple[List[dict], Dict[str, int]]:
+    """Place SL orders and return (sl_orders, tag_to_instrument_map)"""
     sl_orders = []
+    tag_to_instrument = {}
     for order in filled_orders:
         # Calculate raw SL price
         raw_price = float(order["OrderAverageTradedPrice"]) * (1 + leg_sl_pct / 100.0)
@@ -82,9 +97,10 @@ def _place_leg_sl_orders(
         trigger = _round_to_tick(max(price - 0.5, 0.05), index_config.tick_size)
         
         tag = f"{strategy_name}_SL_{order['TradingSymbol']}_{int(time.time())}"
+        instrument_id = int(order["ExchangeInstrumentID"])
         order_id = client.place_sl_order(
             index_config=index_config,
-            instrument_id=int(order["ExchangeInstrumentID"]),
+            instrument_id=instrument_id,
             order_side=client.interactive.TRANSACTION_TYPE_BUY,
             quantity=int(order["OrderQuantity"]),
             limit_price=price,
@@ -94,7 +110,8 @@ def _place_leg_sl_orders(
         )
         if order_id:
             sl_orders.append({"app_order_id": order_id, "tag": tag})
-    return sl_orders
+            tag_to_instrument[tag] = instrument_id
+    return sl_orders, tag_to_instrument
 
 
 def _get_filled_orders(order_book: List[dict], tags: List[str]) -> List[dict]:
@@ -142,13 +159,24 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
         status="OPEN",
         strike=strike,
         instrument_ids=[ce_id, pe_id],
-        entry_time=datetime.datetime.now().isoformat(timespec="seconds"),
+        entry_time=get_ist_timestamp(),
         order_tags=[ce_tag, pe_tag],
     )
 
+    # Log strategy execution to database
+    strategy_db_id = log_strategy_execution(
+        name,
+        strike,
+        get_ist_timestamp(),
+        strategy.get("lots", 0),
+        strategy.get("leg_sl_pct", 0.0),
+        strategy.get("strategy_sl", 0.0),
+    )
+    update_strategy(name, db_id=strategy_db_id)
+
     time.sleep(5)
     filled = _get_filled_orders(client.get_order_book(), [ce_tag, pe_tag])
-    sl_orders = _place_leg_sl_orders(client, index_config, filled, strategy["leg_sl_pct"], name)
+    sl_orders, tag_to_instrument = _place_leg_sl_orders(client, index_config, filled, strategy["leg_sl_pct"], name)
     positions = []
     for order in filled:
         try:
@@ -162,10 +190,21 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
                 "instrument_id": instrument_id,
                 "quantity": quantity,
                 "entry_price": entry_price,
+                "exit_price": None,
                 "symbol": order.get("TradingSymbol"),
             }
         )
-    update_strategy(name, sl_orders=sl_orders, positions=positions)
+        # Log position to database
+        if strategy["db_id"] and strategy["db_id"] > 0:
+            log_position(
+                strategy["db_id"],
+                order.get("TradingSymbol"),
+                instrument_id,
+                quantity,
+                entry_price,
+                get_ist_timestamp(),
+            )
+    update_strategy(name, sl_orders=sl_orders, positions=positions, sl_tag_map=tag_to_instrument)
 
 
 def _place_close_order(client: XTSClient, index_config, pos: dict, tag_prefix: str) -> None:
@@ -206,6 +245,21 @@ def _close_strategy(client: XTSClient, index_config, strategy: dict, positions: 
     update_strategy(strategy["name"], status="CLOSING", message=reason)
     _close_positions_for_instruments(client, index_config, positions, strategy.get("instrument_ids", []))
     _cancel_strategy_sl_orders(client, strategy)
+    
+    # Log closed trade to database
+    db_id = strategy.get("db_id")
+    if db_id and db_id > 0:
+        exit_time = get_ist_timestamp()
+        log_trade_closed(
+            strategy.get("name", ""),
+            strategy.get("strike"),
+            strategy.get("entry_time"),
+            exit_time,
+            strategy.get("realized", 0.0),
+            strategy.get("mtm", 0.0),
+            reason,
+        )
+    
     update_strategy(strategy["name"], status="CLOSED", positions=[])
 
 
@@ -213,6 +267,39 @@ def _square_off_all(client: XTSClient, index_config, positions: List[dict], reas
     logger.warning("Square-off all positions: %s", reason)
     for pos in positions:
         _place_close_order(client, index_config, pos, "SQUAREOFF")
+
+
+def _capture_sl_exit_prices(client: XTSClient, strategy: dict) -> None:
+    """Capture exit prices from filled SL orders and update strategy positions."""
+    if strategy["status"] != "OPEN" or not strategy.get("sl_tag_map"):
+        return
+    
+    order_book = client.get_order_book()
+    sl_tags = set(sl["tag"] for sl in strategy.get("sl_orders", []))
+    filled_sl_orders = {o["OrderUniqueIdentifier"]: o for o in order_book 
+                        if o.get("OrderUniqueIdentifier") in sl_tags and o.get("OrderStatus") == "Filled"}
+    
+    for pos in strategy.get("positions", []):
+        if pos.get("exit_price") is not None:
+            continue
+        instrument_id = pos["instrument_id"]
+        for tag, instr_id in strategy.get("sl_tag_map", {}).items():
+            if instr_id == instrument_id and tag in filled_sl_orders:
+                try:
+                    exit_price = float(filled_sl_orders[tag].get("OrderAverageTradedPrice", 0.0))
+                    if exit_price > 0:
+                        pos["exit_price"] = exit_price
+                        logger.info(f"Captured SL exit price for {strategy['name']} instrument {instrument_id}: {exit_price}")
+                        # Log exit price to database
+                        if strategy["db_id"] and strategy["db_id"] > 0:
+                            update_position_exit(
+                                strategy["db_id"],
+                                instrument_id,
+                                exit_price,
+                                get_ist_timestamp(),
+                            )
+                except (TypeError, ValueError):
+                    pass
 
 
 def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
@@ -227,6 +314,7 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
     update_portfolio(overall, realized, unrealized, portfolio_sl)
 
     for strategy in STRATEGY_STATE.values():
+        _capture_sl_exit_prices(client, strategy)
         strategy_positions = strategy.get("positions") or []
         if not strategy_positions:
             continue
@@ -248,6 +336,7 @@ STRATEGY_STATE: Dict[str, dict] = {
         "status": "PENDING", "mtm": 0.0, "realized": 0.0, "unrealized": 0.0,
         "strike": None, "instrument_ids": [], "sl_orders": [], "positions": [],
         "order_tags": [], "entry_time": None, "message": None, "last_update": None,
+        "sl_tag_map": {}, "db_id": None,
     }
     for cfg in STRATEGIES
 }
@@ -273,6 +362,7 @@ def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
             )
 
     schedule.every(3).seconds.do(_monitor_mtm, client=client, index_config=index_config, portfolio_sl=PORTFOLIO_SL_LIMIT)
+    schedule.every().day.at("00:00").do(cleanup_old_data)
 
 
 def main() -> None:
@@ -313,6 +403,23 @@ def main() -> None:
         index_config, expiry = _pick_index_and_expiry(client)
 
     logger.info("Index: %s | Expiry: %s", index_config.name, expiry)
+    init_db()
+    
+    # Restore today's open strategies from database (before init_state)
+    if not DEMO_MODE:
+        restored = restore_todays_strategies()
+        for restored_strategy in restored:
+            strategy_name = restored_strategy["strategy_name"]
+            if strategy_name in STRATEGY_STATE:
+                logger.info(f"Restoring {strategy_name} from database...")
+                STRATEGY_STATE[strategy_name].update({
+                    "db_id": restored_strategy["db_id"],
+                    "status": "OPEN",
+                    "strike": restored_strategy["strike"],
+                    "entry_time": restored_strategy["entry_time"],
+                    "positions": restored_strategy["positions"],
+                })
+    
     init_state(STRATEGY_STATE)
     set_index(index_config.name, expiry)
 

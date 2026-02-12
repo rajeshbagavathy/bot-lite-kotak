@@ -78,15 +78,24 @@ def calculate_strategy_mtm(
     strategy_positions: Iterable[dict],
     ltp_map: Dict[int, float],
 ) -> Tuple[float, float, float]:
-    total = 0.0
+    """Calculate strategy MTM using exit_price if available (realized), else LTP (unrealized)."""
+    realized = 0.0
+    unrealized = 0.0
     for pos in strategy_positions:
         instrument_id = _safe_int(pos.get("instrument_id"))
         if instrument_id == 0:
             continue
-        ltp = ltp_map.get(instrument_id)
-        if ltp is None:
-            continue
         entry_price = _safe_float(pos.get("entry_price"))
         quantity = _safe_int(pos.get("quantity"))
-        total += (ltp - entry_price) * quantity
-    return 0.0, total, total
+        exit_price = pos.get("exit_price")
+        
+        if exit_price is not None:
+            exit_price = _safe_float(exit_price)
+            realized += (exit_price - entry_price) * quantity
+        else:
+            ltp = ltp_map.get(instrument_id)
+            if ltp is not None:
+                unrealized += (ltp - entry_price) * quantity
+    
+    total = realized + unrealized
+    return realized, unrealized, total
