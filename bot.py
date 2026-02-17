@@ -303,42 +303,36 @@ def _capture_sl_exit_prices(client: XTSClient, strategy: dict) -> None:
 
 
 def _sync_strategy_positions_from_broker(strategy: dict, broker_positions: List[dict]) -> None:
-    """Sync strategy positions with actual broker positions for this strategy's instruments."""
+    """Check if strategy positions still exist on broker (detect manual closures)."""
     instrument_ids = set(strategy.get("instrument_ids", []))
-    if not instrument_ids:
+    local_positions = strategy.get("positions") or []
+    
+    if not instrument_ids or not local_positions:
         return
     
-    # Find all broker positions matching this strategy's instruments
-    synced_positions = []
+    # Build map of broker positions by instrument_id
+    broker_map = {}
     for broker_pos in broker_positions:
         broker_instrument_id = int(broker_pos.get("ExchangeInstrumentId", 0))
-        if broker_instrument_id not in instrument_ids:
-            continue
-        
-        # Preserve local entry/exit prices if available
-        local_position = None
-        if strategy.get("positions"):
-            local_position = next(
-                (p for p in strategy["positions"] if p.get("instrument_id") == broker_instrument_id),
-                None,
-            )
-        
         quantity = int(broker_pos.get("Quantity", 0))
-        if quantity == 0:
-            continue
-        
-        synced_positions.append(
-            {
-                "instrument_id": broker_instrument_id,
-                "quantity": quantity,
-                "entry_price": local_position.get("entry_price") if local_position else 0.0,
-                "exit_price": local_position.get("exit_price") if local_position else None,
-                "symbol": broker_pos.get("TradingSymbol", ""),
-            }
-        )
+        broker_map[broker_instrument_id] = quantity
     
-    if synced_positions:
-        update_strategy(strategy["name"], positions=synced_positions)
+    # Check if strategy's instruments still have positions on broker
+    has_any_position = False
+    for instrument_id in instrument_ids:
+        broker_qty = broker_map.get(instrument_id, 0)
+        if broker_qty != 0:
+            has_any_position = True
+            break
+    
+    # If ALL positions for this strategy are squared off on broker, close the strategy
+    if not has_any_position and strategy.get("status") == "OPEN":
+        update_strategy(
+            strategy["name"], 
+            status="CLOSED", 
+            message="All positions squared off manually",
+            positions=[]
+        )
 
 
 def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
