@@ -58,11 +58,11 @@ INDEX_CONFIGS = {
 }
 
 STRATEGIES = [
-    StrategyConfig("S0921", "09:21:00", 5, 20.0, 10000.0),
-    StrategyConfig("S0955", "09:55:00", 5, 30.0, 10000.0),
-    StrategyConfig("S1005", "10:05:00", 5, 30.0, 10000.0),
-    StrategyConfig("S1045", "10:45:00", 5, 35.0, 10000.0),
-    StrategyConfig("S1305", "13:05:00", 5, 35.0, 10000.0),
+    StrategyConfig("S0921", "09:21:00", 7, 20.0, 10000.0),
+    StrategyConfig("S0955", "09:50:00", 7, 30.0, 10000.0),
+    StrategyConfig("S1005", "10:05:00", 7, 30.0, 10000.0),
+    StrategyConfig("S1045", "10:45:00", 7, 35.0, 10000.0),
+    StrategyConfig("S1205", "12:55:00", 7, 35.0, 10000.0),
 ]
 
 PORTFOLIO_SL_LIMIT = -50000.0
