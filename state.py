@@ -1,7 +1,7 @@
 import copy
 import datetime
 from threading import Lock
-from typing import Dict
+from typing import Dict, Optional
 
 STATE_LOCK = Lock()
 STATE: Dict[str, dict] = {
@@ -19,7 +19,9 @@ def init_state(strategies: Dict[str, dict]) -> None:
             "realized": 0.0,
             "unrealized": 0.0,
             "sl_limit": None,
+            "available_margin": None,
             "last_update": None,
+            "margin_update": None,
         }
         STATE["strategies"] = strategies
 
@@ -42,6 +44,12 @@ def update_portfolio(mtm: float, realized: float, unrealized: float, sl_limit: f
         STATE["portfolio"]["unrealized"] = unrealized
         STATE["portfolio"]["sl_limit"] = sl_limit
         STATE["portfolio"]["last_update"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def update_portfolio_margin(available_margin: Optional[float]) -> None:
+    with STATE_LOCK:
+        STATE["portfolio"]["available_margin"] = available_margin
+        STATE["portfolio"]["margin_update"] = datetime.datetime.now().isoformat(timespec="seconds")
 
 
 def update_strategy(name: str, **fields) -> None:

@@ -72,6 +72,21 @@ class XTSClient:
             return result.get("result")
         return []
 
+    def get_available_margin(self) -> Optional[float]:
+        result = self.interactive.get_balance(self.client_id)
+        if not result or not result.get("result"):
+            return None
+        balance_list = result.get("result", {}).get("BalanceList") or []
+        if not balance_list:
+            return None
+        limit_obj = balance_list[0].get("limitObject") or {}
+        rms_limits = limit_obj.get("RMSSubLimits") or {}
+        available = rms_limits.get("netMarginAvailable")
+        try:
+            return round(float(available))
+        except (TypeError, ValueError):
+            return None
+
     def get_ltp_map(self, instruments: List[dict]) -> Dict[int, float]:
         ltp_map: Dict[int, float] = {}
         if not instruments:

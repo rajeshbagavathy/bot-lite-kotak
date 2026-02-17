@@ -31,7 +31,7 @@ from db import (
     get_ist_timestamp,
 )
 from mtm import calculate_mtm, calculate_strategy_mtm
-from state import init_state, set_index, set_spot, update_portfolio, update_strategy
+from state import init_state, set_index, set_spot, update_portfolio, update_portfolio_margin, update_strategy
 from ui import create_app
 from xts_client import XTSClient
 
@@ -302,6 +302,45 @@ def _capture_sl_exit_prices(client: XTSClient, strategy: dict) -> None:
                     pass
 
 
+def _sync_strategy_positions_from_broker(strategy: dict, broker_positions: List[dict]) -> None:
+    """Sync strategy positions with actual broker positions for this strategy's instruments."""
+    instrument_ids = set(strategy.get("instrument_ids", []))
+    if not instrument_ids:
+        return
+    
+    # Find all broker positions matching this strategy's instruments
+    synced_positions = []
+    for broker_pos in broker_positions:
+        broker_instrument_id = int(broker_pos.get("ExchangeInstrumentId", 0))
+        if broker_instrument_id not in instrument_ids:
+            continue
+        
+        # Preserve local entry/exit prices if available
+        local_position = None
+        if strategy.get("positions"):
+            local_position = next(
+                (p for p in strategy["positions"] if p.get("instrument_id") == broker_instrument_id),
+                None,
+            )
+        
+        quantity = int(broker_pos.get("Quantity", 0))
+        if quantity == 0:
+            continue
+        
+        synced_positions.append(
+            {
+                "instrument_id": broker_instrument_id,
+                "quantity": quantity,
+                "entry_price": local_position.get("entry_price") if local_position else 0.0,
+                "exit_price": local_position.get("exit_price") if local_position else None,
+                "symbol": broker_pos.get("TradingSymbol", ""),
+            }
+        )
+    
+    if synced_positions:
+        update_strategy(strategy["name"], positions=synced_positions)
+
+
 def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
     positions = client.get_positions()
     instruments = [
@@ -315,11 +354,17 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
 
     for strategy in STRATEGY_STATE.values():
         _capture_sl_exit_prices(client, strategy)
+        
+        # Sync strategy positions with broker positions to keep state real-time
+        _sync_strategy_positions_from_broker(strategy, positions)
+        
         strategy_positions = strategy.get("positions") or []
         if not strategy_positions:
             continue
         s_realized, s_unrealized, s_total = calculate_strategy_mtm(strategy_positions, ltp_map)
         update_strategy(strategy["name"], mtm=s_total, realized=s_realized, unrealized=s_unrealized)
+        
+        # Now s_total is based on actual broker positions (synced), not stale local data
         if strategy["status"] == "OPEN" and s_total <= -float(strategy["strategy_sl"]):
             _close_strategy(client, index_config, strategy, positions, "Strategy SL hit")
 
@@ -327,6 +372,15 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         _square_off_all(client, index_config, positions, "Portfolio SL hit")
         for strategy in STRATEGY_STATE.values():
             update_strategy(strategy["name"], status="CLOSED", message="Portfolio SL hit", positions=[])
+
+
+def _update_available_margin(client: XTSClient) -> None:
+    try:
+        available_margin = client.get_available_margin()
+    except Exception:
+        logger.exception("Failed to fetch available margin")
+        return
+    update_portfolio_margin(available_margin)
 
 
 STRATEGY_STATE: Dict[str, dict] = {
@@ -362,6 +416,7 @@ def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
             )
 
     schedule.every(3).seconds.do(_monitor_mtm, client=client, index_config=index_config, portfolio_sl=PORTFOLIO_SL_LIMIT)
+    schedule.every(60).seconds.do(_update_available_margin, client=client)
     schedule.every().day.at("00:00").do(cleanup_old_data)
 
 
@@ -436,6 +491,7 @@ def main() -> None:
 
     if DEMO_MODE:
         update_portfolio(2500.50, 1200.25, 1300.25, PORTFOLIO_SL_LIMIT)
+        update_portfolio_margin(250000.0)
         for idx, strategy in enumerate(STRATEGY_STATE.values()):
             update_strategy(
                 strategy["name"],

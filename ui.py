@@ -177,12 +177,20 @@ DASHBOARD_TEMPLATE = """
             <div class="meta-label">Portfolio MTM</div>
             <div class="meta-value ${getClass(portfolio.mtm)}">${fmt(portfolio.mtm)}</div>
           </div>
+          <div class="meta-item">
+            <div class="meta-label">Available Margin</div>
+            <div class="meta-value">${fmt(portfolio.available_margin)}</div>
+          </div>
         `;
 
         document.getElementById('portfolio-status').innerHTML = `
           <div class="metric">
             <span class="metric-label">MTM</span>
             <span class="metric-value ${getClass(portfolio.mtm)}">${fmt(portfolio.mtm)}</span>
+          </div>
+          <div class="metric">
+            <span class="metric-label">Available Margin</span>
+            <span class="metric-value">${fmt(portfolio.available_margin)}</span>
           </div>
           <div class="metric">
             <span class="metric-label">SL Limit</span>
@@ -383,7 +391,7 @@ HTML_TEMPLATE = """
       const mtmClass = portfolio.mtm < 0 ? 'negative' : 'positive';
       document.getElementById('meta').innerHTML =
         `Index: <b>${idx.name || '-'}</b> | Expiry: <b>${idx.expiry || '-'}</b> | Spot: <b>${idx.spot || '-'}</b><br>` +
-        `Portfolio MTM: <span class="${mtmClass}">${fmt(portfolio.mtm)}</span> | SL Limit: ${fmt(portfolio.sl_limit)} | Updated: ${portfolio.last_update || '-'}`;
+        `Portfolio MTM: <span class="${mtmClass}">${fmt(portfolio.mtm)}</span> | Available Margin: ${fmt(portfolio.available_margin)} | SL Limit: ${fmt(portfolio.sl_limit)} | Updated: ${portfolio.last_update || '-'}`;
 
       const tbody = document.getElementById('strategy-rows');
       tbody.innerHTML = '';
