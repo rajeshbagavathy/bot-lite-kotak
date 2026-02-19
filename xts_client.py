@@ -176,3 +176,42 @@ class XTSClient:
 
     def cancel_all_orders(self, index_config: IndexConfig, instrument_id: int) -> None:
         self.interactive.cancelall_order(index_config.order_exchange_segment, instrument_id)
+
+    def modify_order(
+        self,
+        app_order_id: int,
+        product_type: str,
+        order_type: str,
+        quantity: int,
+        disclosed_quantity: int,
+        stop_price: float,
+        limit_price: float,
+        time_in_force: str,
+        tag: str,
+    ) -> None:
+        """
+        Modify an existing order (e.g., convert SL to market execution).
+        
+        Args:
+            app_order_id: AppOrderID of the order to modify
+            product_type: Product type (MIS, CNC, etc.)
+            order_type: New order type (MARKET, LIMIT, STOPLIMIT)
+            quantity: Order quantity
+            disclosed_quantity: Disclosed quantity
+            stop_price: Stop price (0 for market orders)
+            limit_price: Limit price (0 for market orders)
+            time_in_force: Time in force (DAY, etc.)
+            tag: Order unique identifier
+        """
+        self.interactive.modify_order(
+            app_order_id,
+            product_type,
+            order_type,
+            quantity,
+            disclosed_quantity,
+            stop_price,
+            limit_price,
+            time_in_force,
+            tag,
+            self.client_id,
+        )

@@ -47,7 +47,7 @@ xts-bot-lite/
 └── README.md              # This file
 ```
 
-**See [docs/PROJECT_ORGANIZATION.md](docs/PROJECT_ORGANIZATION.md) for complete details**
+**See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for complete system design and details**
 
 ## Installation
 

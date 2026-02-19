@@ -464,25 +464,29 @@ class TestCancelStrategySLOrders(unittest.TestCase):
 class TestCloseStrategy(unittest.TestCase):
     """Test _close_strategy() function."""
 
-    @patch("bot._cancel_strategy_sl_orders")
-    @patch("bot._close_positions_for_instruments")
+    @patch("bot._close_strategy_via_open_sl_orders")
     @patch("bot.update_strategy")
-    def test_close_strategy_success(self, mock_update, mock_close_pos, mock_cancel_sl):
-        """Test successful strategy closure."""
+    def test_close_strategy_success(self, mock_update, mock_close_via_sl):
+        """Test successful strategy closure using SL orders."""
         client = MagicMock()
         index_config = MagicMock()
         strategy = {
             "name": "S0920",
             "status": "OPEN",
-            "instrument_ids": [12345, 67890],
+            "positions": [
+                {"instrument_id": 12345, "quantity": -520, "entry_price": 150.0},
+            ],
+            "db_id": 1,
+            "strike": 21900,
+            "entry_time": "2026-02-08T09:20:01",
         }
         positions = []
         
         bot._close_strategy(client, index_config, strategy, positions, "Test closure")
         
+        # Should call the NEW SL-based closing function (no index_config parameter)
+        mock_close_via_sl.assert_called_once_with(client, strategy)
         mock_update.assert_any_call("S0920", status="CLOSING", message="Test closure")
-        mock_close_pos.assert_called_once()
-        mock_cancel_sl.assert_called_once()
         mock_update.assert_any_call("S0920", status="CLOSED", positions=[])
 
     @patch("bot.update_strategy")
@@ -639,6 +643,78 @@ class TestMonitorMTM(unittest.TestCase):
         # All strategies should be marked CLOSED
         close_calls = [call for call in mock_update_strat.call_args_list if "CLOSED" in str(call)]
         self.assertGreaterEqual(len(close_calls), 2)
+
+    @patch("bot._close_strategy_via_open_sl_orders")
+    @patch("bot.update_strategy")
+    @patch("bot.calculate_strategy_mtm")
+    def test_monitor_mtm_multi_strategy_conflict_fix(
+        self, mock_calc_mtm_inst, mock_update_strat, mock_close_via_sl
+    ):
+        """
+        Test that closing one strategy via _close_strategy_via_open_sl_orders()
+        doesn't affect another strategy on the same instruments.
+        
+        Scenario:
+        - S0921 has -130 qty on CE 25950, PE 25950
+        - S1001 has -130 qty on CE 25950, PE 25950
+        - When S0921 SL hits, _close_strategy_via_open_sl_orders() is called with S0921's SL orders
+        - It should modify ONLY S0921's SL orders, NOT S1001's
+        """
+        # Setup: Two strategies on same instruments
+        ce_id = 12345
+        pe_id = 67890
+        
+        bot.STRATEGY_STATE = {
+            "S0921": {
+                "name": "S0921",
+                "status": "OPEN",
+                "instrument_ids": [ce_id, pe_id],
+                "positions": [
+                    {"instrument_id": ce_id, "quantity": -130, "entry_price": 150.0},
+                    {"instrument_id": pe_id, "quantity": -130, "entry_price": 145.0},
+                ],
+                "strategy_sl": 4000.0,
+                "sl_orders": [
+                    {"app_order_id": 101, "tag": "S0921_SL_CE"},
+                    {"app_order_id": 102, "tag": "S0921_SL_PE"},
+                ],
+            },
+            "S1001": {
+                "name": "S1001",
+                "status": "OPEN",
+                "instrument_ids": [ce_id, pe_id],
+                "positions": [
+                    {"instrument_id": ce_id, "quantity": -130, "entry_price": 152.0},
+                    {"instrument_id": pe_id, "quantity": -130, "entry_price": 147.0},
+                ],
+                "strategy_sl": 30000.0,
+                "sl_orders": [
+                    {"app_order_id": 201, "tag": "S1001_SL_CE"},
+                    {"app_order_id": 202, "tag": "S1001_SL_PE"},
+                ],
+            },
+        }
+        
+        # S0921's MTM hits its SL, but S1001's doesn't
+        positions = []
+        self.client.get_positions.return_value = positions
+        self.client.get_ltp_map.return_value = {}
+        
+        mock_calc_return_values = [
+            (0.0, -4500.0, -4500.0),   # S0921: hits -4000 SL
+            (0.0, -100.0, -100.0),     # S1001: doesn't hit SL
+        ]
+        mock_calc_mtm_inst.side_effect = mock_calc_return_values
+        
+        bot._monitor_mtm(self.client, self.index_config, -80000.0)
+        
+        # Verify _close_strategy_via_open_sl_orders was called for S0921
+        self.assertEqual(mock_close_via_sl.call_count, 1)
+        
+        # Verify it was called with S0921's data
+        call_args = mock_close_via_sl.call_args[0]
+        strategy_arg = call_args[1]
+        self.assertEqual(strategy_arg["name"], "S0921")
 
 
 class TestScheduleJobs(unittest.TestCase):
@@ -826,6 +902,554 @@ class TestAppStartTime(unittest.TestCase):
     def test_app_start_time_set(self):
         """Test that APP_START_TIME is set."""
         self.assertIsInstance(bot.APP_START_TIME, datetime.datetime)
+
+
+class TestSyncSLOrderStatusAndCaptureExits(unittest.TestCase):
+    """Test _sync_sl_order_status_and_capture_exits() - Order book monitoring."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.mock_client = MagicMock()
+        self.strategy = {
+            "name": "S0921",
+            "status": "OPEN",
+            "db_id": 1,
+            "sl_orders": [
+                {"tag": "S0921_SL_CE_19900", "app_order_id": "app_1"},
+                {"tag": "S0921_SL_PE_19900", "app_order_id": "app_2"},
+            ],
+            "sl_tag_map": {
+                "S0921_SL_CE_19900": 12345,
+                "S0921_SL_PE_19900": 12346,
+            },
+            "positions": [
+                {
+                    "instrument_id": 12345,
+                    "quantity": -260,
+                    "entry_price": 150.0,
+                    "exit_price": None,
+                    "symbol": "NIFTY19900CE",
+                },
+                {
+                    "instrument_id": 12346,
+                    "quantity": -260,
+                    "entry_price": 100.0,
+                    "exit_price": None,
+                    "symbol": "NIFTY19900PE",
+                },
+            ],
+        }
+
+    def test_skips_if_strategy_not_open(self):
+        """Should skip if strategy status is not OPEN."""
+        self.strategy["status"] = "CLOSED"
+        with patch("bot.logger"):
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Positions should still be open (no exit_price set)
+        self.assertIsNone(self.strategy["positions"][0]["exit_price"])
+
+    def test_skips_if_no_sl_orders(self):
+        """Should skip if strategy has no SL orders."""
+        self.strategy["sl_orders"] = None
+        with patch("bot.logger"):
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Positions should remain unchanged
+        self.assertIsNone(self.strategy["positions"][0]["exit_price"])
+
+    def test_handles_demo_mode_gracefully(self):
+        """Should handle DEMO_MODE (client is None) without crashing."""
+        with patch("bot.logger") as mock_logger:
+            bot._sync_sl_order_status_and_capture_exits(None, self.strategy)
+        
+        # Should log debug message and return gracefully
+        self.assertTrue(mock_logger.debug.called)
+        self.assertIsNone(self.strategy["positions"][0]["exit_price"])
+
+    def test_handles_order_book_fetch_error(self):
+        """Should handle order book fetch errors gracefully."""
+        self.mock_client.get_order_book.side_effect = Exception("API error")
+        
+        with patch("bot.logger") as mock_logger:
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Should log error and return gracefully
+        self.assertTrue(mock_logger.error.called)
+        self.assertIsNone(self.strategy["positions"][0]["exit_price"])
+
+    def test_captures_exit_price_when_sl_filled(self):
+        """Should capture exit price when SL order is FILLED."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "FILLED",
+                "OrderAverageTradedPrice": 145.50,
+            },
+            {
+                "OrderUniqueIdentifier": "S0921_SL_PE_19900",
+                "OrderStatus": "FILLED",
+                "OrderAverageTradedPrice": 95.75,
+            },
+        ]
+        
+        with patch("bot.logger"), patch("bot.update_position_exit") as mock_update:
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Both positions should have exit prices
+        self.assertEqual(self.strategy["positions"][0]["exit_price"], 145.50)
+        self.assertEqual(self.strategy["positions"][1]["exit_price"], 95.75)
+        
+        # Database should be updated
+        self.assertEqual(mock_update.call_count, 2)
+
+    def test_sets_sl_status_when_pending(self):
+        """Should set sl_status when SL order is PENDING."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "PENDING",
+                "OrderAverageTradedPrice": 0,
+            },
+        ]
+        
+        with patch("bot.logger"):
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Position should have sl_status set to WAITING
+        self.assertEqual(self.strategy["positions"][0].get("sl_status"), "WAITING")
+        # But no exit price yet
+        self.assertIsNone(self.strategy["positions"][0]["exit_price"])
+
+    def test_warns_when_sl_rejected(self):
+        """Should warn when SL order is REJECTED."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "REJECTED",
+                "OrderAverageTradedPrice": 0,
+            },
+        ]
+        
+        with patch("bot.logger") as mock_logger:
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Should warn
+        self.assertTrue(mock_logger.warning.called)
+        # Position should have sl_status set to REJECTED
+        self.assertEqual(self.strategy["positions"][0].get("sl_status"), "REJECTED")
+
+    def test_ignores_missing_order_in_book(self):
+        """Should gracefully handle SL order not in order book."""
+        self.mock_client.get_order_book.return_value = []
+        
+        with patch("bot.logger"):
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Positions should remain unchanged
+        self.assertIsNone(self.strategy["positions"][0]["exit_price"])
+
+    def test_handles_invalid_exit_price(self):
+        """Should handle invalid/zero exit prices."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "FILLED",
+                "OrderAverageTradedPrice": 0,  # Invalid
+            },
+        ]
+        
+        with patch("bot.logger"):
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, self.strategy)
+        
+        # Position should NOT have exit price set
+        self.assertIsNone(self.strategy["positions"][0]["exit_price"])
+
+    def test_multi_strategy_isolation(self):
+        """Should not affect other strategies' positions."""
+        # Two strategies on same instrument
+        strategy_1 = {
+            "name": "S0921",
+            "status": "OPEN",
+            "db_id": 1,
+            "sl_orders": [{"tag": "S0921_SL_CE", "app_order_id": "app_1"}],
+            "sl_tag_map": {"S0921_SL_CE": 12345},
+            "positions": [
+                {"instrument_id": 12345, "exit_price": None, "symbol": "CE"}
+            ],
+        }
+        
+        strategy_2 = {
+            "name": "S0955",
+            "status": "OPEN",
+            "db_id": 2,
+            "sl_orders": [{"tag": "S0955_SL_CE", "app_order_id": "app_2"}],
+            "sl_tag_map": {"S0955_SL_CE": 12345},  # Same instrument!
+            "positions": [
+                {"instrument_id": 12345, "exit_price": None, "symbol": "CE"}
+            ],
+        }
+        
+        # Only S0921's SL is filled
+        self.mock_client.get_order_book.return_value = [
+            {
+                "OrderUniqueIdentifier": "S0921_SL_CE",
+                "OrderStatus": "FILLED",
+                "OrderAverageTradedPrice": 150.0,
+            },
+            {
+                "OrderUniqueIdentifier": "S0955_SL_CE",
+                "OrderStatus": "PENDING",
+                "OrderAverageTradedPrice": 0,
+            },
+        ]
+        
+        with patch("bot.logger"), patch("bot.update_position_exit"):
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, strategy_1)
+            bot._sync_sl_order_status_and_capture_exits(self.mock_client, strategy_2)
+        
+        # S0921 should be closed
+        self.assertEqual(strategy_1["positions"][0]["exit_price"], 150.0)
+        # S0955 should still be open
+        self.assertIsNone(strategy_2["positions"][0]["exit_price"])
+        self.assertEqual(strategy_2["positions"][0].get("sl_status"), "WAITING")
+
+
+class TestCheckAllPositionsClosed(unittest.TestCase):
+    """Test _check_all_positions_closed() helper function."""
+
+    def test_returns_true_when_no_positions(self):
+        """Should return True when strategy has no positions."""
+        strategy = {"positions": []}
+        self.assertTrue(bot._check_all_positions_closed(strategy))
+
+    def test_returns_true_when_all_positions_have_exit_price(self):
+        """Should return True when all positions have exit_price."""
+        strategy = {
+            "positions": [
+                {"exit_price": 150.0},
+                {"exit_price": 95.75},
+            ]
+        }
+        self.assertTrue(bot._check_all_positions_closed(strategy))
+
+    def test_returns_false_when_any_position_open(self):
+        """Should return False if any position has no exit_price."""
+        strategy = {
+            "positions": [
+                {"exit_price": 150.0},
+                {"exit_price": None},  # One still open
+            ]
+        }
+        self.assertFalse(bot._check_all_positions_closed(strategy))
+
+    def test_returns_false_when_all_positions_open(self):
+        """Should return False when no positions are closed."""
+        strategy = {
+            "positions": [
+                {"exit_price": None},
+                {"exit_price": None},
+            ]
+        }
+        self.assertFalse(bot._check_all_positions_closed(strategy))
+
+    def test_handles_missing_positions_key(self):
+        """Should handle missing 'positions' key gracefully."""
+        strategy = {}
+        self.assertTrue(bot._check_all_positions_closed(strategy))
+
+
+class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
+    """Test _close_strategy_via_open_sl_orders() - SL-based strategy closure."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.mock_client = MagicMock()
+        self.strategy = {
+            "name": "S0921",
+            "status": "OPEN",
+            "db_id": 1,
+            "sl_orders": [
+                {"tag": "S0921_SL_CE_19900", "app_order_id": 101},
+                {"tag": "S0921_SL_PE_19900", "app_order_id": 102},
+            ],
+            "positions": [
+                {
+                    "instrument_id": 12345,
+                    "quantity": -260,
+                    "entry_price": 150.0,
+                    "exit_price": None,
+                    "symbol": "NIFTY19900CE",
+                },
+                {
+                    "instrument_id": 12346,
+                    "quantity": -260,
+                    "entry_price": 100.0,
+                    "exit_price": None,
+                    "symbol": "NIFTY19900PE",
+                },
+            ],
+        }
+
+    def test_skips_if_no_sl_orders(self):
+        """Should skip if strategy has no SL orders."""
+        self.strategy["sl_orders"] = None
+        with patch("bot.logger"):
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # No API calls should be made
+        self.mock_client.get_order_book.assert_not_called()
+        self.mock_client.modify_order.assert_not_called()
+
+    def test_handles_order_book_fetch_error(self):
+        """Should handle order book fetch errors gracefully."""
+        self.mock_client.get_order_book.side_effect = Exception("API error")
+        
+        with patch("bot.logger") as mock_logger:
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # Should log error and return gracefully
+        self.assertTrue(mock_logger.error.called)
+        self.mock_client.modify_order.assert_not_called()
+
+    def test_both_sl_orders_open_modifies_both(self):
+        """Should modify both SL orders when both are NEW/REPLACED."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "AppOrderID": 101,
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "NEW",
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+            {
+                "AppOrderID": 102,
+                "OrderUniqueIdentifier": "S0921_SL_PE_19900",
+                "OrderStatus": "NEW",
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+        ]
+        
+        with patch("bot.logger") as mock_logger:
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # Both SL orders should be modified
+        self.assertEqual(self.mock_client.modify_order.call_count, 2)
+        
+        # Verify calls include market order type
+        for call_obj in self.mock_client.modify_order.call_args_list:
+            kwargs = call_obj[1]
+            self.assertEqual(kwargs["order_type"], self.mock_client.interactive.ORDER_TYPE_MARKET)
+            self.assertEqual(kwargs["stop_price"], 0)
+            self.assertEqual(kwargs["limit_price"], 0)
+
+    def test_partial_closure_one_leg_already_filled(self):
+        """Should skip FILLED SL orders and only modify open ones."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "AppOrderID": 101,
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "FILLED",  # Already closed
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+            {
+                "AppOrderID": 102,
+                "OrderUniqueIdentifier": "S0921_SL_PE_19900",
+                "OrderStatus": "NEW",  # Still open
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+        ]
+        
+        with patch("bot.logger") as mock_logger:
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # Only PE SL should be modified (CE is already FILLED)
+        self.assertEqual(self.mock_client.modify_order.call_count, 1)
+        
+        # Modified order should be PE
+        call_kwargs = self.mock_client.modify_order.call_args[1]
+        self.assertEqual(call_kwargs["app_order_id"], 102)
+        
+        # CE should be logged as already filled
+        self.assertTrue(mock_logger.info.called)
+
+    def test_replaced_status_also_modifies(self):
+        """Should modify SL orders with REPLACED status (reopened)."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "AppOrderID": 101,
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "REPLACED",  # Order was modified/reopened
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+        ]
+        
+        with patch("bot.logger"):
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # REPLACED status should also trigger modification
+        self.assertEqual(self.mock_client.modify_order.call_count, 1)
+        call_kwargs = self.mock_client.modify_order.call_args[1]
+        self.assertEqual(call_kwargs["order_type"], self.mock_client.interactive.ORDER_TYPE_MARKET)
+
+    def test_rejected_sl_warns_and_skips(self):
+        """Should warn when SL order is REJECTED."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "AppOrderID": 101,
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "REJECTED",
+            },
+        ]
+        
+        with patch("bot.logger") as mock_logger:
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # Should warn about rejected SL
+        self.assertTrue(mock_logger.warning.called)
+        # Should not try to modify
+        self.mock_client.modify_order.assert_not_called()
+
+    def test_cancelled_sl_warns_and_skips(self):
+        """Should warn when SL order is CANCELLED."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "AppOrderID": 101,
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "CANCELLED",
+            },
+        ]
+        
+        with patch("bot.logger") as mock_logger:
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # Should warn about cancelled SL
+        self.assertTrue(mock_logger.warning.called)
+        self.mock_client.modify_order.assert_not_called()
+
+    def test_missing_sl_order_in_book_warns_and_continues(self):
+        """Should warn if SL order not found in order book."""
+        self.mock_client.get_order_book.return_value = []  # Empty order book
+        
+        with patch("bot.logger") as mock_logger:
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # Should warn about missing orders
+        self.assertTrue(mock_logger.warning.called)
+        self.mock_client.modify_order.assert_not_called()
+
+    def test_modify_order_failure_logs_error(self):
+        """Should log error if modify_order API call fails."""
+        self.mock_client.get_order_book.return_value = [
+            {
+                "AppOrderID": 101,
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "NEW",
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+        ]
+        self.mock_client.modify_order.side_effect = Exception("XTS API error")
+        
+        with patch("bot.logger") as mock_logger:
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+        
+        # Should log error but not crash
+        self.assertTrue(mock_logger.error.called)
+
+    def test_multi_strategy_independent_closure(self):
+        """Each strategy should close only its own SL orders (isolation test)."""
+        # Two strategies with same instruments but different SL order IDs
+        strategy_1 = {
+            "name": "S0921",
+            "status": "OPEN",
+            "sl_orders": [
+                {"tag": "S0921_SL_CE_19900", "app_order_id": 101},
+                {"tag": "S0921_SL_PE_19900", "app_order_id": 102},
+            ],
+        }
+        
+        strategy_2 = {
+            "name": "S0955",
+            "status": "OPEN",
+            "sl_orders": [
+                {"tag": "S0955_SL_CE_19900", "app_order_id": 201},
+                {"tag": "S0955_SL_PE_19900", "app_order_id": 202},
+            ],
+        }
+        
+        # Only S0921's SL orders are open
+        self.mock_client.get_order_book.return_value = [
+            {
+                "AppOrderID": 101,
+                "OrderUniqueIdentifier": "S0921_SL_CE_19900",
+                "OrderStatus": "NEW",
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+            {
+                "AppOrderID": 102,
+                "OrderUniqueIdentifier": "S0921_SL_PE_19900",
+                "OrderStatus": "NEW",
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+            {
+                "AppOrderID": 201,
+                "OrderUniqueIdentifier": "S0955_SL_CE_19900",
+                "OrderStatus": "FILLED",
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+            {
+                "AppOrderID": 202,
+                "OrderUniqueIdentifier": "S0955_SL_PE_19900",
+                "OrderStatus": "FILLED",
+                "OrderQuantity": 260,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            },
+        ]
+        
+        with patch("bot.logger"):
+            # Close S0921
+            bot._close_strategy_via_open_sl_orders(self.mock_client, strategy_1)
+            s1_modify_count = self.mock_client.modify_order.call_count
+            
+            # Reset mock
+            self.mock_client.reset_mock()
+            
+            # Close S0955
+            bot._close_strategy_via_open_sl_orders(self.mock_client, strategy_2)
+            s2_modify_count = self.mock_client.modify_order.call_count
+        
+        # S0921 should modify 2 orders (both NEW)
+        self.assertEqual(s1_modify_count, 2)
+        # S0955 should modify 0 orders (both FILLED, skipped)
+        self.assertEqual(s2_modify_count, 0)
 
 
 class TestMainBlock(unittest.TestCase):

@@ -317,6 +317,68 @@ def cleanup_old_data(days: int = RETENTION_DAYS) -> None:
         logger.error(f"Failed to cleanup old data: {e}")
 
 
+def cleanup_previous_day_data() -> None:
+    """
+    On app startup, delete all data from PREVIOUS DAYS.
+    Keep ONLY today's data (execution_date = today).
+    
+    This ensures:
+    - Each trading day starts fresh with clean database
+    - Previous day positions, orders, strategies are removed
+    - But day-trader might restart app multiple times, so today's data persists
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        today = get_ist_date()
+        
+        # Step 1: Delete old strategies (and their positions)
+        cursor.execute("""
+            SELECT id FROM strategies WHERE execution_date < ?
+        """, (today,))
+        old_strategy_ids = [row[0] for row in cursor.fetchall()]
+        
+        # Delete positions for old strategies
+        for strategy_id in old_strategy_ids:
+            cursor.execute("DELETE FROM positions WHERE strategy_id = ?", (strategy_id,))
+        
+        # Delete old strategies
+        deleted = cursor.execute("""
+            DELETE FROM strategies WHERE execution_date < ?
+        """, (today,)).rowcount
+        
+        # Step 2: Delete old orders (created before today)
+        # Note: created_at uses CURRENT_TIMESTAMP which is UTC, so we compare with IST date
+        ist_today = get_ist_date()
+        deleted_orders = cursor.execute("""
+            DELETE FROM orders WHERE DATE(created_at) < ?
+        """, (ist_today,)).rowcount
+        
+        # Step 3: Delete old closed trades
+        deleted_trades = cursor.execute("""
+            DELETE FROM trades_closed WHERE execution_date < ?
+        """, (today,)).rowcount
+        
+        # Step 4: Delete old MTM snapshots
+        # Note: mtm_snapshots uses CURRENT_TIMESTAMP, compare with IST date
+        deleted_mtm = cursor.execute("""
+            DELETE FROM mtm_snapshots WHERE DATE(timestamp) < ?
+        """, (ist_today,)).rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"🧹 Startup Cleanup: Deleted data from previous days (before {today})")
+        if deleted > 0 or deleted_orders > 0 or deleted_trades > 0 or deleted_mtm > 0:
+            logger.info(f"   - Strategies: {deleted} | Orders: {deleted_orders} | Closed Trades: {deleted_trades} | MTM: {deleted_mtm}")
+            logger.info(f"✅ Previous day data cleaned up. Today starts fresh!")
+        else:
+            logger.info(f"✅ No previous day data to cleanup. Today ({today}) starts clean.")
+            
+    except Exception as e:
+        logger.error(f"Failed to cleanup previous day data: {e}")
+
+
 def get_strategy_record(strategy_name: str, execution_date: str) -> Optional[Dict[str, Any]]:
     """Retrieve strategy record by name and date."""
     try:

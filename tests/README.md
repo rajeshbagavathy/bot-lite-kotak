@@ -72,18 +72,50 @@ Tests expiry data fetching from XTS API for both NIFTY and SENSEX. Useful for:
 
 **Note:** Requires valid XTS API credentials in environment variables or .zshrc
 
+## Demo/Integration Tests
+
+Run these to test real-world scenarios and strategy logic:
+
+### Multi-Strategy Test
+```bash
+# Test concurrent strategies on same strike
+python3 tests/demo_multi_strategy_test.py
+```
+
+Validates:
+- Multiple strategies executing simultaneously
+- Each strategy maintains isolated positions
+- SL closure doesn't affect other strategies
+- Position tracking across different entry times
+
+### Order Book Monitoring Test
+```bash
+# Test SL order execution and position closure
+python3 tests/demo_order_book_monitoring_test.py
+```
+
+Validates:
+- SL order detection and execution
+- Automatic position closure on SL fill
+- Multi-strategy isolation (same instrument, different strategies)
+- Error handling for rejected orders
+
 ## Test Descriptions
 
-| Test File | Purpose | Dependencies |
-|-----------|---------|--------------|
-| `test_bot.py` | **Unit tests for bot.py (40 tests, 99% coverage)** | pytest, coverage |
-| `preflight-check.sh` | Pre-flight validation (files, syntax, dependencies) | bash |
-| `test_all_config.py` | Comprehensive validation of all config parameters | None |
-| `test_segments.py` | Validate exchange segment configuration | None |
-| `test_lot_sizes.py` | Verify NIFTY/SENSEX lot sizes | None |
-| `test_api_params.py` | Validate API parameter ordering | None |
-| `test_expiry_debug.py` | Debug expiry API calls with real credentials | XTS API access |
-| `TEST_COVERAGE_REPORT.md` | Detailed unit test coverage analysis | - |
+| Test File | Purpose | Type | Dependencies |
+|-----------|---------|------|--------------|
+| `test_bot.py` | **Unit tests for bot.py (40 tests, 99% coverage)** | Unit | pytest, coverage |
+| `preflight-check.sh` | Pre-flight validation (files, syntax, dependencies) | Validation | bash |
+| `test_all_config.py` | Comprehensive validation of all config parameters | Validation | None |
+| `test_segments.py` | Validate exchange segment configuration | Validation | None |
+| `test_lot_sizes.py` | Verify NIFTY/SENSEX lot sizes | Validation | None |
+| `test_api_params.py` | Validate API parameter ordering | Validation | None |
+| `test_expiry_debug.py` | Debug expiry API calls with real credentials | Debugging | XTS API access |
+| `test_error_handling.py` | Error handling and graceful failures | Unit | pytest |
+| `test_daily_cleanup.py` | Database cleanup on startup | Unit | pytest |
+| `demo_multi_strategy_test.py` | Multi-strategy concurrent execution | Integration | None |
+| `demo_order_book_monitoring_test.py` | SL order execution and closure | Integration | None |
+| `TEST_COVERAGE_REPORT.md` | Detailed unit test coverage analysis | Report | - |
 
 ## Running All Tests
 

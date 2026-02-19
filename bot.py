@@ -27,11 +27,13 @@ from db import (
     log_trade_closed,
     log_mtm_snapshot,
     cleanup_old_data,
+    cleanup_previous_day_data,
     restore_todays_strategies,
     get_ist_timestamp,
+    get_ist_now,
 )
 from mtm import calculate_mtm, calculate_strategy_mtm
-from state import init_state, set_index, set_spot, update_portfolio, update_portfolio_margin, update_strategy
+from state import init_state, set_index, set_index_error, set_spot, update_portfolio, update_portfolio_margin, update_strategy
 from ui import create_app
 from xts_client import XTSClient
 
@@ -41,7 +43,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
 )
 logger = logging.getLogger("xts-bot-lite")
-APP_START_TIME = datetime.datetime.now()
+APP_START_TIME = get_ist_now()
 
 
 def _pick_index_and_expiry(client: XTSClient) -> Tuple[dict, str]:
@@ -125,7 +127,7 @@ def _get_filled_orders(order_book: List[dict], tags: List[str]) -> List[dict]:
 def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, force: bool = False) -> None:
     if strategy["status"] not in ("PENDING", "ERROR"):
         return
-    if not force and datetime.datetime.now().strftime("%H:%M:%S") < strategy["time"]:
+    if not force and get_ist_now().strftime("%H:%M:%S") < strategy["time"]:
         return
 
     name = strategy["name"]
@@ -239,12 +241,98 @@ def _cancel_strategy_sl_orders(client: XTSClient, strategy: dict) -> None:
             logger.exception("Failed to cancel SL order %s", sl_order)
 
 
+def _close_strategy_via_open_sl_orders(client: XTSClient, strategy: dict) -> None:
+    """
+    Close strategy by converting open SL orders to market execution.
+    
+    This approach:
+    1. Checks order book status of each SL order
+    2. If status = 'New'/'Replaced' → SL still open, modify to market execution
+    3. If status = 'Filled' → Already closed by individual leg SL, skip
+    4. If status = 'Cancelled'/'Rejected' → Failed, skip
+    
+    Benefit: Only closes still-open legs, avoids double-closing already-filled positions.
+    This handles scenarios where one leg SL hit before strategy SL.
+    """
+    sl_orders = strategy.get("sl_orders", []) or []
+    if not sl_orders:
+        logger.info(f"No SL orders found for strategy {strategy['name']}")
+        return
+    
+    try:
+        order_book = client.get_order_book()
+    except Exception as e:
+        logger.error(f"Failed to fetch order book for {strategy['name']}: {e}")
+        return
+    
+    # Create map: app_order_id / tag → order details from order book
+    order_book_map = {}
+    for order in order_book:
+        app_order_id = order.get("AppOrderID")
+        tag = order.get("OrderUniqueIdentifier")
+        if app_order_id or tag:
+            order_book_map[app_order_id] = order
+            order_book_map[tag] = order
+    
+    # Process each SL order
+    for sl_order in sl_orders:
+        app_order_id = sl_order.get("app_order_id")
+        tag = sl_order.get("tag")
+        
+        # Find this SL order in the order book
+        order_detail = order_book_map.get(app_order_id) or order_book_map.get(tag)
+        
+        if not order_detail:
+            logger.warning(
+                f"SL order not found in order book: {strategy['name']} - {tag}"
+            )
+            continue
+        
+        order_status = order_detail.get("OrderStatus", "").upper()
+        
+        # Check if SL order is still open
+        if order_status in ("NEW", "REPLACED"):
+            # ✅ SL is still open - modify to market execution
+            try:
+                client.modify_order(
+                    app_order_id=app_order_id,
+                    product_type=order_detail.get("ProductType"),
+                    order_type=client.interactive.ORDER_TYPE_MARKET,
+                    quantity=int(order_detail.get("OrderQuantity", 0)),
+                    disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
+                    stop_price=0,  # Market execution
+                    limit_price=0,  # Market execution
+                    time_in_force=order_detail.get("TimeInForce"),
+                    tag=tag,
+                )
+                logger.info(
+                    f"✅ [{strategy['name']}] Modified SL order to market: {tag} "
+                    f"(Qty: {order_detail.get('OrderQuantity')})"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to modify SL order for {strategy['name']}: {tag} - {e}"
+                )
+        
+        elif order_status == "FILLED":
+            # ℹ️ SL already executed - position already closed
+            logger.info(
+                f"ℹ️  [{strategy['name']}] SL already FILLED, skipping: {tag}"
+            )
+        
+        elif order_status in ("CANCELLED", "REJECTED"):
+            # ⚠️ SL order failed - position is exposed
+            logger.warning(
+                f"⚠️  [{strategy['name']}] SL order {order_status}: {tag} "
+                f"(position exposed, manual intervention may be needed)"
+            )
+
+
 def _close_strategy(client: XTSClient, index_config, strategy: dict, positions: List[dict], reason: str) -> None:
     if strategy["status"] in ("CLOSED", "CLOSING"):
         return
     update_strategy(strategy["name"], status="CLOSING", message=reason)
-    _close_positions_for_instruments(client, index_config, positions, strategy.get("instrument_ids", []))
-    _cancel_strategy_sl_orders(client, strategy)
+    _close_strategy_via_open_sl_orders(client, strategy)
     
     # Log closed trade to database
     db_id = strategy.get("db_id")
@@ -269,37 +357,125 @@ def _square_off_all(client: XTSClient, index_config, positions: List[dict], reas
         _place_close_order(client, index_config, pos, "SQUAREOFF")
 
 
-def _capture_sl_exit_prices(client: XTSClient, strategy: dict) -> None:
-    """Capture exit prices from filled SL orders and update strategy positions."""
-    if strategy["status"] != "OPEN" or not strategy.get("sl_tag_map"):
+def _sync_sl_order_status_and_capture_exits(client: XTSClient, strategy: dict) -> None:
+    """
+    Monitor XTS order book to determine if SL orders are filled (position closure).
+    This is the SINGLE SOURCE OF TRUTH for position status.
+    
+    Why order book?
+    - Multiple strategies can hold same instruments (same strike CE/PE)
+    - Broker positions are aggregated, can't distinguish per-strategy ownership
+    - SL order tags are strategy-specific, unambiguous
+    
+    Logic:
+    - For each position, find corresponding SL order from sl_orders
+    - Query order book: what is SL order status?
+    - If "Filled" → position is closed, capture exit_price
+    - If "Pending/Rejected" → position status unchanged
+    """
+    if strategy["status"] != "OPEN" or not strategy.get("sl_orders"):
         return
     
-    order_book = client.get_order_book()
-    sl_tags = set(sl["tag"] for sl in strategy.get("sl_orders", []))
-    filled_sl_orders = {o["OrderUniqueIdentifier"]: o for o in order_book 
-                        if o.get("OrderUniqueIdentifier") in sl_tags and o.get("OrderStatus") == "Filled"}
+    # Handle DEMO_MODE (client is None)
+    if client is None:
+        logger.debug(f"Skipping order book sync for {strategy['name']} (DEMO_MODE, no client)")
+        return
     
-    for pos in strategy.get("positions", []):
-        if pos.get("exit_price") is not None:
+    try:
+        order_book = client.get_order_book()
+    except Exception as e:
+        logger.error(f"Failed to fetch order book for {strategy['name']}: {e}")
+        return
+    
+    # Create mapping: sl_order_tag → order details
+    order_book_map = {}
+    for order in order_book:
+        tag = order.get("OrderUniqueIdentifier")
+        if tag:
+            order_book_map[tag] = order
+    
+    # Check each SL order for this strategy
+    sl_orders = strategy.get("sl_orders", []) or []
+    sl_tag_map = strategy.get("sl_tag_map", {}) or {}
+    
+    for sl_order in sl_orders:
+        tag = sl_order.get("tag")
+        
+        if not tag or tag not in order_book_map:
             continue
-        instrument_id = pos["instrument_id"]
-        for tag, instr_id in strategy.get("sl_tag_map", {}).items():
-            if instr_id == instrument_id and tag in filled_sl_orders:
-                try:
-                    exit_price = float(filled_sl_orders[tag].get("OrderAverageTradedPrice", 0.0))
-                    if exit_price > 0:
-                        pos["exit_price"] = exit_price
-                        logger.info(f"Captured SL exit price for {strategy['name']} instrument {instrument_id}: {exit_price}")
-                        # Log exit price to database
-                        if strategy["db_id"] and strategy["db_id"] > 0:
+        
+        # Get order details from XTS order book
+        order_detail = order_book_map[tag]
+        order_status = order_detail.get("OrderStatus", "").upper()
+        
+        # Map SL tag to instrument_id
+        instrument_id = sl_tag_map.get(tag)
+        if not instrument_id:
+            continue
+        
+        # Find matching position
+        matching_position = None
+        for pos in strategy.get("positions", []) or []:
+            if pos.get("instrument_id") == instrument_id and pos.get("exit_price") is None:
+                matching_position = pos
+                break
+        
+        if not matching_position:
+            continue
+        
+        # **MAIN LOGIC: Check XTS order book status**
+        if order_status == "FILLED":
+            # ✅ SL order was executed - position is CLOSED
+            try:
+                exit_price = float(order_detail.get("OrderAverageTradedPrice", 0.0))
+                if exit_price > 0:
+                    matching_position["exit_price"] = exit_price
+                    matching_position["exit_time"] = get_ist_timestamp()
+                    matching_position["closed_via"] = "SL_FILLED"
+                    
+                    logger.info(
+                        f"✅ [{strategy['name']}] Position CLOSED via SL: "
+                        f"Instrument {instrument_id}, Exit Price: {exit_price}"
+                    )
+                    
+                    # Log to database
+                    if strategy["db_id"] and strategy["db_id"] > 0:
+                        try:
                             update_position_exit(
                                 strategy["db_id"],
                                 instrument_id,
                                 exit_price,
                                 get_ist_timestamp(),
                             )
-                except (TypeError, ValueError):
-                    pass
+                        except Exception as e:
+                            logger.error(f"Failed to log position exit: {e}")
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Failed to parse exit price from order {tag}: {e}")
+        
+        elif order_status in ("REJECTED", "CANCELLED"):
+            # ⚠️ SL order failed - position is EXPOSED
+            matching_position["sl_status"] = order_status
+            logger.warning(
+                f"⚠️  [{strategy['name']}] SL order {order_status}: "
+                f"Instrument {instrument_id} (position still exposed)"
+            )
+        
+        elif order_status in ("PENDING", "OPEN", "PARTIALLY_FILLED"):
+            # ⏳ SL order still active - position still OPEN
+            matching_position["sl_status"] = "WAITING"
+
+
+def _check_all_positions_closed(strategy: dict) -> bool:
+    """
+    Determine if ALL positions in strategy are closed.
+    Returns True only if all positions have exit_price set (via filled SL orders).
+    """
+    positions = strategy.get("positions", []) or []
+    if not positions:
+        return True  # No positions = nothing open
+    
+    all_closed = all(pos.get("exit_price") is not None for pos in positions)
+    return all_closed
 
 
 def _sync_strategy_positions_from_broker(strategy: dict, broker_positions: List[dict]) -> None:
@@ -347,10 +523,21 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
     update_portfolio(overall, realized, unrealized, portfolio_sl)
 
     for strategy in STRATEGY_STATE.values():
-        _capture_sl_exit_prices(client, strategy)
+        # **FIRST**: Sync SL order status from XTS order book (single source of truth)
+        _sync_sl_order_status_and_capture_exits(client, strategy)
         
         # Sync strategy positions with broker positions to keep state real-time
         _sync_strategy_positions_from_broker(strategy, positions)
+        
+        # **CHECK**: If all positions are closed via SL orders, mark strategy as CLOSED
+        if strategy["status"] == "OPEN" and _check_all_positions_closed(strategy):
+            logger.info(f"✅ [{strategy['name']}] All positions closed via SL orders - closing strategy")
+            update_strategy(
+                strategy["name"], 
+                status="CLOSED", 
+                message="All positions closed via SL orders",
+                positions=strategy.get("positions", [])
+            )
         
         strategy_positions = strategy.get("positions") or []
         if not strategy_positions:
@@ -414,6 +601,56 @@ def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
     schedule.every().day.at("00:00").do(cleanup_old_data)
 
 
+def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
+    """Periodically retry picking expiry if initial attempt failed."""
+    global STRATEGY_STATE
+    retry_interval = 10  # Start with 10 seconds
+    max_interval = 60    # Max out at 60 seconds
+    attempt = 0
+    
+    while True:
+        time.sleep(retry_interval)
+        attempt += 1
+        
+        try:
+            logger.info(f"🔄 Retry {attempt}: Checking for expiry data...")
+            index_config, expiry = _pick_index_and_expiry(client)
+            
+            logger.info(f"✓ Expiry found! Index: {index_config.name} | Expiry: {expiry}")
+            set_index(index_config.name, expiry)
+            
+            # Schedule jobs now that we have expiry
+            _schedule_jobs(client, index_config, expiry)
+            
+            # Restore today's strategies now that we have expiry
+            restored = restore_todays_strategies()
+            for restored_strategy in restored:
+                strategy_name = restored_strategy["strategy_name"]
+                if strategy_name in STRATEGY_STATE:
+                    logger.info(f"Restoring {strategy_name} from database...")
+                    STRATEGY_STATE[strategy_name].update({
+                        "db_id": restored_strategy["db_id"],
+                        "status": "OPEN",
+                        "strike": restored_strategy["strike"],
+                        "entry_time": restored_strategy["entry_time"],
+                        "positions": restored_strategy["positions"],
+                    })
+            
+            logger.info("✓ Bot is now operational")
+            return  # Success, exit retry loop
+            
+        except RuntimeError as e:
+            # Update error message on UI
+            error_msg = f"Still waiting for expiry data... (Attempt {attempt})"
+            set_index_error(error_msg)
+            logger.debug(f"Retry {attempt} failed: {e}")
+            
+            # Increase retry interval, but cap at max
+            retry_interval = min(retry_interval + 5, max_interval)
+            current_time = get_ist_now().strftime("%H:%M:%S")
+            logger.info(f"⏳ Retrying in {retry_interval}s... Current time: {current_time} (Market hours: 09:15-15:30)")
+
+
 def main() -> None:
     if DEMO_MODE:
         logger.info("DEMO MODE - Simulated data")
@@ -449,13 +686,21 @@ def main() -> None:
             client_id=creds["client_id"],
         )
         client.login()
-        index_config, expiry = _pick_index_and_expiry(client)
+        try:
+            index_config, expiry = _pick_index_and_expiry(client)
+        except RuntimeError as e:
+            logger.error(f"Failed to pick index and expiry: {e}")
+            index_config = None
+            expiry = None
+            client_for_retry = client
 
-    logger.info("Index: %s | Expiry: %s", index_config.name, expiry)
+    logger.info("Index: %s | Expiry: %s", index_config.name if index_config else "NOT SET", expiry if expiry else "NOT SET")
     init_db()
+    # Clean up all previous day data on startup
+    cleanup_previous_day_data()
     
     # Restore today's open strategies from database (before init_state)
-    if not DEMO_MODE:
+    if not DEMO_MODE and index_config is not None:
         restored = restore_todays_strategies()
         for restored_strategy in restored:
             strategy_name = restored_strategy["strategy_name"]
@@ -470,11 +715,18 @@ def main() -> None:
                 })
     
     init_state(STRATEGY_STATE)
-    set_index(index_config.name, expiry)
+    if index_config is not None:
+        set_index(index_config.name, expiry)
+    else:
+        set_index_error("No expiries found for NIFTY or SENSEX. Please check market hours (09:15-15:30).")
 
     app = create_app(auth["username"], auth["password"])
-    if not DEMO_MODE:
+    
+    # Only schedule jobs if we have valid index and expiry
+    jobs_scheduled = False
+    if not DEMO_MODE and index_config is not None:
         _schedule_jobs(client, index_config, expiry)
+        jobs_scheduled = True
 
     from threading import Thread
     ui_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=80, debug=False, use_reloader=False))
@@ -482,6 +734,12 @@ def main() -> None:
     ui_thread.start()
 
     logger.info("UI at http://localhost:8001 | %s / %s", auth["username"], auth["password"])
+    
+    # If no expiry was found, retry periodically
+    if index_config is None and not DEMO_MODE:
+        logger.info("⏳ Waiting for expiry data... Current time: %s (Market hours: 09:15-15:30)", get_ist_now().strftime("%H:%M:%S"))
+        retry_thread = Thread(target=lambda: _retry_pick_expiry(client, auth), daemon=True)
+        retry_thread.start()
 
     if DEMO_MODE:
         update_portfolio(2500.50, 1200.25, 1300.25, PORTFOLIO_SL_LIMIT)

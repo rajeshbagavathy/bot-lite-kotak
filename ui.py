@@ -160,7 +160,19 @@ DASHBOARD_TEMPLATE = """
 
         const portfolio = state.portfolio || {};
         const idx = state.index || {};
-        document.getElementById('meta-info').innerHTML = `
+        
+        // Show error if expiry not available
+        let errorHtml = '';
+        if (idx.error) {
+          errorHtml = `
+            <div class="meta-item" style="grid-column: 1 / -1; background: #7c2d12; padding: 15px; border-radius: 6px; border-left: 4px solid #ef4444;">
+              <div class="meta-label" style="color: #fed7aa;">⚠️ Status</div>
+              <div class="meta-value" style="color: #fecaca; font-size: 14px; margin-top: 8px;">${idx.error}</div>
+            </div>
+          `;
+        }
+        
+        document.getElementById('meta-info').innerHTML = errorHtml + `
           <div class="meta-item">
             <div class="meta-label">Index</div>
             <div class="meta-value">${idx.name || '-'}</div>
