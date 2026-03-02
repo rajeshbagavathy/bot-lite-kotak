@@ -58,9 +58,10 @@ INDEX_CONFIGS = {
 }
 
 STRATEGIES = [
-    StrategyConfig("S0921", "09:21:00", 7, 20.0, 10000.0),
+    StrategyConfig("S0921", "09:30:00", 7, 20.0, 10000.0),
     StrategyConfig("S0955", "09:50:00", 7, 30.0, 10000.0),
     StrategyConfig("S1005", "10:05:00", 7, 30.0, 10000.0),
+    StrategyConfig("S1005", "10:25:00", 7, 30.0, 10000.0),
     StrategyConfig("S1045", "10:45:00", 7, 35.0, 10000.0),
     StrategyConfig("S1205", "12:55:00", 7, 35.0, 10000.0),
 ]
