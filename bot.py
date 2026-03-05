@@ -91,6 +91,14 @@ def _place_leg_sl_orders(
     sl_orders = []
     tag_to_instrument = {}
     for order in filled_orders:
+        # Use traded quantity when available (handles partial fills safely)
+        try:
+            quantity = int(order.get("OrderQuantityTraded") or order.get("OrderQuantity") or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity <= 0:
+            continue
+
         # Calculate raw SL price
         raw_price = float(order["OrderAverageTradedPrice"]) * (1 + leg_sl_pct / 100.0)
         
@@ -104,7 +112,7 @@ def _place_leg_sl_orders(
             index_config=index_config,
             instrument_id=instrument_id,
             order_side=client.interactive.TRANSACTION_TYPE_BUY,
-            quantity=int(order["OrderQuantity"]),
+            quantity=quantity,
             limit_price=price,
             stop_price=trigger,
             tag=tag,
@@ -120,7 +128,10 @@ def _get_filled_orders(order_book: List[dict], tags: List[str]) -> List[dict]:
     return [
         order
         for order in order_book
-        if order.get("OrderUniqueIdentifier") in tags and order.get("OrderStatus") == "Filled"
+        if order.get("OrderUniqueIdentifier") in tags
+        and str(order.get("OrderStatus", "")).replace(" ", "").upper()
+        in ("FILLED", "PARTIALLYFILLED")
+        and float(order.get("OrderAverageTradedPrice") or 0) > 0
     ]
 
 
@@ -177,7 +188,41 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     update_strategy(name, db_id=strategy_db_id)
 
     time.sleep(5)
-    filled = _get_filled_orders(client.get_order_book(), [ce_tag, pe_tag])
+    # Wait for entry orders to get filled (or partially filled) before placing SLs.
+    # This loop is resilient to slower fills and avoids missing SL placement.
+    filled: List[dict] = []
+    tags = [ce_tag, pe_tag]
+    max_wait_seconds = 45
+    poll_interval = 3
+    start_time = time.time()
+
+    while True:
+        try:
+            order_book = client.get_order_book()
+        except Exception as e:
+            logger.error("Failed to fetch order book while waiting for fills: %s", e)
+            break
+
+        filled = _get_filled_orders(order_book, tags)
+        if len(filled) >= 2:
+            break
+
+        if time.time() - start_time >= max_wait_seconds:
+            break
+
+        time.sleep(poll_interval)
+
+    if not filled:
+        logger.warning(
+            "No filled entry orders found for strategy %s (tags=%s); "
+            "SKIPPING SL placement for now.",
+            name,
+            tags,
+        )
+        # Still update positions/DB if any eventually appear via other flows,
+        # but we can't place SLs safely without fills.
+        return
+
     sl_orders, tag_to_instrument = _place_leg_sl_orders(client, index_config, filled, strategy["leg_sl_pct"], name)
     positions = []
     for order in filled:
@@ -551,8 +596,25 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
 
     if overall <= portfolio_sl:
         _square_off_all(client, index_config, positions, "Portfolio SL hit")
+        # After squaring off all broker positions, cancel any remaining SL orders
+        # and clear them from in-memory state so they can't be reused.
         for strategy in STRATEGY_STATE.values():
-            update_strategy(strategy["name"], status="CLOSED", message="Portfolio SL hit", positions=[])
+            try:
+                _cancel_strategy_sl_orders(client, strategy)
+            except Exception:
+                logger.exception(
+                    "Failed to cancel SL orders for strategy %s during portfolio SL handling",
+                    strategy.get("name"),
+                )
+
+            update_strategy(
+                strategy["name"],
+                status="CLOSED",
+                message="Portfolio SL hit",
+                positions=[],
+                sl_orders=[],
+                sl_tag_map={},
+            )
 
 
 def _update_available_margin(client: XTSClient) -> None:
