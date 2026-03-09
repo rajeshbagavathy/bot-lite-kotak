@@ -68,6 +68,8 @@ STRATEGIES = [
 ]
 
 PORTFOLIO_SL_LIMIT = -50000.0
+# Set to True to enable trading on non-expiry days; False disables all strategies on non-expiry.
+TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "False").lower() in ("true", "1", "yes")
 
 # Margin + hedging configuration
 # If available margin is below this, bot will buy far-OTM hedges first.

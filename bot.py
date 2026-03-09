@@ -25,6 +25,7 @@ from config import (
     SOURCE,
     STRATEGIES,
     STRATEGY_LOTS_NON_EXPIRY,
+    TRADE_NON_EXPIRY_DAY,
     DEMO_MODE,
     get_basic_auth_creds,
     load_credentials,
@@ -904,6 +905,15 @@ def _apply_non_expiry_overrides(expiry: str) -> None:
 
 def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
     _apply_non_expiry_overrides(expiry)
+
+    if not _is_expiry_day(expiry) and not TRADE_NON_EXPIRY_DAY:
+        logger.info("Non-expiry day and TRADE_NON_EXPIRY_DAY is disabled — skipping all strategy scheduling")
+        for strategy in STRATEGY_STATE.values():
+            update_strategy(strategy["name"], status="DISABLED", message="No trading on non-expiry day")
+        schedule.every(60).seconds.do(_update_available_margin, client=client)
+        schedule.every().day.at("00:00").do(cleanup_old_data)
+        return
+
     test_mode = os.getenv("TEST_FIRST_STRATEGY_IN_1MIN", "false").lower() == "true"
     
     for idx, strategy in enumerate(STRATEGY_STATE.values()):

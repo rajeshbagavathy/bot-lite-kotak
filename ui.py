@@ -37,6 +37,8 @@ DASHBOARD_TEMPLATE = """
     tr:hover { background: #334155; }
     .status-open { background: #065f46; color: #d1fae5; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
     .status-closed { background: #7c2d12; color: #fed7aa; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+    .status-disabled { background: #92400e; color: #fef3c7; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+    .disabled-banner { background: #92400e; color: #fef3c7; padding: 14px 20px; border-radius: 6px; margin-bottom: 16px; font-size: 15px; font-weight: bold; text-align: center; border: 2px solid #d97706; }
     .tag { background: #1e40af; color: #dbeafe; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
     .meta-info { background: #0f172a; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
     .meta-item { border-right: 1px solid #334155; }
@@ -50,6 +52,7 @@ DASHBOARD_TEMPLATE = """
   <div class="container">
     <h1>📊 XTS Bot Database Dashboard</h1>
     
+    <div id="dash-disabled-banner"></div>
     <div class="meta-info" id="meta-info">Loading...</div>
     
     <div class="tabs">
@@ -160,6 +163,15 @@ DASHBOARD_TEMPLATE = """
 
         const portfolio = state.portfolio || {};
         const idx = state.index || {};
+        const stateStrategies = state.strategies || {};
+
+        const allDisabled = Object.values(stateStrategies).length > 0 && Object.values(stateStrategies).every(s => s.status === 'DISABLED');
+        const dashBanner = document.getElementById('dash-disabled-banner');
+        if (allDisabled) {
+          dashBanner.innerHTML = '<div class="disabled-banner">Trading is disabled today (non-expiry day). No strategies will be executed.</div>';
+        } else {
+          dashBanner.innerHTML = '';
+        }
         
         // Show error if expiry not available
         let errorHtml = '';
@@ -363,6 +375,7 @@ HTML_TEMPLATE = """
     th { background: #efe6d6; }
     .negative { color: #a12222; font-weight: bold; }
     .positive { color: #206622; font-weight: bold; }
+    .disabled-banner { background: #92400e; color: #fef3c7; padding: 14px 20px; border-radius: 6px; margin-bottom: 16px; font-size: 15px; font-weight: bold; text-align: center; border: 2px solid #d97706; }
   </style>
 </head>
 <body>
@@ -370,6 +383,7 @@ HTML_TEMPLATE = """
     <h1>XTS Bot MTM</h1>
     <a href="/dashboard" class="nav-link">📊 Full Dashboard</a>
   </div>
+  <div id=\"disabled-banner\"></div>
   <div class=\"meta\" id=\"meta\"></div>
   <table>
     <thead>
@@ -399,6 +413,15 @@ HTML_TEMPLATE = """
 
       const idx = data.index || {};
       const portfolio = data.portfolio || {};
+      const strategies = data.strategies || {};
+
+      const allDisabled = Object.values(strategies).length > 0 && Object.values(strategies).every(s => s.status === 'DISABLED');
+      const bannerEl = document.getElementById('disabled-banner');
+      if (allDisabled) {
+        bannerEl.innerHTML = '<div class="disabled-banner">Trading is disabled today (non-expiry day). No strategies will be executed.</div>';
+      } else {
+        bannerEl.innerHTML = '';
+      }
 
       const mtmClass = portfolio.mtm < 0 ? 'negative' : 'positive';
       document.getElementById('meta').innerHTML =
