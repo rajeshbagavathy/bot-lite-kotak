@@ -369,8 +369,8 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     if not _ensure_margin_or_skip_strategy(client, index_config, expiry, strategy, atm_strike):
         return
 
-    effective_lots = int(STRATEGY_LOTS_NON_EXPIRY) if not is_expiry else int(strategy["lots"])
-    effective_leg_sl_pct = float(LEG_SL_PCT_NON_EXPIRY) if not is_expiry else float(strategy["leg_sl_pct"])
+    effective_lots = int(strategy["lots"])
+    effective_leg_sl_pct = float(strategy["leg_sl_pct"])
     qty = effective_lots * index_config.lot_size
     ce_tag = f"{name}_CE_SELL_{int(time.time())}"
     pe_tag = f"{name}_PE_SELL_{int(time.time())}"
@@ -885,7 +885,25 @@ STRATEGY_STATE: Dict[str, dict] = {
 }
 
 
+def _apply_non_expiry_overrides(expiry: str) -> None:
+    """If today is NOT expiry day, override lots and leg_sl_pct in STRATEGY_STATE for the UI."""
+    if _is_expiry_day(expiry):
+        return
+    for strategy in STRATEGY_STATE.values():
+        update_strategy(
+            strategy["name"],
+            lots=int(STRATEGY_LOTS_NON_EXPIRY),
+            leg_sl_pct=float(LEG_SL_PCT_NON_EXPIRY),
+        )
+    logger.info(
+        "Non-expiry day: overridden lots=%d, leg_sl_pct=%.1f%% for all strategies",
+        STRATEGY_LOTS_NON_EXPIRY,
+        LEG_SL_PCT_NON_EXPIRY,
+    )
+
+
 def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
+    _apply_non_expiry_overrides(expiry)
     test_mode = os.getenv("TEST_FIRST_STRATEGY_IN_1MIN", "false").lower() == "true"
     
     for idx, strategy in enumerate(STRATEGY_STATE.values()):
