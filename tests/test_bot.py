@@ -232,10 +232,10 @@ class TestGetFilledOrders(unittest.TestCase):
     def test_get_filled_orders(self):
         """Test filtering filled orders by tags."""
         order_book = [
-            {"OrderUniqueIdentifier": "TAG1", "OrderStatus": "Filled"},
-            {"OrderUniqueIdentifier": "TAG2", "OrderStatus": "Pending"},
-            {"OrderUniqueIdentifier": "TAG3", "OrderStatus": "Filled"},
-            {"OrderUniqueIdentifier": "TAG4", "OrderStatus": "Rejected"},
+            {"OrderUniqueIdentifier": "TAG1", "OrderStatus": "Filled", "OrderAverageTradedPrice": 10.0},
+            {"OrderUniqueIdentifier": "TAG2", "OrderStatus": "Pending", "OrderAverageTradedPrice": 0.0},
+            {"OrderUniqueIdentifier": "TAG3", "OrderStatus": "Filled", "OrderAverageTradedPrice": 12.0},
+            {"OrderUniqueIdentifier": "TAG4", "OrderStatus": "Rejected", "OrderAverageTradedPrice": 0.0},
         ]
         tags = ["TAG1", "TAG3", "TAG4"]
         
@@ -248,8 +248,8 @@ class TestGetFilledOrders(unittest.TestCase):
     def test_get_filled_orders_none_filled(self):
         """Test when no orders are filled."""
         order_book = [
-            {"OrderUniqueIdentifier": "TAG1", "OrderStatus": "Pending"},
-            {"OrderUniqueIdentifier": "TAG2", "OrderStatus": "Rejected"},
+            {"OrderUniqueIdentifier": "TAG1", "OrderStatus": "Pending", "OrderAverageTradedPrice": 0.0},
+            {"OrderUniqueIdentifier": "TAG2", "OrderStatus": "Rejected", "OrderAverageTradedPrice": 0.0},
         ]
         tags = ["TAG1", "TAG2"]
         
@@ -316,13 +316,14 @@ class TestExecuteStrategy(unittest.TestCase):
 
     @patch("bot._place_leg_sl_orders")
     @patch("bot._get_filled_orders")
+    @patch("bot._ensure_margin_or_skip_strategy", return_value=True)
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
     @patch("time.time", return_value=1707400000)
     @patch("time.sleep")
     @patch("datetime.datetime")
     def test_successful_strategy_execution(
-        self, mock_dt, mock_sleep, mock_time, mock_get_atm, mock_update, mock_filled, mock_place_sl
+        self, mock_dt, mock_sleep, mock_time, mock_get_atm, mock_update, mock_ensure_margin, mock_filled, mock_place_sl
     ):
         """Test successful strategy execution."""
         mock_dt.now.return_value.strftime.return_value = "09:20:01"
@@ -331,7 +332,28 @@ class TestExecuteStrategy(unittest.TestCase):
         self.client.get_option_instrument_id.side_effect = [12345, 67890]
         self.client.place_market_order.side_effect = ["CE_ORDER_ID", "PE_ORDER_ID"]
         self.client.get_order_book.return_value = []
-        mock_filled.return_value = []
+        mock_filled.return_value = [
+            {
+                "OrderUniqueIdentifier": "S0920_CE_SELL_1707400000",
+                "OrderStatus": "Filled",
+                "OrderAverageTradedPrice": 150.0,
+                "OrderQuantity": 520,
+                "OrderQuantityTraded": 520,
+                "ExchangeInstrumentID": 12345,
+                "TradingSymbol": "NIFTY_TEST_CE",
+                "ProductType": "MIS",
+            },
+            {
+                "OrderUniqueIdentifier": "S0920_PE_SELL_1707400000",
+                "OrderStatus": "Filled",
+                "OrderAverageTradedPrice": 145.0,
+                "OrderQuantity": 520,
+                "OrderQuantityTraded": 520,
+                "ExchangeInstrumentID": 67890,
+                "TradingSymbol": "NIFTY_TEST_PE",
+                "ProductType": "MIS",
+            },
+        ]
         mock_place_sl.return_value = ([], {})  # Return tuple: (sl_orders, tag_map)
         
         strategy = {

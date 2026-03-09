@@ -10,9 +10,21 @@ import schedule
 from config import (
     ACC_NAME,
     INDEX_CONFIGS,
+    HEDGE_LOTS,
+    HEDGE_PREMIUM_MAX_EXPIRY,
+    HEDGE_PREMIUM_MAX_NON_EXPIRY,
+    HEDGE_PREMIUM_MIN_EXPIRY,
+    HEDGE_PREMIUM_MIN_NON_EXPIRY,
+    HEDGE_TARGET_PREMIUM_EXPIRY,
+    HEDGE_TARGET_PREMIUM_NON_EXPIRY,
+    ITM_STRIKES_NIFTY,
+    ITM_STRIKES_SENSEX,
+    LEG_SL_PCT_NON_EXPIRY,
     PORTFOLIO_SL_LIMIT,
+    REQUIRED_MARGIN_PER_STRATEGY,
     SOURCE,
     STRATEGIES,
+    STRATEGY_LOTS_NON_EXPIRY,
     DEMO_MODE,
     get_basic_auth_creds,
     load_credentials,
@@ -73,6 +85,196 @@ def _get_atm_strike(client: XTSClient, index_config) -> Optional[int]:
     spot_val = round(float(spot), 2)
     set_spot(spot_val)
     return int(round(spot_val / index_config.strike_diff) * index_config.strike_diff)
+
+
+def _is_expiry_day(expiry: str) -> bool:
+    """Return True if today (IST) equals the option expiry date."""
+    try:
+        expiry_date = datetime.datetime.strptime(expiry, "%d%b%Y").date()
+    except ValueError:
+        return False
+    return get_ist_now().date() == expiry_date
+
+
+def _find_hedge_by_target_premium(
+    client: XTSClient,
+    index_config,
+    expiry: str,
+    option_type: str,
+    atm_strike: int,
+    target_premium: float,
+    min_premium: float,
+    max_premium: float,
+    max_steps: int = 40,
+) -> Optional[dict]:
+    """
+    Find a far-OTM hedge option with LTP within [min_premium, max_premium], closest to target_premium.
+    For CE: scans strikes above ATM; For PE: scans strikes below ATM.
+    Returns dict with strike, instrument_id, ltp.
+    """
+    direction = 1 if option_type.upper() == "CE" else -1
+    strike_diff = int(index_config.strike_diff)
+
+    candidates: List[Tuple[int, int]] = []
+    for i in range(1, max_steps + 1):
+        strike = atm_strike + (i * strike_diff * direction)
+        instrument_id = client.get_option_instrument_id(index_config, expiry, option_type.upper(), strike)
+        if instrument_id:
+            try:
+                candidates.append((strike, int(instrument_id)))
+            except (TypeError, ValueError):
+                continue
+
+    if not candidates:
+        return None
+
+    instruments = [
+        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": instrument_id}
+        for _, instrument_id in candidates
+    ]
+    ltp_map = client.get_ltp_map(instruments)
+
+    best = None  # (abs_diff, strike, instrument_id, ltp)
+    for strike, instrument_id in candidates:
+        ltp = ltp_map.get(instrument_id)
+        if ltp is None:
+            continue
+        try:
+            ltp_val = float(ltp)
+        except (TypeError, ValueError):
+            continue
+        if not (min_premium <= ltp_val <= max_premium):
+            continue
+        diff = abs(ltp_val - float(target_premium))
+        if best is None or diff < best[0]:
+            best = (diff, strike, instrument_id, ltp_val)
+
+    if best is None:
+        return None
+
+    _, strike, instrument_id, ltp_val = best
+    return {"strike": strike, "instrument_id": instrument_id, "ltp": ltp_val}
+
+
+def _ensure_margin_or_skip_strategy(
+    client: XTSClient,
+    index_config,
+    expiry: str,
+    strategy: dict,
+    atm_strike: int,
+) -> bool:
+    """
+    Ensure required margin is available before placing the straddle.
+    If margin is low, buys far-OTM hedges (CE above ATM, PE below ATM), refreshes margin,
+    and only proceeds if margin becomes sufficient.
+    If still insufficient, closes hedges and marks strategy as ERROR.
+    """
+    name = strategy["name"]
+
+    available = client.get_available_margin()
+    update_portfolio_margin(available)
+    if available is not None and float(available) >= float(REQUIRED_MARGIN_PER_STRATEGY):
+        return True
+
+    target_premium = float(HEDGE_TARGET_PREMIUM_EXPIRY) if _is_expiry_day(expiry) else float(HEDGE_TARGET_PREMIUM_NON_EXPIRY)
+    min_premium = float(HEDGE_PREMIUM_MIN_EXPIRY) if _is_expiry_day(expiry) else float(HEDGE_PREMIUM_MIN_NON_EXPIRY)
+    max_premium = float(HEDGE_PREMIUM_MAX_EXPIRY) if _is_expiry_day(expiry) else float(HEDGE_PREMIUM_MAX_NON_EXPIRY)
+
+    update_strategy(
+        name,
+        message=f"Low margin ({available}); buying hedges targeting ~₹{target_premium} (LTP in ₹{min_premium}-₹{max_premium})",
+    )
+
+    pe_hedge = _find_hedge_by_target_premium(
+        client=client,
+        index_config=index_config,
+        expiry=expiry,
+        option_type="PE",
+        atm_strike=atm_strike,
+        target_premium=target_premium,
+        min_premium=min_premium,
+        max_premium=max_premium,
+    )
+    ce_hedge = _find_hedge_by_target_premium(
+        client=client,
+        index_config=index_config,
+        expiry=expiry,
+        option_type="CE",
+        atm_strike=atm_strike,
+        target_premium=target_premium,
+        min_premium=min_premium,
+        max_premium=max_premium,
+    )
+
+    if not pe_hedge or not ce_hedge:
+        update_strategy(name, status="ERROR", message="Margin low; unable to find hedge options")
+        return False
+
+    hedge_qty = int(HEDGE_LOTS) * int(index_config.lot_size)
+    hedge_orders = []
+    for hedge, side in ((pe_hedge, "PE"), (ce_hedge, "CE")):
+        tag = f"{name}_HEDGE_{side}_BUY_{int(time.time())}"
+        oid = client.place_market_order(
+            index_config=index_config,
+            instrument_id=int(hedge["instrument_id"]),
+            order_side=client.interactive.TRANSACTION_TYPE_BUY,
+            quantity=hedge_qty,
+            tag=tag,
+            product_type=client.interactive.PRODUCT_MIS,
+        )
+        if oid:
+            hedge_orders.append({"app_order_id": oid, "tag": tag, "instrument_id": int(hedge["instrument_id"])})
+        else:
+            # Rollback any hedge order already placed
+            for placed in hedge_orders:
+                try:
+                    client.cancel_order(placed["app_order_id"], placed["tag"])
+                except Exception:
+                    logger.exception("Failed to cancel hedge order %s", placed)
+            # If anything got filled, close using broker positions
+            try:
+                positions = client.get_positions()
+                _close_positions_for_instruments(
+                    client,
+                    index_config,
+                    positions,
+                    [p["instrument_id"] for p in hedge_orders],
+                )
+            except Exception:
+                logger.exception("Failed to rollback hedge positions for %s", name)
+
+            update_strategy(name, status="ERROR", message="Margin low; hedge order placement failed")
+            return False
+
+    update_strategy(
+        name,
+        hedge_orders=hedge_orders,
+        hedge_target_premium=target_premium,
+        hedge_qty=hedge_qty,
+        hedge_strikes={"PE": pe_hedge.get("strike"), "CE": ce_hedge.get("strike")},
+    )
+
+    time.sleep(5)
+    available2 = client.get_available_margin()
+    update_portfolio_margin(available2)
+    if available2 is not None and float(available2) >= float(REQUIRED_MARGIN_PER_STRATEGY):
+        update_strategy(name, message=f"Margin improved ({available2}); proceeding with straddle")
+        return True
+
+    # Still insufficient: close hedge positions and skip strategy
+    try:
+        positions = client.get_positions()
+        _close_positions_for_instruments(
+            client,
+            index_config,
+            positions,
+            [int(pe_hedge["instrument_id"]), int(ce_hedge["instrument_id"])],
+        )
+    except Exception:
+        logger.exception("Failed to close hedge positions for %s", name)
+
+    update_strategy(name, status="ERROR", message="Margin not available even after hedges")
+    return False
 
 
 def _round_to_tick(price: float, tick_size: float = 0.05) -> float:
@@ -142,23 +344,40 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
         return
 
     name = strategy["name"]
-    strike = _get_atm_strike(client, index_config)
-    if strike is None:
+    is_expiry = _is_expiry_day(expiry)
+    atm_strike = _get_atm_strike(client, index_config)
+    if atm_strike is None:
         update_strategy(name, status="ERROR", message="Spot LTP unavailable")
         return
 
-    ce_id = client.get_option_instrument_id(index_config, expiry, "CE", strike)
-    pe_id = client.get_option_instrument_id(index_config, expiry, "PE", strike)
+    # Expiry: ATM straddle (same strike CE & PE). Non-expiry: ITM (CE below spot, PE above spot).
+    strike_diff = int(index_config.strike_diff)
+    if is_expiry:
+        ce_strike = pe_strike = atm_strike
+    else:
+        n = int(ITM_STRIKES_SENSEX) if index_config.name == "SENSEX" else int(ITM_STRIKES_NIFTY)
+        ce_strike = atm_strike - n * strike_diff
+        pe_strike = atm_strike + n * strike_diff
+
+    ce_id = client.get_option_instrument_id(index_config, expiry, "CE", ce_strike)
+    pe_id = client.get_option_instrument_id(index_config, expiry, "PE", pe_strike)
     if not ce_id or not pe_id:
         update_strategy(name, status="ERROR", message="Option instruments not found")
         return
 
-    qty = strategy["lots"] * index_config.lot_size
+    # Pre-check margin; if low, buy far-OTM hedges first and refresh.
+    if not _ensure_margin_or_skip_strategy(client, index_config, expiry, strategy, atm_strike):
+        return
+
+    effective_lots = int(STRATEGY_LOTS_NON_EXPIRY) if not is_expiry else int(strategy["lots"])
+    effective_leg_sl_pct = float(LEG_SL_PCT_NON_EXPIRY) if not is_expiry else float(strategy["leg_sl_pct"])
+    qty = effective_lots * index_config.lot_size
     ce_tag = f"{name}_CE_SELL_{int(time.time())}"
     pe_tag = f"{name}_PE_SELL_{int(time.time())}"
 
+    placed_entry = []
     for instrument_id, tag in [(ce_id, ce_tag), (pe_id, pe_tag)]:
-        client.place_market_order(
+        order_id = client.place_market_order(
             index_config=index_config,
             instrument_id=instrument_id,
             order_side=client.interactive.TRANSACTION_TYPE_SELL,
@@ -166,11 +385,36 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
             tag=tag,
             product_type=client.interactive.PRODUCT_MIS,
         )
+        if order_id:
+            placed_entry.append({"app_order_id": order_id, "tag": tag, "instrument_id": int(instrument_id)})
+        else:
+            # Rollback any already placed entry order to avoid a naked leg.
+            for placed in placed_entry:
+                try:
+                    client.cancel_order(placed["app_order_id"], placed["tag"])
+                except Exception:
+                    logger.exception("Failed to cancel entry order %s", placed)
+
+            try:
+                positions = client.get_positions()
+                _close_positions_for_instruments(
+                    client,
+                    index_config,
+                    positions,
+                    [p["instrument_id"] for p in placed_entry],
+                )
+            except Exception:
+                logger.exception("Failed to rollback partial straddle for %s", name)
+
+            update_strategy(name, status="ERROR", message="Entry order placement failed (margin/blocked)")
+            return
 
     update_strategy(
         name,
         status="OPEN",
-        strike=strike,
+        strike=atm_strike,
+        strike_ce=ce_strike,
+        strike_pe=pe_strike,
         instrument_ids=[ce_id, pe_id],
         entry_time=get_ist_timestamp(),
         order_tags=[ce_tag, pe_tag],
@@ -179,10 +423,10 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     # Log strategy execution to database
     strategy_db_id = log_strategy_execution(
         name,
-        strike,
+        atm_strike,
         get_ist_timestamp(),
-        strategy.get("lots", 0),
-        strategy.get("leg_sl_pct", 0.0),
+        effective_lots,
+        effective_leg_sl_pct,
         strategy.get("strategy_sl", 0.0),
     )
     update_strategy(name, db_id=strategy_db_id)
@@ -194,7 +438,8 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     tags = [ce_tag, pe_tag]
     max_wait_seconds = 45
     poll_interval = 3
-    start_time = time.time()
+    max_attempts = max(1, int(max_wait_seconds // poll_interval))
+    attempts = 0
 
     while True:
         try:
@@ -207,7 +452,8 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
         if len(filled) >= 2:
             break
 
-        if time.time() - start_time >= max_wait_seconds:
+        attempts += 1
+        if attempts >= max_attempts:
             break
 
         time.sleep(poll_interval)
@@ -223,7 +469,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
         # but we can't place SLs safely without fills.
         return
 
-    sl_orders, tag_to_instrument = _place_leg_sl_orders(client, index_config, filled, strategy["leg_sl_pct"], name)
+    sl_orders, tag_to_instrument = _place_leg_sl_orders(client, index_config, filled, effective_leg_sl_pct, name)
     positions = []
     for order in filled:
         try:

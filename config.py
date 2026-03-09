@@ -68,6 +68,28 @@ STRATEGIES = [
 ]
 
 PORTFOLIO_SL_LIMIT = -50000.0
+
+# Margin + hedging configuration
+# If available margin is below this, bot will buy far-OTM hedges first.
+REQUIRED_MARGIN_PER_STRATEGY = float(os.getenv("REQUIRED_MARGIN_PER_STRATEGY", "1750000"))
+# Hedge lots to buy on both sides (CE+PE) when margin is low.
+HEDGE_LOTS = int(os.getenv("HEDGE_LOTS", "7"))
+# Strategy lots: expiry uses STRATEGIES[].lots (7), non-expiry uses this.
+STRATEGY_LOTS_NON_EXPIRY = int(os.getenv("STRATEGY_LOTS_NON_EXPIRY", "4"))
+# ITM strikes away from ATM for non-expiry (NIFTY: 2 → 25100 CE / 25300 PE @ spot 25200; SENSEX: 3).
+ITM_STRIKES_NIFTY = int(os.getenv("ITM_STRIKES_NIFTY", "2"))
+ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "3"))
+# Leg SL % on non-expiry day (override per-strategy); expiry uses strategy leg_sl_pct.
+LEG_SL_PCT_NON_EXPIRY = float(os.getenv("LEG_SL_PCT_NON_EXPIRY", "20.0"))
+# Target premium for hedge selection (approx LTP per option).
+HEDGE_TARGET_PREMIUM_EXPIRY = float(os.getenv("HEDGE_TARGET_PREMIUM_EXPIRY", "5"))
+HEDGE_TARGET_PREMIUM_NON_EXPIRY = float(os.getenv("HEDGE_TARGET_PREMIUM_NON_EXPIRY", "10"))
+# Allowed LTP range for hedge strikes (reject if outside). Expiry: 2–8, non-expiry: 7–13.
+HEDGE_PREMIUM_MIN_EXPIRY = float(os.getenv("HEDGE_PREMIUM_MIN_EXPIRY", "2"))
+HEDGE_PREMIUM_MAX_EXPIRY = float(os.getenv("HEDGE_PREMIUM_MAX_EXPIRY", "8"))
+HEDGE_PREMIUM_MIN_NON_EXPIRY = float(os.getenv("HEDGE_PREMIUM_MIN_NON_EXPIRY", "7"))
+HEDGE_PREMIUM_MAX_NON_EXPIRY = float(os.getenv("HEDGE_PREMIUM_MAX_NON_EXPIRY", "13"))
+
 SOURCE = "WEBAPI"
 DEMO_MODE = os.getenv("DEMO_MODE", "False").lower() in ("true", "1", "yes")  # Reads from environment variable
 SSM_BASE_PATH = "/trade/config"
