@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pytz
 
+try:
+    from config import LEG_TARGET_PCT
+except ImportError:
+    LEG_TARGET_PCT = 65.0
+
 logger = logging.getLogger("xts-bot-lite")
 
 DB_PATH = "trades.db"
@@ -449,11 +454,14 @@ def restore_positions_for_strategy(strategy_id: int) -> List[Dict[str, Any]]:
         
         positions = []
         for row in rows:
+            entry = float(row["entry_price"]) if row["entry_price"] is not None else 0.0
+            target_price = round(entry * (1 - LEG_TARGET_PCT / 100.0), 2) if entry > 0 else None
             positions.append({
                 "symbol": row["symbol"],
                 "instrument_id": row["instrument_id"],
                 "quantity": row["quantity"],
                 "entry_price": row["entry_price"],
+                "target_price": target_price,
                 "exit_price": row["exit_price"],
             })
         

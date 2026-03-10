@@ -4,6 +4,11 @@ import sqlite3
 
 from state import get_snapshot, get_mtm_snapshots_enabled, set_mtm_snapshots_enabled
 
+try:
+    from config import LEG_TARGET_PCT
+except ImportError:
+    LEG_TARGET_PCT = 65.0
+
 DASHBOARD_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -107,7 +112,7 @@ DASHBOARD_TEMPLATE = """
     <div id="positions" class="tab-content">
       <table>
         <thead>
-          <tr><th>Strategy</th><th>Symbol</th><th>Quantity</th><th>Entry Price</th><th>Exit Price</th><th>Entry Time</th><th>Exit Time</th><th>Status</th></tr>
+          <tr><th>Strategy</th><th>Symbol</th><th>Quantity</th><th>Entry Price</th><th>Target (65%)</th><th>Exit Price</th><th>Entry Time</th><th>Exit Time</th><th>Status</th></tr>
         </thead>
         <tbody id="positions-rows">Loading...</tbody>
       </table>
@@ -327,6 +332,7 @@ DASHBOARD_TEMPLATE = """
               <td><span class="tag">${p.symbol || '-'}</span></td>
               <td>${p.quantity || '-'}</td>
               <td>${fmt(p.entry_price)}</td>
+              <td>${p.target_price != null ? fmt(p.target_price) : '-'}</td>
               <td ${p.exit_price ? `class="${getClass(pnl)}"` : ''}>${fmt(p.exit_price) || '-'}</td>
               <td>${p.entry_time || '-'}</td>
               <td>${p.exit_time || '-'}</td>
@@ -334,7 +340,7 @@ DASHBOARD_TEMPLATE = """
             </tr>
           `;
         }
-        document.getElementById('positions-rows').innerHTML = positionsHTML || '<tr><td colspan="8">No data</td></tr>';
+        document.getElementById('positions-rows').innerHTML = positionsHTML || '<tr><td colspan="9">No data</td></tr>';
 
         let ordersHTML = '';
         for (const o of orders.slice(0, 50)) {
@@ -433,6 +439,7 @@ HTML_TEMPLATE = """
         <th>Time</th>
         <th>Lots</th>
         <th>Leg SL %</th>
+        <th>Leg target %</th>
         <th>Strategy SL</th>
         <th>Status</th>
         <th>MTM</th>
@@ -479,6 +486,7 @@ HTML_TEMPLATE = """
           <td>${s.time}</td>
           <td>${s.lots}</td>
           <td>${s.leg_sl_pct}</td>
+          <td>${s.leg_target_pct != null ? s.leg_target_pct : '-'}</td>
           <td>${fmt(s.strategy_sl)}</td>
           <td>${s.status || '-'}</td>
           <td class="${mtmClass}">${fmt(s.mtm)}</td>
@@ -549,7 +557,7 @@ def create_app(username: str, password: str) -> Flask:
     @app.route("/api/positions")
     @basic_auth.required
     def api_positions():
-        """Get all positions from database."""
+        """Get all positions from database. Adds target_price (65%% profit on entry premium) for UI."""
         try:
             conn = sqlite3.connect("trades.db")
             conn.row_factory = sqlite3.Row
@@ -557,7 +565,16 @@ def create_app(username: str, password: str) -> Flask:
             cursor.execute("SELECT * FROM positions ORDER BY id DESC")
             rows = cursor.fetchall()
             conn.close()
-            return jsonify([dict(row) for row in rows])
+            out = []
+            for row in rows:
+                d = dict(row)
+                ep = d.get("entry_price")
+                if ep is not None and float(ep) > 0:
+                    d["target_price"] = round(float(ep) * (1 - LEG_TARGET_PCT / 100.0), 2)
+                else:
+                    d["target_price"] = None
+                out.append(d)
+            return jsonify(out)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 

@@ -20,6 +20,7 @@ from config import (
     ITM_STRIKES_NIFTY,
     ITM_STRIKES_SENSEX,
     LEG_SL_PCT_NON_EXPIRY,
+    LEG_TARGET_PCT,
     PORTFOLIO_SL_LIMIT,
     REQUIRED_MARGIN_PER_STRATEGY,
     SOURCE,
@@ -372,14 +373,14 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
         update_strategy(name, status="ERROR", message="Spot LTP unavailable")
         return
 
-    # Expiry: ATM straddle (same strike CE & PE). Non-expiry: ITM (CE below spot, PE above spot).
+    # Expiry: ITM (CE below spot, PE above spot). Non-expiry: ATM straddle (same strike CE & PE).
     strike_diff = int(index_config.strike_diff)
     if is_expiry:
-        ce_strike = pe_strike = atm_strike
-    else:
         n = int(ITM_STRIKES_SENSEX) if index_config.name == "SENSEX" else int(ITM_STRIKES_NIFTY)
         ce_strike = atm_strike - n * strike_diff
         pe_strike = atm_strike + n * strike_diff
+    else:
+        ce_strike = pe_strike = atm_strike
 
     ce_id = client.get_option_instrument_id(index_config, expiry, "CE", ce_strike)
     pe_id = client.get_option_instrument_id(index_config, expiry, "PE", pe_strike)
@@ -508,11 +509,14 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
             entry_price = float(order.get("OrderAverageTradedPrice", 0.0))
         except (TypeError, ValueError):
             continue
+        # Target price: close leg when LTP reaches this (65% profit on executed sell premium = entry_price)
+        target_price = round(entry_price * (1 - LEG_TARGET_PCT / 100.0), 2)
         positions.append(
             {
                 "instrument_id": instrument_id,
                 "quantity": quantity,
                 "entry_price": entry_price,
+                "target_price": target_price,
                 "exit_price": None,
                 "symbol": order.get("TradingSymbol"),
             }
@@ -787,6 +791,111 @@ def _sync_sl_order_status_and_capture_exits(client: XTSClient, strategy: dict) -
             matching_position["sl_status"] = "WAITING"
 
 
+def _check_leg_target_and_close(
+    client: XTSClient, strategy: dict, ltp_map: Dict[int, float]
+) -> None:
+    """
+    If any leg's profit from collected premium reaches LEG_TARGET_PCT (e.g. 65%),
+    close that leg by modifying its SL order to market (single action: leg closed + SL order executed).
+    Target is calculated on executed sell order premium (entry_price): profit_pct = (entry_price - ltp) / entry_price * 100.
+    """
+    if strategy["status"] != "OPEN" or not strategy.get("sl_orders"):
+        return
+    if client is None:
+        return
+
+    sl_orders = strategy.get("sl_orders", []) or []
+    sl_tag_map = strategy.get("sl_tag_map", {}) or {}
+    # Build instrument_id -> (app_order_id, tag) for SL orders
+    instrument_to_sl: Dict[int, Tuple[int, str]] = {}
+    for so in sl_orders:
+        tag = so.get("tag")
+        app_order_id = so.get("app_order_id")
+        if not tag or app_order_id is None:
+            continue
+        instrument_id = sl_tag_map.get(tag)
+        if instrument_id is not None:
+            instrument_to_sl[int(instrument_id)] = (int(app_order_id), tag)
+
+    target_triggered = set(strategy.get("target_triggered_instruments") or [])
+
+    try:
+        order_book = client.get_order_book()
+    except Exception as e:
+        logger.error("Failed to fetch order book for leg target check %s: %s", strategy["name"], e)
+        return
+
+    order_book_by_id = {}
+    order_book_by_tag = {}
+    for order in order_book:
+        oid = order.get("AppOrderID")
+        tag = order.get("OrderUniqueIdentifier")
+        if oid is not None:
+            order_book_by_id[oid] = order
+        if tag:
+            order_book_by_tag[tag] = order
+
+    positions = strategy.get("positions") or []
+    for pos in positions:
+        if pos.get("exit_price") is not None:
+            continue
+        instrument_id = pos.get("instrument_id")
+        entry_price = pos.get("entry_price")
+        if instrument_id is None or entry_price is None or float(entry_price) <= 0:
+            continue
+        instrument_id = int(instrument_id)
+        if instrument_id in target_triggered:
+            continue
+
+        ltp = ltp_map.get(instrument_id)
+        if ltp is None:
+            continue
+        try:
+            entry_f = float(entry_price)
+            ltp_f = float(ltp)
+        except (TypeError, ValueError):
+            continue
+        # Short position: profit when LTP drops. Profit % = (entry - ltp) / entry * 100
+        profit_pct = (entry_f - ltp_f) / entry_f * 100.0
+        if profit_pct < float(LEG_TARGET_PCT):
+            continue
+
+        sl_info = instrument_to_sl.get(instrument_id)
+        if not sl_info:
+            continue
+        app_order_id, tag = sl_info
+        order_detail = order_book_by_id.get(app_order_id) or order_book_by_tag.get(tag)
+        if not order_detail:
+            continue
+        order_status = (order_detail.get("OrderStatus") or "").replace(" ", "").upper()
+        if order_status not in ("NEW", "REPLACED"):
+            continue
+
+        try:
+            client.modify_order(
+                app_order_id=app_order_id,
+                product_type=order_detail.get("ProductType"),
+                order_type=client.interactive.ORDER_TYPE_MARKET,
+                quantity=int(order_detail.get("OrderQuantity", 0)),
+                disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
+                stop_price=0,
+                limit_price=0,
+                time_in_force=order_detail.get("TimeInForce"),
+                tag=tag,
+            )
+            target_triggered.add(instrument_id)
+            update_strategy(strategy["name"], target_triggered_instruments=target_triggered)
+            logger.info(
+                "✅ [%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%); modified SL to market",
+                strategy["name"], float(LEG_TARGET_PCT), instrument_id, profit_pct,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to modify SL to market for leg target [%s] instrument %s: %s",
+                strategy["name"], instrument_id, e,
+            )
+
+
 def _check_all_positions_closed(strategy: dict) -> bool:
     """
     Determine if ALL positions in strategy are closed.
@@ -847,6 +956,9 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
     for strategy in STRATEGY_STATE.values():
         # **FIRST**: Sync SL order status from XTS order book (single source of truth)
         _sync_sl_order_status_and_capture_exits(client, strategy)
+
+        # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to market
+        _check_leg_target_and_close(client, strategy, ltp_map)
         
         # Sync strategy positions with broker positions to keep state real-time
         _sync_strategy_positions_from_broker(strategy, positions)
@@ -909,7 +1021,7 @@ def _update_available_margin(client: XTSClient) -> None:
 STRATEGY_STATE: Dict[str, dict] = {
     cfg.name: {
         "name": cfg.name, "time": cfg.time, "lots": cfg.lots,
-        "leg_sl_pct": cfg.leg_sl_pct, "strategy_sl": cfg.strategy_sl,
+        "leg_sl_pct": cfg.leg_sl_pct, "leg_target_pct": LEG_TARGET_PCT, "strategy_sl": cfg.strategy_sl,
         "status": "PENDING", "mtm": 0.0, "realized": 0.0, "unrealized": 0.0,
         "strike": None, "instrument_ids": [], "sl_orders": [], "positions": [],
         "order_tags": [], "entry_time": None, "message": None, "last_update": None,
