@@ -79,8 +79,8 @@ HEDGE_LOTS = int(os.getenv("HEDGE_LOTS", "7"))
 # Strategy lots: expiry uses STRATEGIES[].lots (7), non-expiry uses this.
 STRATEGY_LOTS_NON_EXPIRY = int(os.getenv("STRATEGY_LOTS_NON_EXPIRY", "4"))
 # ITM strikes away from ATM for expiry days (NIFTY: 2 → 25100 CE / 25300 PE @ spot 25200; SENSEX: 3). Non-expiry uses ATM.
-ITM_STRIKES_NIFTY = int(os.getenv("ITM_STRIKES_NIFTY", "2"))
-ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "3"))
+ITM_STRIKES_NIFTY = int(os.getenv("ITM_STRIKES_NIFTY", "1"))
+ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "2"))
 # Leg SL % on non-expiry day (override per-strategy); expiry uses strategy leg_sl_pct.
 LEG_SL_PCT_NON_EXPIRY = float(os.getenv("LEG_SL_PCT_NON_EXPIRY", "20.0"))
 # Leg target %: if a leg's profit (as % of executed sell order premium / entry_price) reaches this, close that leg by modifying SL to market.
