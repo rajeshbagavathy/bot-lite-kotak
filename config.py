@@ -67,7 +67,7 @@ STRATEGIES = [
     StrategyConfig("S1255", "12:55:00", 7, 35.0, 10000.0),
 ]
 
-PORTFOLIO_SL_LIMIT = -50000.0
+PORTFOLIO_SL_LIMIT = -80000.0
 # Set to True to enable trading on non-expiry days; False disables all strategies on non-expiry.
 TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "False").lower() in ("true", "1", "yes")
 
