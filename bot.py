@@ -27,6 +27,7 @@ from config import (
     STRATEGY_LOTS_NON_EXPIRY,
     TRADE_NON_EXPIRY_DAY,
     DEMO_MODE,
+    DB_ENABLE_MTM_SNAPSHOTS,
     get_basic_auth_creds,
     load_credentials,
 )
@@ -46,7 +47,17 @@ from db import (
     get_ist_now,
 )
 from mtm import calculate_mtm, calculate_strategy_mtm
-from state import init_state, set_index, set_index_error, set_spot, update_portfolio, update_portfolio_margin, update_strategy
+from state import (
+    init_state,
+    set_index,
+    set_index_error,
+    set_spot,
+    update_portfolio,
+    update_portfolio_margin,
+    update_strategy,
+    get_mtm_snapshots_enabled,
+    set_mtm_snapshots_enabled,
+)
 from ui import create_app
 from xts_client import XTSClient
 
@@ -57,6 +68,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
+_LAST_MTM_LOG: Dict[str, float] = {}  # strategy_name -> last log timestamp (for throttling)
 
 
 def _pick_index_and_expiry(client: XTSClient) -> Tuple[dict, str]:
@@ -324,6 +336,15 @@ def _place_leg_sl_orders(
         if order_id:
             sl_orders.append({"app_order_id": order_id, "tag": tag})
             tag_to_instrument[tag] = instrument_id
+            log_order(
+                strategy_name,
+                tag,
+                instrument_id,
+                order.get("TradingSymbol", ""),
+                quantity,
+                "STOPLIMIT",
+                "BUY",
+            )
     return sl_orders, tag_to_instrument
 
 
@@ -410,6 +431,9 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
             update_strategy(name, status="ERROR", message="Entry order placement failed (margin/blocked)")
             return
 
+    for instrument_id, tag in [(ce_id, ce_tag), (pe_id, pe_tag)]:
+        log_order(name, tag, int(instrument_id), "", qty, "MARKET", "SELL")
+
     update_strategy(
         name,
         status="OPEN",
@@ -451,6 +475,11 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
 
         filled = _get_filled_orders(order_book, tags)
         if len(filled) >= 2:
+            for order in filled:
+                tag_id = order.get("OrderUniqueIdentifier")
+                price = order.get("OrderAverageTradedPrice")
+                if tag_id:
+                    update_order_status(tag_id, "Filled", float(price) if price is not None else None)
             break
 
         attempts += 1
@@ -729,6 +758,7 @@ def _sync_sl_order_status_and_capture_exits(client: XTSClient, strategy: dict) -
                         f"✅ [{strategy['name']}] Position CLOSED via SL: "
                         f"Instrument {instrument_id}, Exit Price: {exit_price}"
                     )
+                    update_order_status(tag, "Filled", exit_price)
                     
                     # Log to database
                     if strategy["db_id"] and strategy["db_id"] > 0:
@@ -821,14 +851,12 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         # Sync strategy positions with broker positions to keep state real-time
         _sync_strategy_positions_from_broker(strategy, positions)
         
-        # **CHECK**: If all positions are closed via SL orders, mark strategy as CLOSED
+        # **CHECK**: If all positions are closed via SL orders, close strategy (logs to trades_closed)
         if strategy["status"] == "OPEN" and _check_all_positions_closed(strategy):
             logger.info(f"✅ [{strategy['name']}] All positions closed via SL orders - closing strategy")
-            update_strategy(
-                strategy["name"], 
-                status="CLOSED", 
-                message="All positions closed via SL orders",
-                positions=strategy.get("positions", [])
+            _close_strategy(
+                client, index_config, strategy, positions,
+                "All positions closed via SL orders",
             )
         
         strategy_positions = strategy.get("positions") or []
@@ -836,6 +864,11 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
             continue
         s_realized, s_unrealized, s_total = calculate_strategy_mtm(strategy_positions, ltp_map)
         update_strategy(strategy["name"], mtm=s_total, realized=s_realized, unrealized=s_unrealized)
+        if get_mtm_snapshots_enabled():
+            now_ts = time.time()
+            if now_ts - _LAST_MTM_LOG.get(strategy["name"], 0) >= 60:
+                log_mtm_snapshot(strategy["name"], s_total, s_realized, s_unrealized)
+                _LAST_MTM_LOG[strategy["name"]] = now_ts
         
         # Now s_total is based on actual broker positions (synced), not stale local data
         if strategy["status"] == "OPEN" and s_total <= -float(strategy["strategy_sl"]):
@@ -1051,6 +1084,7 @@ def main() -> None:
                 })
     
     init_state(STRATEGY_STATE)
+    set_mtm_snapshots_enabled(DB_ENABLE_MTM_SNAPSHOTS)
     if index_config is not None:
         set_index(index_config.name, expiry)
     else:

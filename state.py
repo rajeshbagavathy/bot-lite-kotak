@@ -11,6 +11,7 @@ STATE: Dict[str, dict] = {
     "index": {},
     "portfolio": {},
     "strategies": {},
+    "settings": {},
 }
 
 
@@ -27,6 +28,8 @@ def init_state(strategies: Dict[str, dict]) -> None:
             "margin_update": None,
         }
         STATE["strategies"] = strategies
+        if "settings" not in STATE or not STATE["settings"]:
+            STATE["settings"] = {"mtm_snapshots_enabled": False}
 
 
 def set_index(name: str, expiry: str) -> None:
@@ -76,3 +79,17 @@ def update_strategy(name: str, **fields) -> None:
 def get_snapshot() -> dict:
     with STATE_LOCK:
         return copy.deepcopy(STATE)
+
+
+def get_mtm_snapshots_enabled() -> bool:
+    """Whether MTM snapshots should be written to DB (can be toggled from UI)."""
+    with STATE_LOCK:
+        return bool(STATE.get("settings", {}).get("mtm_snapshots_enabled", False))
+
+
+def set_mtm_snapshots_enabled(enabled: bool) -> None:
+    """Enable or disable MTM snapshot logging (used by UI toggle)."""
+    with STATE_LOCK:
+        if "settings" not in STATE:
+            STATE["settings"] = {}
+        STATE["settings"]["mtm_snapshots_enabled"] = bool(enabled)

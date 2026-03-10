@@ -2,7 +2,7 @@ from flask import Flask, jsonify, render_template_string
 from flask_basicauth import BasicAuth
 import sqlite3
 
-from state import get_snapshot
+from state import get_snapshot, get_mtm_snapshots_enabled, set_mtm_snapshots_enabled
 
 DASHBOARD_TEMPLATE = """
 <!doctype html>
@@ -39,6 +39,8 @@ DASHBOARD_TEMPLATE = """
     .status-closed { background: #7c2d12; color: #fed7aa; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
     .status-disabled { background: #92400e; color: #fef3c7; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
     .disabled-banner { background: #92400e; color: #fef3c7; padding: 14px 20px; border-radius: 6px; margin-bottom: 16px; font-size: 15px; font-weight: bold; text-align: center; border: 2px solid #d97706; }
+    .setting-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .setting-row input[type="checkbox"] { cursor: pointer; }
     .tag { background: #1e40af; color: #dbeafe; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
     .meta-info { background: #0f172a; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
     .meta-item { border-right: 1px solid #334155; }
@@ -73,6 +75,16 @@ DASHBOARD_TEMPLATE = """
         <div class="card">
           <div class="card-title">Today's Summary</div>
           <div id="today-summary">Loading...</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Settings</div>
+          <div id="settings-card">
+            <label class="setting-row">
+              <input type="checkbox" id="mtm-snapshots-toggle" />
+              <span>Enable MTM snapshots</span>
+            </label>
+            <div class="meta-label" style="margin-top: 6px; font-size: 11px;">Writes strategy MTM to DB every ~60s when enabled. Turn on to populate the MTM Snapshots tab.</div>
+          </div>
         </div>
       </div>
       <table>
@@ -120,6 +132,13 @@ DASHBOARD_TEMPLATE = """
     </div>
 
     <div id="mtm" class="tab-content">
+      <div class="card" style="margin-bottom: 15px;">
+        <label class="setting-row">
+          <input type="checkbox" id="mtm-snapshots-toggle-tab" />
+          <span>Enable MTM snapshots</span>
+        </label>
+        <div class="meta-label" style="margin-top: 6px; font-size: 11px;">When enabled, strategy MTM is written to the database about every 60 seconds (table below).</div>
+      </div>
       <table>
         <thead>
           <tr><th>Strategy</th><th>Total MTM</th><th>Realized</th><th>Unrealized</th><th>Timestamp</th></tr>
@@ -164,6 +183,28 @@ DASHBOARD_TEMPLATE = """
         const portfolio = state.portfolio || {};
         const idx = state.index || {};
         const stateStrategies = state.strategies || {};
+
+        const mtmEnabled = !!(state.settings && state.settings.mtm_snapshots_enabled);
+        const toggle1 = document.getElementById('mtm-snapshots-toggle');
+        const toggle2 = document.getElementById('mtm-snapshots-toggle-tab');
+        if (toggle1) toggle1.checked = mtmEnabled;
+        if (toggle2) toggle2.checked = mtmEnabled;
+        if (toggle1 && !toggle1.dataset.bound) {
+          toggle1.dataset.bound = '1';
+          toggle1.addEventListener('change', async function() {
+            const enabled = toggle1.checked;
+            await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mtm_snapshots_enabled: enabled }) });
+            if (toggle2) toggle2.checked = enabled;
+          });
+        }
+        if (toggle2 && !toggle2.dataset.bound) {
+          toggle2.dataset.bound = '1';
+          toggle2.addEventListener('change', async function() {
+            const enabled = toggle2.checked;
+            await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mtm_snapshots_enabled: enabled }) });
+            if (toggle1) toggle1.checked = enabled;
+          });
+        }
 
         const allDisabled = Object.values(stateStrategies).length > 0 && Object.values(stateStrategies).every(s => s.status === 'DISABLED');
         const dashBanner = document.getElementById('dash-disabled-banner');
@@ -430,7 +471,6 @@ HTML_TEMPLATE = """
 
       const tbody = document.getElementById('strategy-rows');
       tbody.innerHTML = '';
-      const strategies = data.strategies || {};
       Object.values(strategies).forEach((s) => {
         const row = document.createElement('tr');
         const mtmClass = s.mtm < 0 ? 'negative' : 'positive';
@@ -476,6 +516,20 @@ def create_app(username: str, password: str) -> Flask:
     @basic_auth.required
     def state():
         return jsonify(get_snapshot())
+
+    @app.route("/api/settings", methods=["GET", "POST"])
+    @basic_auth.required
+    def api_settings():
+        """Get or update UI-editable settings (e.g. MTM snapshot enabled)."""
+        from flask import request
+        if request.method == "POST":
+            try:
+                data = request.get_json(force=True, silent=True) or {}
+                if "mtm_snapshots_enabled" in data:
+                    set_mtm_snapshots_enabled(bool(data["mtm_snapshots_enabled"]))
+            except Exception as e:
+                return jsonify({"error": str(e)}), 400
+        return jsonify({"mtm_snapshots_enabled": get_mtm_snapshots_enabled()})
 
     @app.route("/api/strategies")
     @basic_auth.required
