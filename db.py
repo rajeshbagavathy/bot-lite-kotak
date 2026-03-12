@@ -80,6 +80,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 strategy_name TEXT NOT NULL,
+                app_order_id INTEGER,
                 order_tag TEXT UNIQUE,
                 instrument_id INTEGER,
                 symbol TEXT,
@@ -91,6 +92,12 @@ def init_db() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Backwards-compatible migration: add app_order_id if an older DB exists.
+        cursor.execute("PRAGMA table_info(orders)")
+        cols = [row[1] for row in cursor.fetchall()]
+        if "app_order_id" not in cols:
+            cursor.execute("ALTER TABLE orders ADD COLUMN app_order_id INTEGER")
         
         # Trades (closed records) - stores finalized P&L
         cursor.execute("""
@@ -183,6 +190,7 @@ def log_position(
 
 def log_order(
     strategy_name: str,
+    app_order_id: Optional[int],
     order_tag: str,
     instrument_id: int,
     symbol: str,
@@ -198,9 +206,9 @@ def log_order(
         
         cursor.execute("""
             INSERT INTO orders 
-            (strategy_name, order_tag, instrument_id, symbol, quantity, order_type, order_side, status, traded_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (strategy_name, order_tag, instrument_id, symbol, quantity, order_type, order_side, "Pending", traded_price))
+            (strategy_name, app_order_id, order_tag, instrument_id, symbol, quantity, order_type, order_side, status, traded_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (strategy_name, app_order_id, order_tag, instrument_id, symbol, quantity, order_type, order_side, "Pending", traded_price))
         
         conn.commit()
         conn.close()
@@ -208,20 +216,33 @@ def log_order(
         logger.error(f"Failed to log order: {e}")
 
 
-def update_order_status(order_tag: str, status: str, traded_price: Optional[float] = None) -> None:
+def update_order_status(
+    order_tag: Optional[str] = None,
+    app_order_id: Optional[int] = None,
+    status: str = "",
+    traded_price: Optional[float] = None,
+) -> None:
     """Update order status when filled."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
+
+        if app_order_id is None and not order_tag:
+            raise ValueError("Either app_order_id or order_tag must be provided")
+
+        where = "app_order_id = ?" if app_order_id is not None else "order_tag = ?"
+        key = app_order_id if app_order_id is not None else order_tag
+
         if traded_price is not None:
-            cursor.execute("""
-                UPDATE orders SET status = ?, traded_price = ? WHERE order_tag = ?
-            """, (status, traded_price, order_tag))
+            cursor.execute(
+                f"UPDATE orders SET status = ?, traded_price = ? WHERE {where}",
+                (status, traded_price, key),
+            )
         else:
-            cursor.execute("""
-                UPDATE orders SET status = ? WHERE order_tag = ?
-            """, (status, order_tag))
+            cursor.execute(
+                f"UPDATE orders SET status = ? WHERE {where}",
+                (status, key),
+            )
         
         conn.commit()
         conn.close()

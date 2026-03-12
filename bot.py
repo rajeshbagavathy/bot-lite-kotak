@@ -341,6 +341,7 @@ def _place_leg_sl_orders(
             tag_to_instrument[tag] = instrument_id
             log_order(
                 strategy_name,
+                int(order_id) if order_id is not None else None,
                 tag,
                 instrument_id,
                 order.get("TradingSymbol", ""),
@@ -351,11 +352,12 @@ def _place_leg_sl_orders(
     return sl_orders, tag_to_instrument
 
 
-def _get_filled_orders(order_book: List[dict], tags: List[str]) -> List[dict]:
+def _get_filled_orders(order_book: List[dict], app_order_ids: List[int]) -> List[dict]:
+    id_set = {int(x) for x in (app_order_ids or []) if x is not None}
     return [
         order
         for order in order_book
-        if order.get("OrderUniqueIdentifier") in tags
+        if int(order.get("AppOrderID") or 0) in id_set
         and str(order.get("OrderStatus", "")).replace(" ", "").upper()
         in ("FILLED", "PARTIALLYFILLED")
         and float(order.get("OrderAverageTradedPrice") or 0) > 0
@@ -434,8 +436,17 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
             update_strategy(name, status="ERROR", message="Entry order placement failed (margin/blocked)")
             return
 
-    for instrument_id, tag in [(ce_id, ce_tag), (pe_id, pe_tag)]:
-        log_order(name, tag, int(instrument_id), "", qty, "MARKET", "SELL")
+    for placed in placed_entry:
+        log_order(
+            name,
+            int(placed["app_order_id"]),
+            str(placed["tag"]),
+            int(placed["instrument_id"]),
+            "",
+            qty,
+            "MARKET",
+            "SELL",
+        )
 
     update_strategy(
         name,
@@ -463,7 +474,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     # Wait for entry orders to get filled (or partially filled) before placing SLs.
     # This loop is resilient to slower fills and avoids missing SL placement.
     filled: List[dict] = []
-    tags = [ce_tag, pe_tag]
+    entry_app_order_ids = [int(p["app_order_id"]) for p in placed_entry if p.get("app_order_id") is not None]
     max_wait_seconds = 45
     poll_interval = 3
     max_attempts = max(1, int(max_wait_seconds // poll_interval))
@@ -476,13 +487,13 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
             logger.error("Failed to fetch order book while waiting for fills: %s", e)
             break
 
-        filled = _get_filled_orders(order_book, tags)
+        filled = _get_filled_orders(order_book, entry_app_order_ids)
         if len(filled) >= 2:
             for order in filled:
-                tag_id = order.get("OrderUniqueIdentifier")
+                oid = order.get("AppOrderID")
                 price = order.get("OrderAverageTradedPrice")
-                if tag_id:
-                    update_order_status(tag_id, "Filled", float(price) if price is not None else None)
+                if oid is not None:
+                    update_order_status(app_order_id=int(oid), status="Filled", traded_price=float(price) if price is not None else None)
             break
 
         attempts += 1
@@ -493,10 +504,10 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
 
     if not filled:
         logger.warning(
-            "No filled entry orders found for strategy %s (tags=%s); "
+            "No filled entry orders found for strategy %s (app_order_ids=%s); "
             "SKIPPING SL placement for now.",
             name,
-            tags,
+            entry_app_order_ids,
         )
         # Still update positions/DB if any eventually appear via other flows,
         # but we can't place SLs safely without fills.
@@ -788,7 +799,11 @@ def _sync_sl_order_status_and_capture_exits(
                         f"✅ [{strategy['name']}] Position CLOSED via SL: "
                         f"Instrument {instrument_id}, Exit Price: {exit_price}"
                     )
-                    update_order_status(tag, "Filled", exit_price)
+                    # Prefer updating by AppOrderID (stable); tag is retained only for display.
+                    try:
+                        update_order_status(app_order_id=int(order_detail.get("AppOrderID")), status="Filled", traded_price=exit_price)
+                    except Exception:
+                        update_order_status(order_tag=tag, status="Filled", traded_price=exit_price)
                     
                     # Log to database
                     if strategy["db_id"] and strategy["db_id"] > 0:
@@ -1032,7 +1047,7 @@ def _sync_strategy_positions_from_broker(
                         if client is not None and app_order_id is not None:
                             try:
                                 client.cancel_order(int(app_order_id), sl_tag_for_instrument)
-                                update_order_status(sl_tag_for_instrument, "CANCELLED")
+                                update_order_status(order_tag=sl_tag_for_instrument, status="CANCELLED")
                             except Exception:
                                 logger.exception(
                                     "Failed to cancel stale SL %s for %s",
