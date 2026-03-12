@@ -472,11 +472,10 @@ def restore_positions_for_strategy(strategy_id: int) -> List[Dict[str, Any]]:
 
 
 def restore_todays_strategies() -> List[Dict[str, Any]]:
-    """Restore ONLY today's OPEN strategies from database.
+    """Restore today's strategies (OPEN and CLOSED) from database.
     
     Returns list of strategy data with positions for strategies that:
     - Were executed TODAY (execution_date = today in IST)
-    - Are currently OPEN (not CLOSED/CLOSING)
     
     STRICT DATE FILTER: Only today's data is restored.
     """
@@ -487,10 +486,10 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
         
         today = get_ist_date()
         
-        # STRICT: Only today's open strategies
+        # STRICT: Only today's strategies (OPEN/CLOSED)
         cursor.execute("""
             SELECT * FROM strategies
-            WHERE execution_date = ? AND status = 'OPEN'
+            WHERE execution_date = ? AND status IN ('OPEN', 'CLOSED')
             ORDER BY id
         """, (today,))
         
@@ -504,6 +503,7 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
                 "strategy_name": row["strategy_name"],
                 "strike": row["strike"],
                 "entry_time": row["entry_time"],
+                "status": row["status"],
                 "lots": row["lots"],
                 "leg_sl_pct": row["leg_sl_pct"],
                 "strategy_sl": row["strategy_sl"],

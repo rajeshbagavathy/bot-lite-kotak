@@ -673,7 +673,9 @@ def _close_strategy(client: XTSClient, index_config, strategy: dict, positions: 
             reason,
         )
     
-    update_strategy(strategy["name"], status="CLOSED", positions=[])
+    # Keep `positions` so UI can continue showing realized P&L for CLOSED strategies.
+    # Clear SL order tracking to avoid reusing old SL orders/tags.
+    update_strategy(strategy["name"], status="CLOSED", sl_orders=[], sl_tag_map={})
 
 
 def _square_off_all(client: XTSClient, index_config, positions: List[dict], reason: str) -> None:
@@ -909,8 +911,20 @@ def _check_all_positions_closed(strategy: dict) -> bool:
     return all_closed
 
 
-def _sync_strategy_positions_from_broker(strategy: dict, broker_positions: List[dict]) -> None:
-    """Check if strategy positions still exist on broker (detect manual closures)."""
+def _sync_strategy_positions_from_broker(
+    strategy: dict,
+    broker_positions: List[dict],
+    ltp_map: dict,
+) -> None:
+    """
+    Reconcile strategy positions with broker positions.
+    
+    Important:
+    - Broker positions are aggregated. We only force-close a leg in our strategy state if broker net qty is 0
+      for that instrument (meaning there is no open position remaining at broker for that instrument).
+    - This fixes cases where legs get closed without SL tag becoming FILLED (manual square-off, broker netting,
+      target-close order not mapped, etc.).
+    """
     instrument_ids = set(strategy.get("instrument_ids", []))
     local_positions = strategy.get("positions") or []
     
@@ -923,6 +937,36 @@ def _sync_strategy_positions_from_broker(strategy: dict, broker_positions: List[
         broker_instrument_id = int(broker_pos.get("ExchangeInstrumentId", 0))
         quantity = int(broker_pos.get("Quantity", 0))
         broker_map[broker_instrument_id] = quantity
+
+    # If broker has no net position for an instrument but we still show it open locally, close it.
+    db_id = strategy.get("db_id")
+    now_ts = get_ist_timestamp()
+    for pos in local_positions:
+        instrument_id = int(pos.get("instrument_id") or 0)
+        if instrument_id == 0:
+            continue
+        if pos.get("exit_price") is not None:
+            continue
+
+        broker_qty = broker_map.get(instrument_id, 0)  # missing => 0 (position fully squared off)
+        if broker_qty == 0:
+            exit_price = ltp_map.get(instrument_id)
+            if exit_price is None:
+                # Fallback: no LTP available; assume flat exit so UI doesn't show it as open forever
+                try:
+                    exit_price = float(pos.get("entry_price") or 0.0)
+                except Exception:
+                    exit_price = 0.0
+
+            pos["exit_price"] = float(exit_price)
+            pos["exit_time"] = now_ts
+            pos["closed_via"] = "BROKER_SYNC"
+
+            if db_id and db_id > 0:
+                try:
+                    update_position_exit(db_id, instrument_id, float(exit_price), now_ts)
+                except Exception:
+                    logger.exception("Failed to update DB exit for %s instrument %s", strategy.get("name"), instrument_id)
     
     # Check if strategy's instruments still have positions on broker
     has_any_position = False
@@ -961,7 +1005,22 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         _check_leg_target_and_close(client, strategy, ltp_map)
         
         # Sync strategy positions with broker positions to keep state real-time
-        _sync_strategy_positions_from_broker(strategy, positions)
+        _sync_strategy_positions_from_broker(strategy, positions, ltp_map)
+        
+        # Compute strategy MTM from local strategy positions (exit_price -> realized, else LTP -> unrealized)
+        # Do this BEFORE we potentially clear positions during closure.
+        strategy_positions = strategy.get("positions") or []
+        if strategy_positions:
+            s_realized, s_unrealized, s_total = calculate_strategy_mtm(strategy_positions, ltp_map)
+            update_strategy(strategy["name"], mtm=s_total, realized=s_realized, unrealized=s_unrealized)
+            if get_mtm_snapshots_enabled():
+                now_ts = time.time()
+                if now_ts - _LAST_MTM_LOG.get(strategy["name"], 0) >= 60:
+                    log_mtm_snapshot(strategy["name"], s_total, s_realized, s_unrealized)
+                    _LAST_MTM_LOG[strategy["name"]] = now_ts
+        else:
+            # Preserve last known MTM for closed strategies whose positions were cleared.
+            s_total = float(strategy.get("mtm", 0.0) or 0.0)
         
         # **CHECK**: If all positions are closed via SL orders, close strategy (logs to trades_closed)
         if strategy["status"] == "OPEN" and _check_all_positions_closed(strategy):
@@ -970,19 +1029,8 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
                 client, index_config, strategy, positions,
                 "All positions closed via SL orders",
             )
-        
-        strategy_positions = strategy.get("positions") or []
-        if not strategy_positions:
-            continue
-        s_realized, s_unrealized, s_total = calculate_strategy_mtm(strategy_positions, ltp_map)
-        update_strategy(strategy["name"], mtm=s_total, realized=s_realized, unrealized=s_unrealized)
-        if get_mtm_snapshots_enabled():
-            now_ts = time.time()
-            if now_ts - _LAST_MTM_LOG.get(strategy["name"], 0) >= 60:
-                log_mtm_snapshot(strategy["name"], s_total, s_realized, s_unrealized)
-                _LAST_MTM_LOG[strategy["name"]] = now_ts
-        
-        # Now s_total is based on actual broker positions (synced), not stale local data
+
+        # Now s_total is based on local positions (exit_price/LTP), not broker aggregates.
         if strategy["status"] == "OPEN" and s_total <= -float(strategy["strategy_sl"]):
             _close_strategy(client, index_config, strategy, positions, "Strategy SL hit")
 
@@ -1111,7 +1159,7 @@ def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
                     logger.info(f"Restoring {strategy_name} from database...")
                     STRATEGY_STATE[strategy_name].update({
                         "db_id": restored_strategy["db_id"],
-                        "status": "OPEN",
+                        "status": restored_strategy.get("status", "OPEN"),
                         "strike": restored_strategy["strike"],
                         "entry_time": restored_strategy["entry_time"],
                         "positions": restored_strategy["positions"],
@@ -1180,7 +1228,7 @@ def main() -> None:
     # Clean up all previous day data on startup
     cleanup_previous_day_data()
     
-    # Restore today's open strategies from database (before init_state)
+    # Restore today's strategies from database (before init_state)
     if not DEMO_MODE and index_config is not None:
         restored = restore_todays_strategies()
         for restored_strategy in restored:
@@ -1189,7 +1237,7 @@ def main() -> None:
                 logger.info(f"Restoring {strategy_name} from database...")
                 STRATEGY_STATE[strategy_name].update({
                     "db_id": restored_strategy["db_id"],
-                    "status": "OPEN",
+                    "status": restored_strategy.get("status", "OPEN"),
                     "strike": restored_strategy["strike"],
                     "entry_time": restored_strategy["entry_time"],
                     "positions": restored_strategy["positions"],
