@@ -322,8 +322,10 @@ def _place_leg_sl_orders(
         price = _round_to_tick(raw_price, index_config.tick_size)
         trigger = _round_to_tick(max(price - 0.5, 0.05), index_config.tick_size)
         
-        tag = f"{strategy_name}_SL_{order['TradingSymbol']}_{int(time.time())}"
+        # IMPORTANT: XTS/broker can truncate OrderUniqueIdentifier, so keep tags short and unique.
+        # Use instrument_id to guarantee uniqueness across legs/strategies.
         instrument_id = int(order["ExchangeInstrumentID"])
+        tag = f"{strategy_name}_SL_{instrument_id}"
         order_id = client.place_sl_order(
             index_config=index_config,
             instrument_id=instrument_id,
@@ -684,7 +686,11 @@ def _square_off_all(client: XTSClient, index_config, positions: List[dict], reas
         _place_close_order(client, index_config, pos, "SQUAREOFF")
 
 
-def _sync_sl_order_status_and_capture_exits(client: XTSClient, strategy: dict) -> None:
+def _sync_sl_order_status_and_capture_exits(
+    client: XTSClient,
+    strategy: dict,
+    order_book: Optional[List[dict]] = None,
+) -> None:
     """
     Monitor XTS order book to determine if SL orders are filled (position closure).
     This is the SINGLE SOURCE OF TRUTH for position status.
@@ -708,18 +714,26 @@ def _sync_sl_order_status_and_capture_exits(client: XTSClient, strategy: dict) -
         logger.debug(f"Skipping order book sync for {strategy['name']} (DEMO_MODE, no client)")
         return
     
-    try:
-        order_book = client.get_order_book()
-    except Exception as e:
-        logger.error(f"Failed to fetch order book for {strategy['name']}: {e}")
-        return
+    if order_book is None:
+        try:
+            order_book = client.get_order_book()
+        except Exception as e:
+            logger.error(f"Failed to fetch order book for {strategy['name']}: {e}")
+            return
     
-    # Create mapping: sl_order_tag → order details
-    order_book_map = {}
-    for order in order_book:
+    # Create mapping: app_order_id / sl_order_tag → order details
+    order_book_map_by_tag: Dict[str, dict] = {}
+    order_book_map_by_id: Dict[int, dict] = {}
+    for order in order_book or []:
         tag = order.get("OrderUniqueIdentifier")
         if tag:
-            order_book_map[tag] = order
+            order_book_map_by_tag[str(tag)] = order
+        oid = order.get("AppOrderID")
+        try:
+            if oid is not None:
+                order_book_map_by_id[int(oid)] = order
+        except Exception:
+            pass
     
     # Check each SL order for this strategy
     sl_orders = strategy.get("sl_orders", []) or []
@@ -728,11 +742,21 @@ def _sync_sl_order_status_and_capture_exits(client: XTSClient, strategy: dict) -
     for sl_order in sl_orders:
         tag = sl_order.get("tag")
         
-        if not tag or tag not in order_book_map:
+        if not tag:
             continue
-        
-        # Get order details from XTS order book
-        order_detail = order_book_map[tag]
+
+        # Prefer AppOrderID matching (robust even if broker truncates OrderUniqueIdentifier)
+        order_detail = None
+        try:
+            app_order_id = sl_order.get("app_order_id")
+            if app_order_id is not None:
+                order_detail = order_book_map_by_id.get(int(app_order_id))
+        except Exception:
+            order_detail = None
+        if order_detail is None:
+            order_detail = order_book_map_by_tag.get(str(tag))
+        if not order_detail:
+            continue
         order_status = order_detail.get("OrderStatus", "").upper()
         
         # Map SL tag to instrument_id
@@ -912,9 +936,11 @@ def _check_all_positions_closed(strategy: dict) -> bool:
 
 
 def _sync_strategy_positions_from_broker(
+    client: XTSClient,
     strategy: dict,
     broker_positions: List[dict],
     ltp_map: dict,
+    order_book: Optional[List[dict]] = None,
 ) -> None:
     """
     Reconcile strategy positions with broker positions.
@@ -938,9 +964,31 @@ def _sync_strategy_positions_from_broker(
         quantity = int(broker_pos.get("Quantity", 0))
         broker_map[broker_instrument_id] = quantity
 
+    # Build a quick map of latest FILLED BUY avg price by instrument from order book (if provided).
+    filled_buy_price_by_instrument: Dict[int, float] = {}
+    if order_book:
+        for o in order_book:
+            try:
+                status = str(o.get("OrderStatus", "")).upper()
+                side = str(o.get("OrderSide", "")).upper()
+                if status != "FILLED" or side != "BUY":
+                    continue
+                inst = o.get("ExchangeInstrumentId", o.get("ExchangeInstrumentID"))
+                instrument_id = int(inst) if inst is not None else 0
+                if instrument_id == 0:
+                    continue
+                avg = float(o.get("OrderAverageTradedPrice") or 0.0)
+                if avg > 0:
+                    filled_buy_price_by_instrument[instrument_id] = avg
+            except Exception:
+                continue
+
     # If broker has no net position for an instrument but we still show it open locally, close it.
     db_id = strategy.get("db_id")
     now_ts = get_ist_timestamp()
+    sl_orders = strategy.get("sl_orders", []) or []
+    sl_tag_map = strategy.get("sl_tag_map", {}) or {}
+
     for pos in local_positions:
         instrument_id = int(pos.get("instrument_id") or 0)
         if instrument_id == 0:
@@ -950,9 +998,11 @@ def _sync_strategy_positions_from_broker(
 
         broker_qty = broker_map.get(instrument_id, 0)  # missing => 0 (position fully squared off)
         if broker_qty == 0:
-            exit_price = ltp_map.get(instrument_id)
+            # Prefer trade/order book executed avg for BUY exits; else LTP; else entry as last resort.
+            exit_price = filled_buy_price_by_instrument.get(instrument_id)
             if exit_price is None:
-                # Fallback: no LTP available; assume flat exit so UI doesn't show it as open forever
+                exit_price = ltp_map.get(instrument_id)
+            if exit_price is None:
                 try:
                     exit_price = float(pos.get("entry_price") or 0.0)
                 except Exception:
@@ -967,6 +1017,29 @@ def _sync_strategy_positions_from_broker(
                     update_position_exit(db_id, instrument_id, float(exit_price), now_ts)
                 except Exception:
                     logger.exception("Failed to update DB exit for %s instrument %s", strategy.get("name"), instrument_id)
+
+            # If there is still an OPEN/PENDING SL order for this instrument, cancel it to avoid orphan SLs.
+            # (We only attempt cancel if we can find the SL tag + app_order_id.)
+            sl_tag_for_instrument = None
+            for tag, iid in sl_tag_map.items():
+                if int(iid) == instrument_id:
+                    sl_tag_for_instrument = tag
+                    break
+            if sl_tag_for_instrument:
+                for sl in sl_orders:
+                    if sl.get("tag") == sl_tag_for_instrument:
+                        app_order_id = sl.get("app_order_id")
+                        if client is not None and app_order_id is not None:
+                            try:
+                                client.cancel_order(int(app_order_id), sl_tag_for_instrument)
+                                update_order_status(sl_tag_for_instrument, "CANCELLED")
+                            except Exception:
+                                logger.exception(
+                                    "Failed to cancel stale SL %s for %s",
+                                    sl_tag_for_instrument,
+                                    strategy.get("name"),
+                                )
+                        break
     
     # Check if strategy's instruments still have positions on broker
     has_any_position = False
@@ -988,6 +1061,10 @@ def _sync_strategy_positions_from_broker(
 
 def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
     positions = client.get_positions()
+    try:
+        order_book = client.get_order_book()
+    except Exception:
+        order_book = None
     instruments = [
         {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": pos["ExchangeInstrumentId"]}
         for pos in positions
@@ -999,13 +1076,13 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
 
     for strategy in STRATEGY_STATE.values():
         # **FIRST**: Sync SL order status from XTS order book (single source of truth)
-        _sync_sl_order_status_and_capture_exits(client, strategy)
+        _sync_sl_order_status_and_capture_exits(client, strategy, order_book=order_book)
 
         # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to market
         _check_leg_target_and_close(client, strategy, ltp_map)
         
         # Sync strategy positions with broker positions to keep state real-time
-        _sync_strategy_positions_from_broker(strategy, positions, ltp_map)
+        _sync_strategy_positions_from_broker(client, strategy, positions, ltp_map, order_book=order_book)
         
         # Compute strategy MTM from local strategy positions (exit_price -> realized, else LTP -> unrealized)
         # Do this BEFORE we potentially clear positions during closure.
