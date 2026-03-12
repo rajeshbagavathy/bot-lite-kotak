@@ -817,7 +817,7 @@ def _check_leg_target_and_close(
         if instrument_id is not None:
             instrument_to_sl[int(instrument_id)] = (int(app_order_id), tag)
 
-    target_triggered = set(strategy.get("target_triggered_instruments") or [])
+    target_triggered = set(strategy.get("target_triggered_instruments") or [])  # use set for fast lookup
 
     try:
         order_book = client.get_order_book()
@@ -884,7 +884,7 @@ def _check_leg_target_and_close(
                 tag=tag,
             )
             target_triggered.add(instrument_id)
-            update_strategy(strategy["name"], target_triggered_instruments=target_triggered)
+            update_strategy(strategy["name"], target_triggered_instruments=list(target_triggered))
             logger.info(
                 "✅ [%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%); modified SL to market",
                 strategy["name"], float(LEG_TARGET_PCT), instrument_id, profit_pct,

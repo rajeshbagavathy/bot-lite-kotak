@@ -76,9 +76,21 @@ def update_strategy(name: str, **fields) -> None:
         strategy["last_update"] = get_ist_now().isoformat(timespec="seconds")
 
 
+def _make_json_safe(obj):
+    """Convert sets to lists so snapshot is JSON-serializable."""
+    if isinstance(obj, set):
+        return list(obj)
+    if isinstance(obj, dict):
+        return {k: _make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_make_json_safe(v) for v in obj]
+    return obj
+
+
 def get_snapshot() -> dict:
     with STATE_LOCK:
-        return copy.deepcopy(STATE)
+        snapshot = copy.deepcopy(STATE)
+    return _make_json_safe(snapshot)
 
 
 def get_mtm_snapshots_enabled() -> bool:
