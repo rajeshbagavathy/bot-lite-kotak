@@ -74,12 +74,12 @@ STRATEGIES = []  # Deprecated: use day-based plans below.
 
 # Monday NIFTY – 14 lots total
 MONDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_M_S10_1146", "11:46:00", 3, 20.0, 0.0),
-    StrategyConfig("N_M_S15_1301", "13:01:00", 3, 20.0, 0.0),
+    StrategyConfig("N_M_S10_1146", "11:46:00", 5, 20.0, 0.0),
+    StrategyConfig("N_M_S15_1301", "13:01:00", 4, 20.0, 0.0),
     StrategyConfig("N_M_S14_1246", "12:46:00", 3, 20.0, 0.0),
-    StrategyConfig("N_M_S11_1201", "12:01:00", 2, 20.0, 0.0),
-    StrategyConfig("N_M_S3_1001",  "10:01:00", 2, 20.0, 0.0),
-    StrategyConfig("N_M_S12_1216", "12:16:00", 1, 20.0, 0.0),
+    StrategyConfig("N_M_S11_1201", "12:01:00", 3, 20.0, 0.0),
+    StrategyConfig("N_M_S3_1001",  "10:01:00", 3, 20.0, 0.0),
+    StrategyConfig("N_M_S12_1216", "12:16:00", 2, 20.0, 0.0),
 ]
 
 # Monday SENSEX – 6 lots total
