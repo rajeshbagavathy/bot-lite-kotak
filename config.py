@@ -125,7 +125,8 @@ ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "2"))
 LEG_SL_PCT_NON_EXPIRY = float(os.getenv("LEG_SL_PCT_NON_EXPIRY", "20.0"))
 # Leg target %: if a leg's profit (as % of executed sell order premium / entry_price) reaches this, close that leg by modifying SL to market.
 # Target is calculated on executed sell order premium: profit_pct = (entry_price - ltp) / entry_price * 100.
-LEG_TARGET_PCT = float(os.getenv("LEG_TARGET_PCT", "65.0"))
+# Default is 60% (can be overridden via LEG_TARGET_PCT env).
+LEG_TARGET_PCT = float(os.getenv("LEG_TARGET_PCT", "60.0"))
 
 # Premium-based straddle strike selection (optional). If set, CE/PE strikes are chosen by option LTP, not ATM.
 # NIFTY: target 100, buffer 15 → allowed range 85–115. SENSEX: target 300, buffer 40 → 260–340.
