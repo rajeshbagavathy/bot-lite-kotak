@@ -57,19 +57,59 @@ INDEX_CONFIGS = {
     "SENSEX": SENSEX,
 }
 
-STRATEGIES = [
-    StrategyConfig("S0930", "09:30:00", 7, 20.0, 10000.0),
-    StrategyConfig("S0950", "09:50:00", 7, 20.0, 10000.0),
-    StrategyConfig("S1005", "10:05:00", 7, 20.0, 10000.0),
-    StrategyConfig("S1025", "10:25:00", 7, 20.0, 10000.0),
-    StrategyConfig("S1045", "10:45:00", 7, 20.0, 10000.0),
-    StrategyConfig("S1144", "11:44:00", 7, 20.0, 10000.0),
-    StrategyConfig("S1255", "12:55:00", 7, 20.0, 10000.0),
+
+
+STRATEGIES = []  # Deprecated: use day-based plans below.
+
+
+# === Day-based strategy plans ===
+#
+# Naming convention:
+# - Prefix: N_ (NIFTY), X_ (SENSEX)
+# - Day letter: M (Mon), T (Tue), W (Wed), H (Thu), F (Fri)
+# - Slot id: S3, S10, S22, etc.
+# - Time suffix: 1001 = 10:01, 1146 = 11:46, 1446 = 14:46, etc.
+#
+# Example: N_M_S10_1146 → NIFTY, Monday, slot S10 at 11:46.
+
+# Monday NIFTY – 14 lots total
+MONDAY_NIFTY_STRATEGIES = [
+    StrategyConfig("N_M_S10_1146", "11:46:00", 3, 20.0, 0.0),
+    StrategyConfig("N_M_S15_1301", "13:01:00", 3, 20.0, 0.0),
+    StrategyConfig("N_M_S14_1246", "12:46:00", 3, 20.0, 0.0),
+    StrategyConfig("N_M_S11_1201", "12:01:00", 2, 20.0, 0.0),
+    StrategyConfig("N_M_S3_1001",  "10:01:00", 2, 20.0, 0.0),
+    StrategyConfig("N_M_S12_1216", "12:16:00", 1, 20.0, 0.0),
 ]
+
+# Monday SENSEX – 6 lots total
+MONDAY_SENSEX_STRATEGIES = [
+    StrategyConfig("X_M_S3_1001",  "10:01:00", 3, 20.0, 0.0),
+    StrategyConfig("X_M_S10_1146", "11:46:00", 1, 20.0, 0.0),
+    StrategyConfig("X_M_S4_1016",  "10:16:00", 1, 20.0, 0.0),
+    StrategyConfig("X_M_S22_1446", "14:46:00", 1, 20.0, 0.0),
+]
+
+
+def get_today_strategies(index_name: str) -> list[StrategyConfig]:
+    """Return today's strategies for the given index (NIFTY/SENSEX)."""
+    import datetime
+
+    today = datetime.datetime.now().date()
+    weekday = today.weekday()  # 0=Mon,1=Tue,...,6=Sun
+
+    if weekday == 0:  # Monday
+        if index_name.upper() == "NIFTY":
+            return MONDAY_NIFTY_STRATEGIES
+        if index_name.upper() == "SENSEX":
+            return MONDAY_SENSEX_STRATEGIES
+
+    # TODO: add Tuesday/Wednesday/Thursday/Friday plans as needed.
+    return []
 
 PORTFOLIO_SL_LIMIT = -80000.0
 # Set to True to enable trading on non-expiry days; False disables all strategies on non-expiry.
-TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "False").lower() in ("true", "1", "yes")
+TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "True").lower() in ("true", "1", "yes")
 
 # Margin + hedging configuration
 # If available margin is below this, bot will buy far-OTM hedges first.
@@ -86,6 +126,19 @@ LEG_SL_PCT_NON_EXPIRY = float(os.getenv("LEG_SL_PCT_NON_EXPIRY", "20.0"))
 # Leg target %: if a leg's profit (as % of executed sell order premium / entry_price) reaches this, close that leg by modifying SL to market.
 # Target is calculated on executed sell order premium: profit_pct = (entry_price - ltp) / entry_price * 100.
 LEG_TARGET_PCT = float(os.getenv("LEG_TARGET_PCT", "65.0"))
+
+# Premium-based straddle strike selection (optional). If set, CE/PE strikes are chosen by option LTP, not ATM.
+# NIFTY: target 100, buffer 15 → allowed range 85–115. SENSEX: target 300, buffer 40 → 260–340.
+# Within range, the strike with premium closest to target is picked. If no strike in range, strategy is skipped.
+USE_PREMIUM_BASED_STRIKE = os.getenv("USE_PREMIUM_BASED_STRIKE", "True").lower() in ("true", "1", "yes")
+STRIKE_PREMIUM_TARGET_NIFTY = float(os.getenv("STRIKE_PREMIUM_TARGET_NIFTY", "100"))
+STRIKE_PREMIUM_BUFFER_NIFTY = float(os.getenv("STRIKE_PREMIUM_BUFFER_NIFTY", "15"))
+STRIKE_PREMIUM_TARGET_SENSEX = float(os.getenv("STRIKE_PREMIUM_TARGET_SENSEX", "300"))
+STRIKE_PREMIUM_BUFFER_SENSEX = float(os.getenv("STRIKE_PREMIUM_BUFFER_SENSEX", "40"))
+
+# Strategy-level SL: if False or strategy_sl <= 0, per-strategy stop-loss is not applied (only portfolio SL and leg SL apply).
+STRATEGY_SL_ENABLED = os.getenv("STRATEGY_SL_ENABLED", "False").lower() in ("true", "1", "yes")
+
 # Target premium for hedge selection (approx LTP per option).
 HEDGE_TARGET_PREMIUM_EXPIRY = float(os.getenv("HEDGE_TARGET_PREMIUM_EXPIRY", "5"))
 HEDGE_TARGET_PREMIUM_NON_EXPIRY = float(os.getenv("HEDGE_TARGET_PREMIUM_NON_EXPIRY", "10"))

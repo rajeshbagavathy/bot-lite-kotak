@@ -2,7 +2,13 @@ from flask import Flask, jsonify, render_template_string
 from flask_basicauth import BasicAuth
 import sqlite3
 
-from state import get_snapshot, get_mtm_snapshots_enabled, set_mtm_snapshots_enabled
+from state import (
+    get_snapshot,
+    get_all_trading_flags,
+    get_mtm_snapshots_enabled,
+    set_mtm_snapshots_enabled,
+    set_trading_flag,
+)
 
 try:
     from config import LEG_TARGET_PCT
@@ -89,6 +95,28 @@ DASHBOARD_TEMPLATE = """
               <span>Enable MTM snapshots</span>
             </label>
             <div class="meta-label" style="margin-top: 6px; font-size: 11px;">Writes strategy MTM to DB every ~60s when enabled. Turn on to populate the MTM Snapshots tab.</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Trading flags</div>
+          <p class="meta-label" style="font-size: 11px; margin-bottom: 10px;">Changes require login to apply.</p>
+          <div id="dash-flags-card">
+            <label class="setting-row"><input type="checkbox" id="dash-flag-premium" /> <span>Premium-based strike</span></label>
+            <label class="setting-row"><input type="checkbox" id="dash-flag-strategy-sl" /> <span>Strategy SL enabled</span></label>
+            <label class="setting-row"><input type="checkbox" id="dash-flag-non-expiry" /> <span>Trade non-expiry day</span></label>
+            <label class="setting-row"><input type="checkbox" id="dash-flag-mtm" /> <span>MTM snapshots</span></label>
+          </div>
+          <button type="button" id="dash-flags-save" class="tab-btn" style="margin-top: 10px; padding: 6px 12px;">Save (requires login)</button>
+        </div>
+      </div>
+      <div id="dash-auth-modal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: #1e293b; padding: 24px; border-radius: 8px; max-width: 320px; width: 90%; border: 1px solid #334155;">
+          <p style="margin: 0 0 12px 0; font-weight: bold; color: #e2e8f0;">Confirm: enter username and password</p>
+          <input type="text" id="dash-auth-user" placeholder="Username" style="width: 100%; padding: 8px; margin-bottom: 8px; box-sizing: border-box; background: #0f172a; border: 1px solid #334155; color: #e2e8f0;" />
+          <input type="password" id="dash-auth-pass" placeholder="Password" style="width: 100%; padding: 8px; margin-bottom: 12px; box-sizing: border-box; background: #0f172a; border: 1px solid #334155; color: #e2e8f0;" />
+          <div style="display: flex; gap: 8px;">
+            <button type="button" id="dash-auth-confirm" style="padding: 8px 16px; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer;">Apply</button>
+            <button type="button" id="dash-auth-cancel" style="padding: 8px 16px; background: #64748b; color: white; border: none; border-radius: 4px; cursor: pointer;">Cancel</button>
           </div>
         </div>
       </div>
@@ -189,17 +217,23 @@ DASHBOARD_TEMPLATE = """
         const idx = state.index || {};
         const stateStrategies = state.strategies || {};
 
-        const mtmEnabled = !!(state.settings && state.settings.mtm_snapshots_enabled);
+        const s = state.settings || {};
+        const mtmEnabled = !!s.mtm_snapshots_enabled;
         const toggle1 = document.getElementById('mtm-snapshots-toggle');
         const toggle2 = document.getElementById('mtm-snapshots-toggle-tab');
         if (toggle1) toggle1.checked = mtmEnabled;
         if (toggle2) toggle2.checked = mtmEnabled;
+        const dp = document.getElementById('dash-flag-premium');
+        const dsl = document.getElementById('dash-flag-strategy-sl');
+        const dne = document.getElementById('dash-flag-non-expiry');
+        const dm = document.getElementById('dash-flag-mtm');
         if (toggle1 && !toggle1.dataset.bound) {
           toggle1.dataset.bound = '1';
           toggle1.addEventListener('change', async function() {
             const enabled = toggle1.checked;
             await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mtm_snapshots_enabled: enabled }) });
             if (toggle2) toggle2.checked = enabled;
+            if (dm) dm.checked = enabled;
           });
         }
         if (toggle2 && !toggle2.dataset.bound) {
@@ -208,6 +242,44 @@ DASHBOARD_TEMPLATE = """
             const enabled = toggle2.checked;
             await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mtm_snapshots_enabled: enabled }) });
             if (toggle1) toggle1.checked = enabled;
+            if (dm) dm.checked = enabled;
+          });
+        }
+        if (document.getElementById('dash-flags-save') && !document.getElementById('dash-flags-save').dataset.bound) {
+          document.getElementById('dash-flags-save').dataset.bound = '1';
+          if (dp) dp.checked = !!s.use_premium_based_strike;
+          if (dsl) dsl.checked = !!s.strategy_sl_enabled;
+          if (dne) dne.checked = !!s.trade_non_expiry_day;
+          if (dm) dm.checked = mtmEnabled;
+          document.getElementById('dash-flags-save').addEventListener('click', function() {
+            document.getElementById('dash-auth-modal').style.display = 'flex';
+            document.getElementById('dash-auth-user').value = '';
+            document.getElementById('dash-auth-pass').value = '';
+          });
+          document.getElementById('dash-auth-cancel').addEventListener('click', function() {
+            document.getElementById('dash-auth-modal').style.display = 'none';
+          });
+          document.getElementById('dash-auth-confirm').addEventListener('click', async function() {
+            const user = document.getElementById('dash-auth-user').value.trim();
+            const pass = document.getElementById('dash-auth-pass').value;
+            if (!user || !pass) { alert('Enter username and password'); return; }
+            const payload = {
+              use_premium_based_strike: document.getElementById('dash-flag-premium').checked,
+              strategy_sl_enabled: document.getElementById('dash-flag-strategy-sl').checked,
+              trade_non_expiry_day: document.getElementById('dash-flag-non-expiry').checked,
+              mtm_snapshots_enabled: document.getElementById('dash-flag-mtm').checked
+            };
+            try {
+              const res = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic ' + btoa(user + ':' + pass) },
+                body: JSON.stringify(payload)
+              });
+              if (!res.ok) throw new Error(await res.text() || res.statusText);
+              document.getElementById('dash-auth-modal').style.display = 'none';
+              if (toggle1) toggle1.checked = payload.mtm_snapshots_enabled;
+              if (toggle2) toggle2.checked = payload.mtm_snapshots_enabled;
+            } catch (e) { alert('Update failed: ' + (e.message || e)); }
           });
         }
 
@@ -449,11 +521,93 @@ HTML_TEMPLATE = """
     <tbody id=\"strategy-rows\"></tbody>
   </table>
 
+  <section class="flags-section" style="margin-top: 24px; padding: 16px; background: #fffdf8; border: 1px solid #e6ded2; border-radius: 8px;">
+    <h2 style="margin: 0 0 12px 0; font-size: 18px;">Trading flags</h2>
+    <p style="color: #666; font-size: 13px; margin-bottom: 12px;">Changes require your login to apply. Only when both CE and PE strikes are in premium range will the straddle run.</p>
+    <div class="flags-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px;">
+      <label class="flag-row" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+        <input type="checkbox" id="flag-use-premium-based-strike" />
+        <span>Use premium-based strike (NIFTY 100±15, SENSEX 300±40)</span>
+      </label>
+      <label class="flag-row" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+        <input type="checkbox" id="flag-strategy-sl-enabled" />
+        <span>Strategy SL enabled (per-strategy stop-loss)</span>
+      </label>
+      <label class="flag-row" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+        <input type="checkbox" id="flag-trade-non-expiry-day" />
+        <span>Trade on non-expiry day</span>
+      </label>
+      <label class="flag-row" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+        <input type="checkbox" id="flag-mtm-snapshots" />
+        <span>MTM snapshots to DB</span>
+      </label>
+    </div>
+    <button type="button" id="flags-save-btn" style="padding: 8px 16px; background: #0ea5e9; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer;">Save (requires login)</button>
+  </section>
+
+  <div id="flags-auth-modal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+    <div style="background: #fffdf8; padding: 24px; border-radius: 8px; max-width: 320px; width: 90%; border: 1px solid #e6ded2;">
+      <p style="margin: 0 0 12px 0; font-weight: bold;">Confirm: enter username and password</p>
+      <input type="text" id="flags-auth-user" placeholder="Username" style="width: 100%; padding: 8px; margin-bottom: 8px; box-sizing: border-box;" />
+      <input type="password" id="flags-auth-pass" placeholder="Password" style="width: 100%; padding: 8px; margin-bottom: 12px; box-sizing: border-box;" />
+      <div style="display: flex; gap: 8px;">
+        <button type="button" id="flags-auth-confirm" style="padding: 8px 16px; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer;">Apply</button>
+        <button type="button" id="flags-auth-cancel" style="padding: 8px 16px; background: #94a3b8; color: white; border: none; border-radius: 4px; cursor: pointer;">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     function fmt(num) {
       if (num === null || num === undefined) return "-";
       return Number(num).toFixed(2);
     }
+
+    async function loadFlags() {
+      try {
+        const res = await fetch('/api/settings');
+        const s = await res.json();
+        document.getElementById('flag-use-premium-based-strike').checked = !!s.use_premium_based_strike;
+        document.getElementById('flag-strategy-sl-enabled').checked = !!s.strategy_sl_enabled;
+        document.getElementById('flag-trade-non-expiry-day').checked = !!s.trade_non_expiry_day;
+        document.getElementById('flag-mtm-snapshots').checked = !!s.mtm_snapshots_enabled;
+      } catch (e) { console.error('Load flags:', e); }
+    }
+
+    document.getElementById('flags-save-btn').addEventListener('click', function() {
+      document.getElementById('flags-auth-modal').style.display = 'flex';
+      document.getElementById('flags-auth-user').value = '';
+      document.getElementById('flags-auth-pass').value = '';
+    });
+    document.getElementById('flags-auth-cancel').addEventListener('click', function() {
+      document.getElementById('flags-auth-modal').style.display = 'none';
+    });
+    document.getElementById('flags-auth-confirm').addEventListener('click', async function() {
+      const user = document.getElementById('flags-auth-user').value.trim();
+      const pass = document.getElementById('flags-auth-pass').value;
+      if (!user || !pass) { alert('Enter username and password'); return; }
+      const payload = {
+        use_premium_based_strike: document.getElementById('flag-use-premium-based-strike').checked,
+        strategy_sl_enabled: document.getElementById('flag-strategy-sl-enabled').checked,
+        trade_non_expiry_day: document.getElementById('flag-trade-non-expiry-day').checked,
+        mtm_snapshots_enabled: document.getElementById('flag-mtm-snapshots').checked
+      };
+      try {
+        const res = await fetch('/api/settings', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Basic ' + btoa(user + ':' + pass)
+          },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) { const t = await res.text(); throw new Error(t || res.statusText); }
+        document.getElementById('flags-auth-modal').style.display = 'none';
+        await loadFlags();
+      } catch (e) {
+        alert('Update failed: ' + (e.message || e));
+      }
+    });
 
     async function refresh() {
       const res = await fetch('/state');
@@ -496,6 +650,7 @@ HTML_TEMPLATE = """
       });
     }
 
+    loadFlags();
     refresh();
     setInterval(refresh, 3000);
   </script>
@@ -528,16 +683,22 @@ def create_app(username: str, password: str) -> Flask:
     @app.route("/api/settings", methods=["GET", "POST"])
     @basic_auth.required
     def api_settings():
-        """Get or update UI-editable settings (e.g. MTM snapshot enabled)."""
+        """Get or update UI-editable trading flags. POST requires valid Basic Auth (re-enter credentials in UI modal)."""
         from flask import request
         if request.method == "POST":
             try:
                 data = request.get_json(force=True, silent=True) or {}
                 if "mtm_snapshots_enabled" in data:
                     set_mtm_snapshots_enabled(bool(data["mtm_snapshots_enabled"]))
+                if "use_premium_based_strike" in data:
+                    set_trading_flag("use_premium_based_strike", bool(data["use_premium_based_strike"]))
+                if "strategy_sl_enabled" in data:
+                    set_trading_flag("strategy_sl_enabled", bool(data["strategy_sl_enabled"]))
+                if "trade_non_expiry_day" in data:
+                    set_trading_flag("trade_non_expiry_day", bool(data["trade_non_expiry_day"]))
             except Exception as e:
                 return jsonify({"error": str(e)}), 400
-        return jsonify({"mtm_snapshots_enabled": get_mtm_snapshots_enabled()})
+        return jsonify(get_all_trading_flags())
 
     @app.route("/api/strategies")
     @basic_auth.required

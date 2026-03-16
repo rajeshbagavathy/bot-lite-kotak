@@ -105,3 +105,50 @@ def set_mtm_snapshots_enabled(enabled: bool) -> None:
         if "settings" not in STATE:
             STATE["settings"] = {}
         STATE["settings"]["mtm_snapshots_enabled"] = bool(enabled)
+
+
+def init_trading_flags(
+    use_premium_based_strike: bool,
+    strategy_sl_enabled: bool,
+    trade_non_expiry_day: bool,
+) -> None:
+    """Set initial trading flags from config (called by bot on startup)."""
+    with STATE_LOCK:
+        if "settings" not in STATE:
+            STATE["settings"] = {}
+        STATE["settings"]["use_premium_based_strike"] = use_premium_based_strike
+        STATE["settings"]["strategy_sl_enabled"] = strategy_sl_enabled
+        STATE["settings"]["trade_non_expiry_day"] = trade_non_expiry_day
+
+
+def get_trading_flag(key: str) -> Optional[bool]:
+    """Return current value for a trading flag (None if not set)."""
+    with STATE_LOCK:
+        return STATE.get("settings", {}).get(key)
+
+
+def set_trading_flag(key: str, value: bool) -> None:
+    """Set a trading flag (used by UI)."""
+    with STATE_LOCK:
+        if "settings" not in STATE:
+            STATE["settings"] = {}
+        STATE["settings"][key] = bool(value)
+
+
+def get_trading_flag_or(key: str, default: bool) -> bool:
+    """Return trading flag value, or default if not set (for bot runtime)."""
+    with STATE_LOCK:
+        val = STATE.get("settings", {}).get(key)
+        return bool(val) if val is not None else default
+
+
+def get_all_trading_flags() -> dict:
+    """Return all UI-editable flags for GET /api/settings."""
+    with STATE_LOCK:
+        s = STATE.get("settings") or {}
+        return {
+            "mtm_snapshots_enabled": bool(s.get("mtm_snapshots_enabled", False)),
+            "use_premium_based_strike": bool(s.get("use_premium_based_strike", True)),
+            "strategy_sl_enabled": bool(s.get("strategy_sl_enabled", False)),
+            "trade_non_expiry_day": bool(s.get("trade_non_expiry_day", False)),
+        }

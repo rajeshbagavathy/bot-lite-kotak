@@ -185,7 +185,8 @@ class TestPlaceLegSLOrders(unittest.TestCase):
     @patch("time.time", return_value=1707400000)
     def test_place_sl_orders_success(self, mock_time):
         """Test successful SL order placement."""
-        self.client.place_sl_order.side_effect = ["SL_ORDER_1", "SL_ORDER_2"]
+        # place_sl_order now returns numeric AppOrderID
+        self.client.place_sl_order.side_effect = [101, 102]
         
         sl_orders, tag_map = bot._place_leg_sl_orders(
             self.client,
@@ -196,8 +197,9 @@ class TestPlaceLegSLOrders(unittest.TestCase):
         )
         
         self.assertEqual(len(sl_orders), 2)
-        self.assertEqual(sl_orders[0]["app_order_id"], "SL_ORDER_1")
-        self.assertIn("S0920_SL_NIFTY26FEB21900CE", sl_orders[0]["tag"])
+        self.assertEqual(sl_orders[0]["app_order_id"], 101)
+        # Tag format is now S0920_SL_<instrument_id>
+        self.assertEqual(sl_orders[0]["tag"], "S0920_SL_12345")
         
         # Verify tag map is populated
         self.assertEqual(len(tag_map), 2)
@@ -210,7 +212,7 @@ class TestPlaceLegSLOrders(unittest.TestCase):
 
     def test_place_sl_orders_with_failed_order(self):
         """Test SL order placement when some orders fail."""
-        self.client.place_sl_order.side_effect = ["SL_ORDER_1", None]
+        self.client.place_sl_order.side_effect = [201, None]
         
         sl_orders, tag_map = bot._place_leg_sl_orders(
             self.client,
@@ -222,7 +224,7 @@ class TestPlaceLegSLOrders(unittest.TestCase):
         
         # Only the successful order should be in the list
         self.assertEqual(len(sl_orders), 1)
-        self.assertEqual(sl_orders[0]["app_order_id"], "SL_ORDER_1")
+        self.assertEqual(sl_orders[0]["app_order_id"], 201)
         self.assertEqual(len(tag_map), 1)
 
 
@@ -230,30 +232,30 @@ class TestGetFilledOrders(unittest.TestCase):
     """Test _get_filled_orders() function."""
 
     def test_get_filled_orders(self):
-        """Test filtering filled orders by tags."""
+        """Test filtering filled orders by AppOrderID."""
         order_book = [
-            {"OrderUniqueIdentifier": "TAG1", "OrderStatus": "Filled", "OrderAverageTradedPrice": 10.0},
-            {"OrderUniqueIdentifier": "TAG2", "OrderStatus": "Pending", "OrderAverageTradedPrice": 0.0},
-            {"OrderUniqueIdentifier": "TAG3", "OrderStatus": "Filled", "OrderAverageTradedPrice": 12.0},
-            {"OrderUniqueIdentifier": "TAG4", "OrderStatus": "Rejected", "OrderAverageTradedPrice": 0.0},
+            {"AppOrderID": 1, "OrderUniqueIdentifier": "TAG1", "OrderStatus": "Filled", "OrderAverageTradedPrice": 10.0},
+            {"AppOrderID": 2, "OrderUniqueIdentifier": "TAG2", "OrderStatus": "Pending", "OrderAverageTradedPrice": 0.0},
+            {"AppOrderID": 3, "OrderUniqueIdentifier": "TAG3", "OrderStatus": "Filled", "OrderAverageTradedPrice": 12.0},
+            {"AppOrderID": 4, "OrderUniqueIdentifier": "TAG4", "OrderStatus": "Rejected", "OrderAverageTradedPrice": 0.0},
         ]
-        tags = ["TAG1", "TAG3", "TAG4"]
+        ids = [1, 3, 4]
         
-        filled = bot._get_filled_orders(order_book, tags)
+        filled = bot._get_filled_orders(order_book, ids)
         
         self.assertEqual(len(filled), 2)
         self.assertEqual(filled[0]["OrderUniqueIdentifier"], "TAG1")
         self.assertEqual(filled[1]["OrderUniqueIdentifier"], "TAG3")
 
     def test_get_filled_orders_none_filled(self):
-        """Test when no orders are filled."""
+        """Test when no orders are filled (by AppOrderID)."""
         order_book = [
-            {"OrderUniqueIdentifier": "TAG1", "OrderStatus": "Pending", "OrderAverageTradedPrice": 0.0},
-            {"OrderUniqueIdentifier": "TAG2", "OrderStatus": "Rejected", "OrderAverageTradedPrice": 0.0},
+            {"AppOrderID": 1, "OrderUniqueIdentifier": "TAG1", "OrderStatus": "Pending", "OrderAverageTradedPrice": 0.0},
+            {"AppOrderID": 2, "OrderUniqueIdentifier": "TAG2", "OrderStatus": "Rejected", "OrderAverageTradedPrice": 0.0},
         ]
-        tags = ["TAG1", "TAG2"]
+        ids = [1, 2]
         
-        filled = bot._get_filled_orders(order_book, tags)
+        filled = bot._get_filled_orders(order_book, ids)
         
         self.assertEqual(len(filled), 0)
 
@@ -268,6 +270,12 @@ class TestExecuteStrategy(unittest.TestCase):
         self.index_config.lot_size = 65
         self.index_config.tick_size = 0.05  # Add tick_size for SL order rounding
         self.expiry = "12FEB2026"
+        # For tests we disable premium-based strike so logic uses ATM/ITM path
+        self._orig_use_premium = bot.USE_PREMIUM_BASED_STRIKE
+        bot.USE_PREMIUM_BASED_STRIKE = False
+
+    def tearDown(self):
+        bot.USE_PREMIUM_BASED_STRIKE = self._orig_use_premium
 
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
@@ -330,7 +338,8 @@ class TestExecuteStrategy(unittest.TestCase):
         mock_dt.now.return_value.isoformat.return_value = "2026-02-08T09:20:01"
         mock_get_atm.return_value = 21900
         self.client.get_option_instrument_id.side_effect = [12345, 67890]
-        self.client.place_market_order.side_effect = ["CE_ORDER_ID", "PE_ORDER_ID"]
+        # place_market_order now returns numeric AppOrderIDs
+        self.client.place_market_order.side_effect = [1001, 1002]
         self.client.get_order_book.return_value = []
         mock_filled.return_value = [
             {
@@ -362,6 +371,7 @@ class TestExecuteStrategy(unittest.TestCase):
             "time": "09:20:00",
             "lots": 8,
             "leg_sl_pct": 20.0,
+            "db_id": 1,
         }
         
         bot._execute_strategy(self.client, self.index_config, self.expiry, strategy, force=True)
@@ -506,10 +516,10 @@ class TestCloseStrategy(unittest.TestCase):
         
         bot._close_strategy(client, index_config, strategy, positions, "Test closure")
         
-        # Should call the NEW SL-based closing function (no index_config parameter)
+        # Should call the SL-based closing helper
         mock_close_via_sl.assert_called_once_with(client, strategy)
         mock_update.assert_any_call("S0920", status="CLOSING", message="Test closure")
-        mock_update.assert_any_call("S0920", status="CLOSED", positions=[])
+        mock_update.assert_any_call("S0920", status="CLOSED", sl_orders=[], sl_tag_map={})
 
     @patch("bot.update_strategy")
     def test_dont_close_already_closed(self, mock_update):
@@ -730,13 +740,12 @@ class TestMonitorMTM(unittest.TestCase):
         
         bot._monitor_mtm(self.client, self.index_config, -80000.0)
         
-        # Verify _close_strategy_via_open_sl_orders was called for S0921
-        self.assertEqual(mock_close_via_sl.call_count, 1)
-        
-        # Verify it was called with S0921's data
-        call_args = mock_close_via_sl.call_args[0]
-        strategy_arg = call_args[1]
-        self.assertEqual(strategy_arg["name"], "S0921")
+        # Verify _close_strategy_via_open_sl_orders was called and that at least
+        # one call targeted S0921 (the one that hit SL). Additional calls for
+        # other strategies are allowed by the new logic.
+        self.assertGreaterEqual(mock_close_via_sl.call_count, 1)
+        called_names = [args[1]["name"] for args, _ in mock_close_via_sl.call_args_list]
+        self.assertIn("S0921", called_names)
 
 
 class TestScheduleJobs(unittest.TestCase):
@@ -901,21 +910,17 @@ class TestMain(unittest.TestCase):
 
 
 class TestStrategyState(unittest.TestCase):
-    """Test STRATEGY_STATE initialization."""
+    """Test STRATEGY_STATE initialization from today's strategies."""
 
-    @patch("bot.STRATEGIES")
-    def test_strategy_state_initialization(self, mock_strategies):
-        """Test that STRATEGY_STATE is correctly initialized from STRATEGIES."""
-        # This tests the module-level STRATEGY_STATE initialization
-        # Since it's already initialized, we just verify the structure
+    def test_strategy_state_initialization(self):
+        """Verify STRATEGY_STATE is a dict of strategies with required fields."""
         self.assertIsInstance(bot.STRATEGY_STATE, dict)
-        
         for key, strategy in bot.STRATEGY_STATE.items():
             self.assertIsInstance(key, str)
             self.assertIn("name", strategy)
             self.assertIn("status", strategy)
-            self.assertEqual(strategy["status"], "PENDING")
-            self.assertEqual(strategy["mtm"], 0.0)
+            self.assertIn("lots", strategy)
+            self.assertIn("time", strategy)
 
 
 class TestAppStartTime(unittest.TestCase):

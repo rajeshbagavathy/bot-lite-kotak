@@ -24,12 +24,18 @@ from config import (
     PORTFOLIO_SL_LIMIT,
     REQUIRED_MARGIN_PER_STRATEGY,
     SOURCE,
-    STRATEGIES,
     STRATEGY_LOTS_NON_EXPIRY,
+    STRATEGY_SL_ENABLED,
+    STRIKE_PREMIUM_BUFFER_NIFTY,
+    STRIKE_PREMIUM_BUFFER_SENSEX,
+    STRIKE_PREMIUM_TARGET_NIFTY,
+    STRIKE_PREMIUM_TARGET_SENSEX,
     TRADE_NON_EXPIRY_DAY,
+    USE_PREMIUM_BASED_STRIKE,
     DEMO_MODE,
     DB_ENABLE_MTM_SNAPSHOTS,
     get_basic_auth_creds,
+    get_today_strategies,
     load_credentials,
 )
 from db import (
@@ -49,15 +55,17 @@ from db import (
 )
 from mtm import calculate_mtm, calculate_strategy_mtm
 from state import (
+    get_mtm_snapshots_enabled,
+    get_trading_flag_or,
     init_state,
+    init_trading_flags,
     set_index,
     set_index_error,
+    set_mtm_snapshots_enabled,
     set_spot,
     update_portfolio,
     update_portfolio_margin,
     update_strategy,
-    get_mtm_snapshots_enabled,
-    set_mtm_snapshots_enabled,
 )
 from ui import create_app
 from xts_client import XTSClient
@@ -168,6 +176,66 @@ def _find_hedge_by_target_premium(
 
     _, strike, instrument_id, ltp_val = best
     return {"strike": strike, "instrument_id": instrument_id, "ltp": ltp_val}
+
+
+def _find_strike_by_premium(
+    client: XTSClient,
+    index_config,
+    expiry: str,
+    option_type: str,
+    atm_strike: int,
+    target_premium: float,
+    min_premium: float,
+    max_premium: float,
+    max_steps: int = 30,
+) -> Optional[Tuple[int, int]]:
+    """
+    Find strike (and instrument_id) whose option LTP is within [min_premium, max_premium],
+    and closest to target_premium. Scans ATM first, then OTM/ITM in both directions.
+    Returns (strike, instrument_id) or None if no strike in range.
+    """
+    strike_diff = int(index_config.strike_diff)
+    strikes_to_check: List[int] = [atm_strike]
+    for i in range(1, max_steps + 1):
+        strikes_to_check.append(atm_strike + i * strike_diff)
+        strikes_to_check.append(atm_strike - i * strike_diff)
+
+    candidates: List[Tuple[int, int]] = []
+    for strike in strikes_to_check:
+        instrument_id = client.get_option_instrument_id(
+            index_config, expiry, option_type.upper(), strike
+        )
+        if instrument_id:
+            candidates.append((strike, int(instrument_id)))
+
+    if not candidates:
+        return None
+
+    instruments = [
+        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": iid}
+        for _, iid in candidates
+    ]
+    ltp_map = client.get_ltp_map(instruments)
+
+    best: Optional[Tuple[float, int, int]] = None  # (abs_diff, strike, instrument_id)
+    for strike, instrument_id in candidates:
+        ltp = ltp_map.get(instrument_id)
+        if ltp is None:
+            continue
+        try:
+            ltp_val = float(ltp)
+        except (TypeError, ValueError):
+            continue
+        if not (min_premium <= ltp_val <= max_premium):
+            continue
+        diff = abs(ltp_val - target_premium)
+        if best is None or diff < best[0]:
+            best = (diff, strike, instrument_id)
+
+    if best is None:
+        return None
+    _, strike, instrument_id = best
+    return (strike, instrument_id)
 
 
 def _ensure_margin_or_skip_strategy(
@@ -377,20 +445,44 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
         update_strategy(name, status="ERROR", message="Spot LTP unavailable")
         return
 
-    # Expiry: ITM (CE below spot, PE above spot). Non-expiry: ATM straddle (same strike CE & PE).
     strike_diff = int(index_config.strike_diff)
-    if is_expiry:
-        n = int(ITM_STRIKES_SENSEX) if index_config.name == "SENSEX" else int(ITM_STRIKES_NIFTY)
-        ce_strike = atm_strike - n * strike_diff
-        pe_strike = atm_strike + n * strike_diff
-    else:
-        ce_strike = pe_strike = atm_strike
+    if get_trading_flag_or("use_premium_based_strike", USE_PREMIUM_BASED_STRIKE):
+        # Premium-based: find CE and PE strikes whose LTP is in target±buffer, closest to target.
+        if index_config.name == "NIFTY":
+            target, buffer = STRIKE_PREMIUM_TARGET_NIFTY, STRIKE_PREMIUM_BUFFER_NIFTY
+        else:
+            target, buffer = STRIKE_PREMIUM_TARGET_SENSEX, STRIKE_PREMIUM_BUFFER_SENSEX
+        min_p = target - buffer
+        max_p = target + buffer
 
-    ce_id = client.get_option_instrument_id(index_config, expiry, "CE", ce_strike)
-    pe_id = client.get_option_instrument_id(index_config, expiry, "PE", pe_strike)
-    if not ce_id or not pe_id:
-        update_strategy(name, status="ERROR", message="Option instruments not found")
-        return
+        ce_result = _find_strike_by_premium(
+            client, index_config, expiry, "CE", atm_strike, target, min_p, max_p
+        )
+        pe_result = _find_strike_by_premium(
+            client, index_config, expiry, "PE", atm_strike, target, min_p, max_p
+        )
+        if ce_result is None or pe_result is None:
+            update_strategy(
+                name,
+                status="ERROR",
+                message=f"Strike not in premium range (CE in range: {ce_result is not None}, PE in range: {pe_result is not None})",
+            )
+            return
+        ce_strike, ce_id = ce_result
+        pe_strike, pe_id = pe_result
+    else:
+        # ATM/ITM-based (legacy).
+        if is_expiry:
+            n = int(ITM_STRIKES_SENSEX) if index_config.name == "SENSEX" else int(ITM_STRIKES_NIFTY)
+            ce_strike = atm_strike - n * strike_diff
+            pe_strike = atm_strike + n * strike_diff
+        else:
+            ce_strike = pe_strike = atm_strike
+        ce_id = client.get_option_instrument_id(index_config, expiry, "CE", ce_strike)
+        pe_id = client.get_option_instrument_id(index_config, expiry, "PE", pe_strike)
+        if not ce_id or not pe_id:
+            update_strategy(name, status="ERROR", message="Option instruments not found")
+            return
 
     # Pre-check margin; if low, buy far-OTM hedges first and refresh.
     if not _ensure_margin_or_skip_strategy(client, index_config, expiry, strategy, atm_strike):
@@ -1122,8 +1214,15 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
                 "All positions closed via SL orders",
             )
 
-        # Now s_total is based on local positions (exit_price/LTP), not broker aggregates.
-        if strategy["status"] == "OPEN" and s_total <= -float(strategy["strategy_sl"]):
+        # Per-strategy SL: only when enabled and strategy_sl > 0.
+        strategy_sl_val = strategy.get("strategy_sl")
+        if (
+            get_trading_flag_or("strategy_sl_enabled", STRATEGY_SL_ENABLED)
+            and strategy["status"] == "OPEN"
+            and strategy_sl_val is not None
+            and float(strategy_sl_val) > 0
+            and s_total <= -float(strategy_sl_val)
+        ):
             _close_strategy(client, index_config, strategy, positions, "Strategy SL hit")
 
     if overall <= portfolio_sl:
@@ -1158,40 +1257,12 @@ def _update_available_margin(client: XTSClient) -> None:
     update_portfolio_margin(available_margin)
 
 
-STRATEGY_STATE: Dict[str, dict] = {
-    cfg.name: {
-        "name": cfg.name, "time": cfg.time, "lots": cfg.lots,
-        "leg_sl_pct": cfg.leg_sl_pct, "leg_target_pct": LEG_TARGET_PCT, "strategy_sl": cfg.strategy_sl,
-        "status": "PENDING", "mtm": 0.0, "realized": 0.0, "unrealized": 0.0,
-        "strike": None, "instrument_ids": [], "sl_orders": [], "positions": [],
-        "order_tags": [], "entry_time": None, "message": None, "last_update": None,
-        "sl_tag_map": {}, "db_id": None,
-    }
-    for cfg in STRATEGIES
-}
-
-
-def _apply_non_expiry_overrides(expiry: str) -> None:
-    """If today is NOT expiry day, override lots and leg_sl_pct in STRATEGY_STATE for the UI."""
-    if _is_expiry_day(expiry):
-        return
-    for strategy in STRATEGY_STATE.values():
-        update_strategy(
-            strategy["name"],
-            lots=int(STRATEGY_LOTS_NON_EXPIRY),
-            leg_sl_pct=float(LEG_SL_PCT_NON_EXPIRY),
-        )
-    logger.info(
-        "Non-expiry day: overridden lots=%d, leg_sl_pct=%.1f%% for all strategies",
-        STRATEGY_LOTS_NON_EXPIRY,
-        LEG_SL_PCT_NON_EXPIRY,
-    )
+STRATEGY_STATE: Dict[str, dict] = {}
 
 
 def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
-    _apply_non_expiry_overrides(expiry)
 
-    if not _is_expiry_day(expiry) and not TRADE_NON_EXPIRY_DAY:
+    if not _is_expiry_day(expiry) and not get_trading_flag_or("trade_non_expiry_day", TRADE_NON_EXPIRY_DAY):
         logger.info("Non-expiry day and TRADE_NON_EXPIRY_DAY is disabled — skipping all strategy scheduling")
         for strategy in STRATEGY_STATE.values():
             update_strategy(strategy["name"], status="DISABLED", message="No trading on non-expiry day")
@@ -1319,14 +1390,43 @@ def main() -> None:
     init_db()
     # Clean up all previous day data on startup
     cleanup_previous_day_data()
-    
+
+    # Build today's strategy plan (per index) and STRATEGY_STATE
+    global STRATEGY_STATE
+    STRATEGY_STATE = {}
+    if index_config is not None:
+        todays_cfgs = get_today_strategies(index_config.name)
+        for cfg in todays_cfgs:
+            STRATEGY_STATE[cfg.name] = {
+                "name": cfg.name,
+                "time": cfg.time,
+                "lots": cfg.lots,
+                "leg_sl_pct": cfg.leg_sl_pct,
+                "leg_target_pct": LEG_TARGET_PCT,
+                "strategy_sl": cfg.strategy_sl,
+                "status": "PENDING",
+                "mtm": 0.0,
+                "realized": 0.0,
+                "unrealized": 0.0,
+                "strike": None,
+                "instrument_ids": [],
+                "sl_orders": [],
+                "positions": [],
+                "order_tags": [],
+                "entry_time": None,
+                "message": None,
+                "last_update": None,
+                "sl_tag_map": {},
+                "db_id": None,
+            }
+
     # Restore today's strategies from database (before init_state)
     if not DEMO_MODE and index_config is not None:
         restored = restore_todays_strategies()
         for restored_strategy in restored:
             strategy_name = restored_strategy["strategy_name"]
             if strategy_name in STRATEGY_STATE:
-                logger.info(f"Restoring {strategy_name} from database...")
+                logger.info(f"Restoring %s from database...", strategy_name)
                 STRATEGY_STATE[strategy_name].update({
                     "db_id": restored_strategy["db_id"],
                     "status": restored_strategy.get("status", "OPEN"),
@@ -1334,8 +1434,9 @@ def main() -> None:
                     "entry_time": restored_strategy["entry_time"],
                     "positions": restored_strategy["positions"],
                 })
-    
+
     init_state(STRATEGY_STATE)
+    init_trading_flags(USE_PREMIUM_BASED_STRIKE, STRATEGY_SL_ENABLED, TRADE_NON_EXPIRY_DAY)
     set_mtm_snapshots_enabled(DB_ENABLE_MTM_SNAPSHOTS)
     if index_config is not None:
         set_index(index_config.name, expiry)
