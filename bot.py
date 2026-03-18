@@ -10,7 +10,6 @@ import schedule
 from config import (
     ACC_NAME,
     INDEX_CONFIGS,
-    HEDGE_LOTS,
     HEDGE_PREMIUM_MAX_EXPIRY,
     HEDGE_PREMIUM_MAX_NON_EXPIRY,
     HEDGE_PREMIUM_MIN_EXPIRY,
@@ -21,15 +20,19 @@ from config import (
     ITM_STRIKES_SENSEX,
     LEG_SL_PCT_NON_EXPIRY,
     LEG_TARGET_PCT,
+    MARGIN_BUFFER_EXPIRY,
+    MARGIN_BUFFER_NON_EXPIRY,
+    MARGIN_REQUIRED_PER_LOT_EXPIRY,
+    MARGIN_REQUIRED_PER_LOT_NON_EXPIRY,
     PORTFOLIO_SL_LIMIT,
-    REQUIRED_MARGIN_PER_STRATEGY,
     SOURCE,
-    STRATEGY_LOTS_NON_EXPIRY,
     STRATEGY_SL_ENABLED,
     STRIKE_PREMIUM_BUFFER_NIFTY,
     STRIKE_PREMIUM_BUFFER_SENSEX,
     STRIKE_PREMIUM_TARGET_NIFTY,
     STRIKE_PREMIUM_TARGET_SENSEX,
+    HEDGE_QTY_MULTIPLIER_EXPIRY,
+    HEDGE_QTY_MULTIPLIER_NON_EXPIRY,
     TRADE_NON_EXPIRY_DAY,
     USE_PREMIUM_BASED_STRIKE,
     DEMO_MODE,
@@ -253,18 +256,27 @@ def _ensure_margin_or_skip_strategy(
     """
     name = strategy["name"]
 
+    is_expiry = _is_expiry_day(expiry)
     available = client.get_available_margin()
     update_portfolio_margin(available)
-    if available is not None and float(available) >= float(REQUIRED_MARGIN_PER_STRATEGY):
+    strategy_lots = int(strategy.get("lots") or 0)
+    required_margin = (
+        (float(MARGIN_REQUIRED_PER_LOT_EXPIRY) if is_expiry else float(MARGIN_REQUIRED_PER_LOT_NON_EXPIRY)) * strategy_lots
+        + (float(MARGIN_BUFFER_EXPIRY) if is_expiry else float(MARGIN_BUFFER_NON_EXPIRY))
+    )
+    if available is not None and float(available) >= required_margin:
         return True
 
-    target_premium = float(HEDGE_TARGET_PREMIUM_EXPIRY) if _is_expiry_day(expiry) else float(HEDGE_TARGET_PREMIUM_NON_EXPIRY)
-    min_premium = float(HEDGE_PREMIUM_MIN_EXPIRY) if _is_expiry_day(expiry) else float(HEDGE_PREMIUM_MIN_NON_EXPIRY)
-    max_premium = float(HEDGE_PREMIUM_MAX_EXPIRY) if _is_expiry_day(expiry) else float(HEDGE_PREMIUM_MAX_NON_EXPIRY)
+    target_premium = float(HEDGE_TARGET_PREMIUM_EXPIRY) if is_expiry else float(HEDGE_TARGET_PREMIUM_NON_EXPIRY)
+    min_premium = float(HEDGE_PREMIUM_MIN_EXPIRY) if is_expiry else float(HEDGE_PREMIUM_MIN_NON_EXPIRY)
+    max_premium = float(HEDGE_PREMIUM_MAX_EXPIRY) if is_expiry else float(HEDGE_PREMIUM_MAX_NON_EXPIRY)
 
     update_strategy(
         name,
-        message=f"Low margin ({available}); buying hedges targeting ~₹{target_premium} (LTP in ₹{min_premium}-₹{max_premium})",
+        message=(
+            f"Low margin ({available}); required {required_margin:.0f}, "
+            f"buying hedges targeting ~₹{target_premium} (LTP in ₹{min_premium}-₹{max_premium})"
+        ),
     )
 
     pe_hedge = _find_hedge_by_target_premium(
@@ -292,7 +304,8 @@ def _ensure_margin_or_skip_strategy(
         update_strategy(name, status="ERROR", message="Margin low; unable to find hedge options")
         return False
 
-    hedge_qty = int(HEDGE_LOTS) * int(index_config.lot_size)
+    hedge_multiplier = float(HEDGE_QTY_MULTIPLIER_EXPIRY) if is_expiry else float(HEDGE_QTY_MULTIPLIER_NON_EXPIRY)
+    hedge_qty = int(math.ceil(strategy_lots * hedge_multiplier)) * int(index_config.lot_size)
     hedge_orders = []
     for hedge, side in ((pe_hedge, "PE"), (ce_hedge, "CE")):
         tag = f"{name}_HEDGE_{side}_BUY_{int(time.time())}"
@@ -336,26 +349,15 @@ def _ensure_margin_or_skip_strategy(
         hedge_strikes={"PE": pe_hedge.get("strike"), "CE": ce_hedge.get("strike")},
     )
 
-    time.sleep(5)
+    time.sleep(3)
     available2 = client.get_available_margin()
     update_portfolio_margin(available2)
-    if available2 is not None and float(available2) >= float(REQUIRED_MARGIN_PER_STRATEGY):
+    if available2 is not None and float(available2) >= required_margin:
         update_strategy(name, message=f"Margin improved ({available2}); proceeding with straddle")
         return True
 
-    # Still insufficient: close hedge positions and skip strategy
-    try:
-        positions = client.get_positions()
-        _close_positions_for_instruments(
-            client,
-            index_config,
-            positions,
-            [int(pe_hedge["instrument_id"]), int(ce_hedge["instrument_id"])],
-        )
-    except Exception:
-        logger.exception("Failed to close hedge positions for %s", name)
-
-    update_strategy(name, status="ERROR", message="Margin not available even after hedges")
+    # Still insufficient: leave hedge positions open and skip strategy.
+    update_strategy(name, status="ERROR", message="MARGIN_NOT_AVAILABLE: margin not available even after hedges")
     return False
 
 

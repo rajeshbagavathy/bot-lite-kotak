@@ -289,10 +289,10 @@ class TestExecuteStrategy(unittest.TestCase):
 
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
-    @patch("datetime.datetime")
-    def test_strategy_before_scheduled_time(self, mock_dt, mock_get_atm, mock_update):
+    @patch("bot.get_ist_now")
+    def test_strategy_before_scheduled_time(self, mock_now, mock_get_atm, mock_update):
         """Test strategy not executed before scheduled time."""
-        mock_dt.now.return_value.strftime.return_value = "09:15:00"
+        mock_now.return_value.strftime.return_value = "09:15:00"
         strategy = {"status": "PENDING", "name": "S0920", "time": "09:20:00"}
         
         bot._execute_strategy(self.client, self.index_config, self.expiry, strategy, force=False)
@@ -382,6 +382,83 @@ class TestExecuteStrategy(unittest.TestCase):
         # Verify strategy updated (3 times: OPEN, db_id, sl_orders)
         update_calls = [call for call in mock_update.call_args_list]
         self.assertEqual(len(update_calls), 3)
+
+
+class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
+    """Test _ensure_margin_or_skip_strategy() margin gating and hedge sizing."""
+
+    def setUp(self):
+        self.client = MagicMock()
+        self.index_config = MagicMock()
+        self.index_config.lot_size = 50
+        self.strategy = {"name": "S0920", "lots": 10}
+
+    @patch("bot.update_strategy")
+    @patch("bot.update_portfolio_margin")
+    @patch("bot._find_hedge_by_target_premium")
+    @patch("bot._is_expiry_day", return_value=True)
+    def test_expiry_day_hedge_quantity_and_success(
+        self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
+    ):
+        self.client.get_available_margin.side_effect = [1000000.0, 4000000.0]
+        mock_find_hedge.side_effect = [
+            {"strike": 100, "instrument_id": 111, "ltp": 2.0},
+            {"strike": 200, "instrument_id": 222, "ltp": 2.1},
+        ]
+        self.client.place_market_order.side_effect = [101, 102]
+
+        with patch("bot.time.sleep") as mock_sleep:
+            result = bot._ensure_margin_or_skip_strategy(
+                self.client,
+                self.index_config,
+                "17Mar2026",
+                self.strategy,
+                atm_strike=150,
+            )
+
+        self.assertTrue(result)
+        mock_sleep.assert_called_once_with(3)
+        self.assertEqual(self.client.place_market_order.call_count, 2)
+        self.assertEqual(self.client.place_market_order.call_args_list[0][1]["quantity"], 1000)
+        self.assertEqual(self.client.place_market_order.call_args_list[1][1]["quantity"], 1000)
+        hedge_call = next(
+            c for c in mock_update_strategy.call_args_list
+            if c.kwargs.get("hedge_qty") == 1000
+        )
+        self.assertEqual(hedge_call.kwargs["hedge_strikes"], {"PE": 100, "CE": 200})
+        self.assertEqual(len(hedge_call.kwargs["hedge_orders"]), 2)
+        self.assertEqual(hedge_call.kwargs["hedge_orders"][0]["app_order_id"], 101)
+        self.assertEqual(hedge_call.kwargs["hedge_orders"][1]["app_order_id"], 102)
+
+    @patch("bot.update_strategy")
+    @patch("bot.update_portfolio_margin")
+    @patch("bot._find_hedge_by_target_premium")
+    @patch("bot._is_expiry_day", return_value=False)
+    def test_non_expiry_day_hedge_quantity_and_failure(
+        self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
+    ):
+        self.client.get_available_margin.side_effect = [1000000.0, 2000000.0]
+        mock_find_hedge.side_effect = [
+            {"strike": 100, "instrument_id": 111, "ltp": 5.0},
+            {"strike": 200, "instrument_id": 222, "ltp": 5.1},
+        ]
+        self.client.place_market_order.side_effect = [201, 202]
+
+        with patch("bot.time.sleep") as mock_sleep:
+            result = bot._ensure_margin_or_skip_strategy(
+                self.client,
+                self.index_config,
+                "18Mar2026",
+                self.strategy,
+                atm_strike=150,
+            )
+
+        self.assertFalse(result)
+        mock_sleep.assert_called_once_with(3)
+        self.assertEqual(self.client.place_market_order.call_count, 2)
+        self.assertEqual(self.client.place_market_order.call_args_list[0][1]["quantity"], 750)
+        self.assertEqual(self.client.place_market_order.call_args_list[1][1]["quantity"], 750)
+        mock_update_strategy.assert_any_call("S0920", status="ERROR", message="MARGIN_NOT_AVAILABLE: margin not available even after hedges")
 
 
 class TestClosePositionsForInstruments(unittest.TestCase):

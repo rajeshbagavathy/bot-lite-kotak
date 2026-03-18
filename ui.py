@@ -58,6 +58,8 @@ DASHBOARD_TEMPLATE = """
     .meta-item:last-child { border-right: none; }
     .meta-label { color: #94a3b8; font-size: 12px; }
     .meta-value { font-size: 18px; font-weight: bold; margin-top: 5px; }
+    .subtext { color: #94a3b8; font-size: 12px; margin-top: 4px; line-height: 1.35; }
+    .warn-box { background: #7c2d12; color: #fed7aa; padding: 10px 12px; border-radius: 6px; border: 1px solid #fb923c; font-size: 12px; line-height: 1.4; }
     .refresh-time { color: #64748b; font-size: 11px; margin-top: 20px; text-align: center; }
   </style>
 </head>
@@ -86,6 +88,10 @@ DASHBOARD_TEMPLATE = """
         <div class="card">
           <div class="card-title">Today's Summary</div>
           <div id="today-summary">Loading...</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Margin Gate</div>
+          <div id="margin-gate-card">Loading...</div>
         </div>
         <div class="card">
           <div class="card-title">Settings</div>
@@ -122,7 +128,7 @@ DASHBOARD_TEMPLATE = """
       </div>
       <table>
         <thead>
-          <tr><th>Strategy</th><th>Status</th><th>Strike</th><th>Entry Time</th><th>Positions</th></tr>
+          <tr><th>Strategy</th><th>Status</th><th>Strike</th><th>Entry Time</th><th>Positions</th><th>Margin / Hedge</th></tr>
         </thead>
         <tbody id="overview-rows">Loading...</tbody>
       </table>
@@ -131,7 +137,7 @@ DASHBOARD_TEMPLATE = """
     <div id="strategies" class="tab-content">
       <table>
         <thead>
-          <tr><th>Strategy Name</th><th>Execution Date</th><th>Strike</th><th>Entry Time</th><th>Status</th><th>Lots</th><th>Leg SL %</th><th>Strategy SL</th></tr>
+          <tr><th>Strategy Name</th><th>Execution Date</th><th>Strike</th><th>Entry Time</th><th>Status</th><th>Lots</th><th>Leg SL %</th><th>Strategy SL</th><th>Margin Req</th><th>Message</th><th>Hedge</th></tr>
         </thead>
         <tbody id="strategies-rows">Loading...</tbody>
       </table>
@@ -140,7 +146,7 @@ DASHBOARD_TEMPLATE = """
     <div id="positions" class="tab-content">
       <table>
         <thead>
-          <tr><th>Strategy</th><th>Symbol</th><th>Quantity</th><th>Entry Price</th><th>Target (65%)</th><th>Exit Price</th><th>Entry Time</th><th>Exit Time</th><th>Status</th></tr>
+          <tr><th>Strategy</th><th>Symbol</th><th>Quantity</th><th>Entry Price</th><th>Target (60%)</th><th>Exit Price</th><th>Entry Time</th><th>Exit Time</th><th>Status</th></tr>
         </thead>
         <tbody id="positions-rows">Loading...</tbody>
       </table>
@@ -193,6 +199,17 @@ DASHBOARD_TEMPLATE = """
     function getClass(num) {
       if (num === null || num === undefined) return '';
       return num < 0 ? 'negative' : 'positive';
+    }
+
+    function fmtMargin(n) {
+      if (n === null || n === undefined || isNaN(Number(n))) return '-';
+      return `${(Number(n) / 100000).toFixed(2)}L`;
+    }
+
+    function calcRequiredMargin(lots, isExpiry) {
+      const perLot = isExpiry ? 315000 : 250000;
+      const buffer = 300000;
+      return (Number(lots) || 0) * perLot + buffer;
     }
 
     function switchTab(event, tabName) {
@@ -290,6 +307,10 @@ DASHBOARD_TEMPLATE = """
         } else {
           dashBanner.innerHTML = '';
         }
+        const marginWarning = Object.values(stateStrategies).find(s => String(s.message || '').includes('MARGIN_NOT_AVAILABLE') || String(s.status || '') === 'ERROR');
+        if (marginWarning && dashBanner) {
+          dashBanner.innerHTML = '<div class="warn-box">Margin gate warning: ' + (marginWarning.message || marginWarning.status || 'Check strategy status') + '</div>';
+        }
         
         // Show error if expiry not available
         let errorHtml = '';
@@ -344,6 +365,22 @@ DASHBOARD_TEMPLATE = """
           </div>
         `;
 
+        const marginGateEl = document.getElementById('margin-gate-card');
+        if (marginGateEl) {
+          const isSensex = (idx.name || '').toUpperCase() === 'SENSEX';
+          marginGateEl.innerHTML = `
+            <div class="metric">
+              <span class="metric-label">Available Margin</span>
+              <span class="metric-value">${fmt(portfolio.available_margin)}</span>
+            </div>
+            <div class="metric">
+              <span class="metric-label">Threshold Rule</span>
+              <span class="metric-value">${isSensex ? '2.5L / lot + buffer' : '3.15L / lot + buffer'}</span>
+            </div>
+            <div class="subtext">If margin is short, the bot buys far OTM CE/PE hedges, waits 3 seconds, then rechecks before placing the straddle.</div>
+          `;
+        }
+
         const openStrategies = strategies.filter(s => s.status === 'OPEN').length;
         const totalPnL = trades.reduce((sum, t) => sum + (t.realized_pnl || 0), 0);
         document.getElementById('today-summary').innerHTML = `
@@ -364,6 +401,10 @@ DASHBOARD_TEMPLATE = """
         let overviewHTML = '';
         for (const s of strategies.slice(0, 10)) {
           const strat_positions = positions.filter(p => p.strategy_id === s.id).length;
+          const marginText = s.message || '-';
+          const hedgeText = s.hedge_qty ? `Hedge qty: ${s.hedge_qty}${s.hedge_strikes ? ` | ${JSON.stringify(s.hedge_strikes)}` : ''}` : '';
+          const expMargin = fmtMargin(calcRequiredMargin(s.lots, true));
+          const nonExpMargin = fmtMargin(calcRequiredMargin(s.lots, false));
           overviewHTML += `
             <tr>
               <td>${s.strategy_name}</td>
@@ -371,13 +412,17 @@ DASHBOARD_TEMPLATE = """
               <td>${s.strike || '-'}</td>
               <td>${s.entry_time || '-'}</td>
               <td>${strat_positions} positions</td>
+              <td>${expMargin} exp / ${nonExpMargin} non-exp${marginText !== '-' ? `<div class="subtext">${marginText}</div>` : ''}${hedgeText ? `<div class="subtext">${hedgeText}</div>` : ''}</td>
             </tr>
           `;
         }
-        document.getElementById('overview-rows').innerHTML = overviewHTML || '<tr><td colspan="5">No data</td></tr>';
+        document.getElementById('overview-rows').innerHTML = overviewHTML || '<tr><td colspan="6">No data</td></tr>';
 
         let strategiesHTML = '';
         for (const s of strategies) {
+          const hedgeText = s.hedge_qty ? `${s.hedge_qty}${s.hedge_strikes ? ` | ${JSON.stringify(s.hedge_strikes)}` : ''}` : '-';
+          const expMargin = fmtMargin(calcRequiredMargin(s.lots, true));
+          const nonExpMargin = fmtMargin(calcRequiredMargin(s.lots, false));
           strategiesHTML += `
             <tr>
               <td>${s.strategy_name}</td>
@@ -388,10 +433,13 @@ DASHBOARD_TEMPLATE = """
               <td>${s.lots || '-'}</td>
               <td>${fmt(s.leg_sl_pct)} %</td>
               <td>${fmt(s.strategy_sl)}</td>
+              <td>${expMargin} exp / ${nonExpMargin} non-exp</td>
+              <td>${s.message || '-'}</td>
+              <td>${hedgeText}</td>
             </tr>
           `;
         }
-        document.getElementById('strategies-rows').innerHTML = strategiesHTML || '<tr><td colspan="8">No data</td></tr>';
+        document.getElementById('strategies-rows').innerHTML = strategiesHTML || '<tr><td colspan="10">No data</td></tr>';
 
         let positionsHTML = '';
         for (const p of positions) {
@@ -624,6 +672,10 @@ HTML_TEMPLATE = """
       } else {
         bannerEl.innerHTML = '';
       }
+        const marginWarning = Object.values(strategies).find(s => String(s.message || '').includes('MARGIN_NOT_AVAILABLE') || String(s.status || '') === 'ERROR');
+        if (marginWarning && bannerEl) {
+          bannerEl.innerHTML = '<div class="warn-box">Margin gate warning: ' + (marginWarning.message || marginWarning.status || 'Check strategy status') + '</div>';
+        }
 
       const mtmClass = portfolio.mtm < 0 ? 'negative' : 'positive';
       document.getElementById('meta').innerHTML =

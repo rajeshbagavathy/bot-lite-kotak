@@ -149,12 +149,14 @@ PORTFOLIO_SL_LIMIT = -80000.0
 TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "True").lower() in ("true", "1", "yes")
 
 # Margin + hedging configuration
-# If available margin is below this, bot will buy far-OTM hedges first.
-REQUIRED_MARGIN_PER_STRATEGY = float(os.getenv("REQUIRED_MARGIN_PER_STRATEGY", "1750000"))
-# Hedge lots to buy on both sides (CE+PE) when margin is low.
-HEDGE_LOTS = int(os.getenv("HEDGE_LOTS", "7"))
-# Strategy lots: expiry uses STRATEGIES[].lots (7), non-expiry uses this.
-STRATEGY_LOTS_NON_EXPIRY = int(os.getenv("STRATEGY_LOTS_NON_EXPIRY", "4"))
+# Day-based margin requirement per straddle lot pair (CE+PE), plus a safety buffer.
+MARGIN_REQUIRED_PER_LOT_EXPIRY = float(os.getenv("MARGIN_REQUIRED_PER_LOT_EXPIRY", "315000"))
+MARGIN_REQUIRED_PER_LOT_NON_EXPIRY = float(os.getenv("MARGIN_REQUIRED_PER_LOT_NON_EXPIRY", "250000"))
+MARGIN_BUFFER_EXPIRY = float(os.getenv("MARGIN_BUFFER_EXPIRY", "300000"))
+MARGIN_BUFFER_NON_EXPIRY = float(os.getenv("MARGIN_BUFFER_NON_EXPIRY", "300000"))
+# Hedge quantity multipliers by day type.
+HEDGE_QTY_MULTIPLIER_EXPIRY = float(os.getenv("HEDGE_QTY_MULTIPLIER_EXPIRY", "2.0"))
+HEDGE_QTY_MULTIPLIER_NON_EXPIRY = float(os.getenv("HEDGE_QTY_MULTIPLIER_NON_EXPIRY", "1.5"))
 # ITM strikes away from ATM for expiry days (NIFTY: 2 → 25100 CE / 25300 PE @ spot 25200; SENSEX: 3). Non-expiry uses ATM.
 ITM_STRIKES_NIFTY = int(os.getenv("ITM_STRIKES_NIFTY", "1"))
 ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "2"))
