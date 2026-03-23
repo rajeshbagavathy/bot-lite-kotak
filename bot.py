@@ -11,6 +11,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import schedule
 
 
+def _default_bot_log_path() -> str:
+    """
+    Log file next to this module (not cwd). Avoids bot vs UI reading different files when
+    systemd/gunicorn cwd differs from where `python bot.py` was started.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+
+
 def _configure_bot_logging() -> None:
     """
     Configure logging before any Flask/ui imports.
@@ -19,7 +27,8 @@ def _configure_bot_logging() -> None:
     - ``xts-bot-lite``: INFO to stderr + bot.log file, propagate=False so app logs are isolated.
     - Werkzeug / boto / urllib3: effectively silent (CRITICAL, no propagate).
     """
-    log_path = os.path.abspath(os.environ.get("BOT_LOG_PATH", "bot.log"))
+    env_lp = os.environ.get("BOT_LOG_PATH")
+    log_path = os.path.abspath(env_lp) if env_lp else _default_bot_log_path()
     # Same path for UI tail (`ui.read_bot_log_tail`) even if cwd differs between processes.
     os.environ["BOT_LOG_PATH"] = log_path
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -1901,15 +1910,25 @@ def main() -> None:
         register_scheduler_snapshot_with_state()
 
     from threading import Thread
+
+    try:
+        ui_port = int(os.getenv("WEB_UI_PORT", "80"))
+    except ValueError:
+        ui_port = 80
+
     def _run_flask_server() -> None:
         ensure_http_access_not_logged()
-        app.run(host="0.0.0.0", port=80, debug=False, use_reloader=False)
+        app.run(host="0.0.0.0", port=ui_port, debug=False, use_reloader=False)
 
     ui_thread = Thread(target=_run_flask_server)
     ui_thread.daemon = True
     ui_thread.start()
 
-    logger.debug("UI at http://localhost:8001 | %s / %s", auth["username"], auth["password"])
+    logger.info(
+        "UI dashboard at http://0.0.0.0:%s (path /dashboard) | basic auth user: %s",
+        ui_port,
+        auth["username"],
+    )
     
     # If no expiry was found, retry periodically
     if index_config is None and not DEMO_MODE:

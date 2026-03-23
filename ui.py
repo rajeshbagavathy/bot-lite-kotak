@@ -21,8 +21,14 @@ except ImportError:
     LEG_TARGET_PCT = 65.0
 
 
+def _default_bot_log_path() -> str:
+    """Same default as bot.py: project directory, not process cwd."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+
+
 def _bot_log_abs_path() -> str:
-    return os.path.abspath(os.environ.get("BOT_LOG_PATH", "bot.log"))
+    env_lp = os.environ.get("BOT_LOG_PATH")
+    return os.path.abspath(env_lp) if env_lp else _default_bot_log_path()
 
 
 def silence_werkzeug_http_access_log() -> None:
@@ -68,12 +74,15 @@ def ensure_http_access_not_logged() -> None:
 
 def read_bot_log_tail(
     max_lines: int = 500,
-    max_bytes: int = 512_000,
+    max_bytes: int = 8_388_608,
     mode: str = "survivor",
 ) -> dict:
     """
     Read the last chunk of the bot log file (same path as bot.py FileHandler).
     Does not accept arbitrary paths from the client (fixed path only).
+
+    ``max_bytes`` is how much of the *end* of the file to load before taking the last
+    ``max_lines`` lines — large enough that typical INFO lines are not cut off before "now".
     """
     path = _bot_log_abs_path()
     if mode not in ("survivor", "all"):
@@ -90,6 +99,9 @@ def read_bot_log_tail(
         out["missing"] = True
         return out
     try:
+        st = os.stat(path)
+        out["file_size_bytes"] = st.st_size
+        out["file_mtime_ms"] = int(st.st_mtime * 1000)
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
@@ -301,7 +313,7 @@ DASHBOARD_TEMPLATE = """
     <div id="botlog" class="tab-content">
       <div class="card" style="margin-bottom: 12px;">
         <div class="card-title">Bot log file</div>
-        <p class="meta-label" style="margin-bottom: 8px;">Tail of <span id="bot-log-path">—</span>. Default view shows only <strong>survivor SL-to-cost</strong> lines. Use the checkbox below to see the full tail (INFO/WARNING/ERROR). Refresh only reloads; it does not change the filter.</p>
+        <p class="meta-label" style="margin-bottom: 8px;">Tail of <span id="bot-log-path">—</span> (default file is <strong>bot.log next to bot.py/ui.py</strong>, not cwd — override with env <code>BOT_LOG_PATH</code>). Default view shows only <strong>survivor SL-to-cost</strong> lines. Use the checkbox for the full tail. If timestamps never update, the UI process is reading a different file than the bot.</p>
         <label class="setting-row" style="margin-bottom: 8px;">
           <input type="checkbox" id="bot-log-show-full" />
           <span>Show full log (entire tail, not survivor-only)</span>
@@ -371,7 +383,7 @@ DASHBOARD_TEMPLATE = """
           fetch('/api/orders', noCache).then(r => r.json()),
           fetch('/api/trades', noCache).then(r => r.json()),
           fetch('/api/mtm', noCache).then(r => r.json()),
-          fetch('/api/bot-log?lines=800&mode=' + encodeURIComponent(logMode) + '&_=' + Date.now(), noCache).then(r => r.json()),
+          fetch('/api/bot-log?lines=2500&mode=' + encodeURIComponent(logMode) + '&_=' + Date.now(), noCache).then(r => r.json()),
         ]);
 
         const portfolio = state.portfolio || {};
@@ -739,7 +751,13 @@ DASHBOARD_TEMPLATE = """
             const shown = (botlog.lines && botlog.lines.length) || 0;
             const tailN = botlog.tail_line_count != null ? botlog.tail_line_count : '?';
             const mode = botlog.mode === 'all' ? 'full tail' : 'survivor filter';
-            logMetaEl.textContent = 'Fetched ' + ts + ' · ' + shown + ' line(s) displayed (' + mode + ', last ' + tailN + ' raw lines read from file end)';
+            let disk = '';
+            if (botlog.file_size_bytes != null && botlog.file_mtime_ms != null) {
+              const kb = (botlog.file_size_bytes / 1024).toFixed(0);
+              const mtime = new Date(botlog.file_mtime_ms).toLocaleString();
+              disk = ' · on-disk: ' + kb + ' KB, last modified ' + mtime;
+            }
+            logMetaEl.textContent = 'Fetched ' + ts + disk + ' · ' + shown + ' line(s) shown (' + mode + ', last ' + tailN + ' raw lines from file end)';
           }
           if (botlog.error) {
             logPre.textContent = 'Error reading log: ' + botlog.error;
@@ -1113,7 +1131,7 @@ def create_app(username: str, password: str) -> Flask:
     @app.route("/api/bot-log")
     @basic_auth.required
     def api_bot_log():
-        """Tail of bot log file (BOT_LOG_PATH or bot.log in cwd). Same file as bot FileHandler."""
+        """Tail of bot log file: BOT_LOG_PATH if set, else bot.log next to ui.py (same default as bot)."""
         from flask import request
 
         try:
