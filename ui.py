@@ -1,6 +1,7 @@
 import os
+import time
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from flask_basicauth import BasicAuth
 import sqlite3
 
@@ -83,6 +84,7 @@ def read_bot_log_tail(
         "truncated": False,
         "missing": False,
         "mode": mode,
+        "fetched_at_ms": int(time.time() * 1000),
     }
     if not os.path.isfile(path):
         out["missing"] = True
@@ -305,6 +307,7 @@ DASHBOARD_TEMPLATE = """
           <span>Show full log (entire tail, not survivor-only)</span>
         </label>
         <button type="button" class="tab-btn" id="bot-log-refresh" style="padding: 6px 12px;">Refresh now</button>
+        <p class="meta-label" id="bot-log-meta" style="margin-top: 8px; font-size: 11px;">—</p>
       </div>
       <pre id="bot-log-pre" class="log-view">Loading...</pre>
     </div>
@@ -360,14 +363,15 @@ DASHBOARD_TEMPLATE = """
       try {
         const showFullLog = document.getElementById('bot-log-show-full')?.checked;
         const logMode = showFullLog ? 'all' : 'survivor';
+        const noCache = { cache: 'no-store', credentials: 'same-origin' };
         const [state, strategies, positions, orders, trades, mtm, botlog] = await Promise.all([
-          fetch('/state').then(r => r.json()),
-          fetch('/api/strategies').then(r => r.json()),
-          fetch('/api/positions').then(r => r.json()),
-          fetch('/api/orders').then(r => r.json()),
-          fetch('/api/trades').then(r => r.json()),
-          fetch('/api/mtm').then(r => r.json()),
-          fetch('/api/bot-log?lines=800&mode=' + encodeURIComponent(logMode)).then(r => r.json()),
+          fetch('/state', noCache).then(r => r.json()),
+          fetch('/api/strategies', noCache).then(r => r.json()),
+          fetch('/api/positions', noCache).then(r => r.json()),
+          fetch('/api/orders', noCache).then(r => r.json()),
+          fetch('/api/trades', noCache).then(r => r.json()),
+          fetch('/api/mtm', noCache).then(r => r.json()),
+          fetch('/api/bot-log?lines=800&mode=' + encodeURIComponent(logMode) + '&_=' + Date.now(), noCache).then(r => r.json()),
         ]);
 
         const portfolio = state.portfolio || {};
@@ -727,8 +731,16 @@ DASHBOARD_TEMPLATE = """
 
         const logPathEl = document.getElementById('bot-log-path');
         const logPre = document.getElementById('bot-log-pre');
+        const logMetaEl = document.getElementById('bot-log-meta');
         if (logPathEl && logPre && botlog) {
           logPathEl.textContent = botlog.path || '—';
+          if (logMetaEl) {
+            const ts = botlog.fetched_at_ms != null ? new Date(botlog.fetched_at_ms).toLocaleString() : new Date().toLocaleString();
+            const shown = (botlog.lines && botlog.lines.length) || 0;
+            const tailN = botlog.tail_line_count != null ? botlog.tail_line_count : '?';
+            const mode = botlog.mode === 'all' ? 'full tail' : 'survivor filter';
+            logMetaEl.textContent = 'Fetched ' + ts + ' · ' + shown + ' line(s) displayed (' + mode + ', last ' + tailN + ' raw lines read from file end)';
+          }
           if (botlog.error) {
             logPre.textContent = 'Error reading log: ' + botlog.error;
           } else if (botlog.missing) {
@@ -866,7 +878,7 @@ HTML_TEMPLATE = """
 
     async function loadFlags() {
       try {
-        const res = await fetch('/api/settings');
+        const res = await fetch('/api/settings', { cache: 'no-store', credentials: 'same-origin' });
         const s = await res.json();
         document.getElementById('flag-use-premium-based-strike').checked = !!s.use_premium_based_strike;
         document.getElementById('flag-strategy-sl-enabled').checked = !!s.strategy_sl_enabled;
@@ -911,7 +923,7 @@ HTML_TEMPLATE = """
     });
 
     async function refresh() {
-      const res = await fetch('/state');
+      const res = await fetch('/state', { cache: 'no-store', credentials: 'same-origin' });
       const data = await res.json();
 
       const idx = data.index || {};
@@ -969,6 +981,15 @@ def create_app(username: str, password: str) -> Flask:
     app.config["BASIC_AUTH_USERNAME"] = username
     app.config["BASIC_AUTH_PASSWORD"] = password
     basic_auth = BasicAuth(app)
+
+    @app.after_request
+    def _no_cache_live_data(response):
+        """Avoid stale dashboard JSON / bot log tail from browser or proxy caches."""
+        p = request.path or ""
+        if p.startswith("/api/") or p in ("/state", "/dashboard"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        return response
 
     @app.route("/")
     @basic_auth.required
