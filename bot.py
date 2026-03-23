@@ -1343,6 +1343,82 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         _hint_survivor_sl_to_cost(strategy, f"modify_order failed: {e!s}"[:220])
 
 
+def _rebuild_sl_links_from_order_book_for_restored_strategy(
+    strategy: dict, order_book: Optional[List[dict]]
+) -> bool:
+    """
+    On restart, DB may restore positions but miss sl_orders/sl_tag_map.
+    Rebuild links from broker order book tags like '<strategy>_SL_<instrument>'.
+    """
+    if not order_book:
+        return False
+    name = str(strategy.get("name") or "")
+    if not name:
+        return False
+    prefix = f"{name}_SL_"
+    open_iids = {
+        int(p.get("instrument_id"))
+        for p in (strategy.get("positions") or [])
+        if p.get("instrument_id") is not None and p.get("exit_price") is None
+    }
+    closed_iids = {
+        int(p.get("instrument_id"))
+        for p in (strategy.get("positions") or [])
+        if p.get("instrument_id") is not None and p.get("exit_price") is not None
+    }
+    candidate_iids = open_iids | closed_iids
+    if not candidate_iids:
+        return False
+
+    sl_orders: List[dict] = []
+    sl_tag_map: Dict[str, int] = {}
+    seen_tags = set()
+    for od in order_book:
+        tag = str(od.get("OrderUniqueIdentifier") or "")
+        if not tag.startswith(prefix):
+            continue
+        app_oid = od.get("AppOrderID")
+        if app_oid is None:
+            continue
+        try:
+            app_oid_int = int(app_oid)
+        except Exception:
+            continue
+        iid = None
+        for k in ("ExchangeInstrumentID", "ExchangeInstrumentId", "InstrumentID", "InstrumentId"):
+            v = od.get(k)
+            if v is None:
+                continue
+            try:
+                iid = int(v)
+                break
+            except Exception:
+                continue
+        if iid is None and tag.count("_") >= 2:
+            # Expected format: <strategy>_SL_<instrument>
+            try:
+                iid = int(tag.rsplit("_", 1)[-1])
+            except Exception:
+                iid = None
+        if iid is None or iid not in candidate_iids:
+            continue
+        if tag in seen_tags:
+            continue
+        seen_tags.add(tag)
+        sl_orders.append({"app_order_id": app_oid_int, "tag": tag})
+        sl_tag_map[tag] = iid
+
+    if not sl_orders:
+        return False
+    update_strategy(strategy["name"], sl_orders=sl_orders, sl_tag_map=sl_tag_map)
+    logger.warning(
+        "[%s] Restored SL links from broker order book: %s order(s)",
+        strategy["name"],
+        len(sl_orders),
+    )
+    return True
+
+
 def _check_leg_target_and_close(
     client: XTSClient, strategy: dict, ltp_map: Dict[int, float]
 ) -> None:
@@ -1957,6 +2033,12 @@ def main() -> None:
     # Restore today's strategies from database (before init_state)
     if not DEMO_MODE and index_config is not None:
         restored = restore_todays_strategies()
+        restore_order_book: Optional[List[dict]] = None
+        if client is not None:
+            try:
+                restore_order_book = client.get_order_book()
+            except Exception as e:
+                logger.error("Failed to fetch order book for SL restore-link bootstrap: %s", e)
         for restored_strategy in restored:
             strategy_name = restored_strategy["strategy_name"]
             if strategy_name in STRATEGY_STATE:
@@ -1970,6 +2052,13 @@ def main() -> None:
                     "sl_orders": restored_strategy.get("sl_orders") or [],
                     "sl_tag_map": restored_strategy.get("sl_tag_map") or {},
                 })
+                if (
+                    STRATEGY_STATE[strategy_name].get("status") == "OPEN"
+                    and not STRATEGY_STATE[strategy_name].get("sl_orders")
+                ):
+                    _rebuild_sl_links_from_order_book_for_restored_strategy(
+                        STRATEGY_STATE[strategy_name], restore_order_book
+                    )
 
     init_state(STRATEGY_STATE)
     init_trading_flags(USE_PREMIUM_BASED_STRIKE, STRATEGY_SL_ENABLED, TRADE_NON_EXPIRY_DAY)

@@ -514,7 +514,11 @@ def restore_sl_orders_for_strategy(strategy_name: str) -> Dict[str, Any]:
             """
             SELECT app_order_id, order_tag, instrument_id
             FROM orders
-            WHERE strategy_name = ? AND order_type = 'SL'
+            WHERE strategy_name = ?
+              AND (
+                order_type = 'SL'
+                OR order_tag LIKE '%_SL_%'
+              )
             ORDER BY id DESC
             """,
             (strategy_name,),
