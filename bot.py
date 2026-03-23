@@ -1107,16 +1107,18 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         return
     peer_via = closed[0].get("closed_via")
     if peer_via not in _SURVIVOR_PEER_CLOSED_VIA_OK:
+        # Live broker sync/orderbook race can leave `closed_via` unset/non-standard while
+        # state still clearly indicates one leg is closed and one survives. Use that state
+        # as fallback so survivor SL tighten is not blocked indefinitely.
         _survivor_sl_to_cost_warn_throttled(
             strategy["name"],
-            f"blocked: closed leg closed_via={peer_via!r} (allowed {sorted(_SURVIVOR_PEER_CLOSED_VIA_OK)})",
+            f"fallback: closed_via={peer_via!r}; proceeding because state is 1 closed + 1 open",
             interval_sec=90.0,
         )
         _hint_survivor_sl_to_cost(
             strategy,
-            f"Peer leg closed_via={peer_via!r} — need SL_FILLED, BROKER_SYNC, or RESTORED (DB restart).",
+            f"Peer closed_via={peer_via!r}; using fallback (1 closed + 1 open) to attempt survivor SL-to-cost.",
         )
-        return
 
     survivor = open_pos[0]
     instrument_id = survivor.get("instrument_id")

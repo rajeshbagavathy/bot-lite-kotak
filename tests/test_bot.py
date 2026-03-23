@@ -1678,9 +1678,10 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
 
     @patch("bot.update_strategy")
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
-    def test_skips_when_closed_via_unknown(self, mock_update):
-        """SL_FILLED, BROKER_SYNC, RESTORED trigger adjust; MANUAL etc. skip (hint updated)."""
+    def test_uses_fallback_when_closed_via_unknown(self, mock_update):
+        """Unknown closed_via should still attempt using 1-closed/1-open fallback."""
         mock_client = MagicMock()
+        mock_client.modify_order.return_value = {"result": {"AppOrderID": 202}}
         mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
         strategy = self._strategy_two_leg()
         strategy["positions"][0]["closed_via"] = "MANUAL"
@@ -1698,9 +1699,12 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
                 mock_client, self.index_config, strategy, order_book=order_book
             )
-        mock_client.modify_order.assert_not_called()
-        mock_update.assert_called_once()
-        self.assertIn("closed_via=", str(mock_update.call_args))
+        mock_client.modify_order.assert_called_once()
+        mock_update.assert_any_call(
+            "N_T_1031",
+            survivor_sl_adjusted_to_cost=True,
+            survivor_sl_to_cost_hint="Done: survivor SL tightened to cost.",
+        )
 
     @patch("bot.update_strategy")
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
