@@ -1,12 +1,32 @@
 import copy
 import datetime
 from threading import Lock
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 # Import IST timezone helpers
 from db import get_ist_now
 
 STATE_LOCK = Lock()
+
+# Optional: bot registers get_scheduler_diagnostics for /state merge (avoid ui importing bot).
+SCHEDULER_SNAPSHOT_FN: Optional[Callable[[], dict]] = None
+
+
+def set_scheduler_snapshot_fn(fn: Optional[Callable[[], dict]]) -> None:
+    """Called from bot.main after jobs are scheduled."""
+    global SCHEDULER_SNAPSHOT_FN
+    SCHEDULER_SNAPSHOT_FN = fn
+
+
+def get_scheduler_snapshot() -> Optional[dict]:
+    if SCHEDULER_SNAPSHOT_FN is None:
+        return None
+    try:
+        return SCHEDULER_SNAPSHOT_FN()
+    except Exception:
+        return {"error": "scheduler_snapshot_failed"}
+
+
 STATE: Dict[str, dict] = {
     "index": {},
     "portfolio": {},
@@ -90,7 +110,11 @@ def _make_json_safe(obj):
 def get_snapshot() -> dict:
     with STATE_LOCK:
         snapshot = copy.deepcopy(STATE)
-    return _make_json_safe(snapshot)
+    out = _make_json_safe(snapshot)
+    sched = get_scheduler_snapshot()
+    if sched is not None:
+        out["scheduler"] = sched
+    return out
 
 
 def get_mtm_snapshots_enabled() -> bool:

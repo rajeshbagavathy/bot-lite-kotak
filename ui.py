@@ -51,6 +51,7 @@ def read_bot_log_tail(
             f.seek(0, os.SEEK_END)
             size = f.tell()
             if size == 0:
+                out["empty_file"] = True
                 return out
             out["truncated"] = size > max_bytes
             read_size = min(max_bytes, size)
@@ -59,6 +60,7 @@ def read_bot_log_tail(
         lines = chunk.splitlines()
         if len(lines) > max_lines:
             lines = lines[-max_lines:]
+        out["tail_line_count"] = len(lines)
         if mode == "survivor":
             filtered = [ln for ln in lines if bot_log_line_is_survivor_event(ln)]
             out["lines"] = filtered
@@ -184,6 +186,11 @@ DASHBOARD_TEMPLATE = """
           </div>
         </div>
       </div>
+      <div class="card" style="margin-bottom: 15px;">
+        <div class="card-title">Scheduler health</div>
+        <p class="meta-label" style="margin-bottom: 8px;" id="scheduler-notes"></p>
+        <div id="scheduler-card">Loading...</div>
+      </div>
       <table>
         <thead>
           <tr><th>Strategy</th><th>Status</th><th>Strike</th><th>Entry Time</th><th>Positions</th><th>Margin / Hedge</th></tr>
@@ -247,10 +254,10 @@ DASHBOARD_TEMPLATE = """
     <div id="botlog" class="tab-content">
       <div class="card" style="margin-bottom: 12px;">
         <div class="card-title">Bot log file</div>
-        <p class="meta-label" style="margin-bottom: 8px;">Tail of <span id="bot-log-path">—</span>. By default only <strong>survivor SL-to-cost</strong> lines (WARNING/ERROR) are shown. Auto-refreshes with the dashboard.</p>
+        <p class="meta-label" style="margin-bottom: 8px;">Tail of <span id="bot-log-path">—</span>. Default view shows only <strong>survivor SL-to-cost</strong> lines. Use the checkbox below to see the full tail (INFO/WARNING/ERROR). Refresh only reloads; it does not change the filter.</p>
         <label class="setting-row" style="margin-bottom: 8px;">
           <input type="checkbox" id="bot-log-show-full" />
-          <span>Show full log (all levels in tail)</span>
+          <span>Show full log (entire tail, not survivor-only)</span>
         </label>
         <button type="button" class="tab-btn" id="bot-log-refresh" style="padding: 6px 12px;">Refresh now</button>
       </div>
@@ -275,6 +282,20 @@ DASHBOARD_TEMPLATE = """
     function fmtMargin(n) {
       if (n === null || n === undefined || isNaN(Number(n))) return '-';
       return `${(Number(n) / 100000).toFixed(2)}L`;
+    }
+
+    function fmtIso(iso) {
+      if (!iso) return '-';
+      try { return new Date(iso).toLocaleString(); } catch (e) { return iso; }
+    }
+
+    function escHtml(s) {
+      if (s === null || s === undefined) return '';
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
     }
 
     function calcRequiredMargin(lots, isExpiry) {
@@ -374,15 +395,20 @@ DASHBOARD_TEMPLATE = """
           });
         }
 
-        const allDisabled = Object.values(stateStrategies).length > 0 && Object.values(stateStrategies).every(s => s.status === 'DISABLED');
+        const stratVals = Object.values(stateStrategies);
+        const portfolioSlHalt = stratVals.length > 0 && stratVals.every(s => s.status === 'CLOSED')
+          && stratVals.some(s => String(s.message || '').includes('Portfolio SL hit'));
+        const allDisabled = stratVals.length > 0 && stratVals.every(s => s.status === 'DISABLED');
         const dashBanner = document.getElementById('dash-disabled-banner');
-        if (allDisabled) {
+        if (portfolioSlHalt && dashBanner) {
+          dashBanner.innerHTML = '<div class="disabled-banner">Trading halted: portfolio stop-loss hit. Strategies are closed in state. The main loop may still run (see Scheduler health below).</div>';
+        } else if (allDisabled) {
           dashBanner.innerHTML = '<div class="disabled-banner">Trading is disabled today (non-expiry day). No strategies will be executed.</div>';
         } else {
           dashBanner.innerHTML = '';
         }
-        const marginWarning = Object.values(stateStrategies).find(s => String(s.message || '').includes('MARGIN_NOT_AVAILABLE') || String(s.status || '') === 'ERROR');
-        if (marginWarning && dashBanner) {
+        const marginWarning = stratVals.find(s => String(s.message || '').includes('MARGIN_NOT_AVAILABLE') || String(s.status || '') === 'ERROR');
+        if (marginWarning && dashBanner && !portfolioSlHalt) {
           dashBanner.innerHTML = '<div class="warn-box">Margin gate warning: ' + (marginWarning.message || marginWarning.status || 'Check strategy status') + '</div>';
         }
         
@@ -453,6 +479,51 @@ DASHBOARD_TEMPLATE = """
             </div>
             <div class="subtext">If margin is short, the bot buys far OTM CE/PE hedges, waits 3 seconds, then rechecks before placing the straddle.</div>
           `;
+        }
+
+        const sch = state.scheduler;
+        const schedCard = document.getElementById('scheduler-card');
+        const schedNotesEl = document.getElementById('scheduler-notes');
+        if (schedNotesEl) {
+          schedNotesEl.textContent = sch && sch.jobs_scheduled_at_startup === false && (sch.job_count === 0 || sch.job_count == null)
+            ? 'No jobs were registered at startup (e.g. waiting for expiry). Retry thread may schedule later.'
+            : '';
+        }
+        if (schedCard) {
+          if (!sch) {
+            schedCard.innerHTML = '<p class="meta-label">Scheduler diagnostics not available yet (snapshot callback not registered).</p>';
+          } else if (sch.error) {
+            schedCard.innerHTML = '<p class="warn-box">' + escHtml(sch.error) + '</p>';
+          } else {
+            const age = sch.heartbeat_age_sec;
+            let hbClass = 'negative';
+            let hbLabel = 'Stale or main loop stuck';
+            if (age == null) {
+              hbLabel = 'Unknown';
+            } else if (age < 5) {
+              hbClass = 'positive';
+              hbLabel = 'OK — main loop alive';
+            } else if (age < 30) {
+              hbClass = '';
+              hbLabel = 'Slow heartbeat';
+            }
+            let minimalBanner = '';
+            if (sch.minimal_schedule_non_expiry) {
+              minimalBanner = '<div class="warn-box" style="margin-bottom:12px;">Minimal schedule (non-expiry day): only margin updates + daily DB cleanup — no MTM monitor or strategy entries.</div>';
+            }
+            let jobRows = '<thead><tr><th>Job</th><th>Schedule</th><th>Next run</th><th>Last run</th></tr></thead><tbody>';
+            for (const j of (sch.jobs || [])) {
+              jobRows += '<tr><td>' + escHtml(j.label) + '<br/><span class="meta-label">' + escHtml(j.function) + '</span></td><td>' + escHtml(j.schedule) + '</td><td>' + fmtIso(j.next_run) + '</td><td>' + fmtIso(j.last_run) + '</td></tr>';
+            }
+            jobRows += '</tbody>';
+            const sub = (sch.survivor_note ? '<p class="subtext" style="margin-top:10px">' + escHtml(sch.survivor_note) + '</p>' : '')
+              + (sch.portfolio_sl_note ? '<p class="subtext">' + escHtml(sch.portfolio_sl_note) + '</p>' : '');
+            schedCard.innerHTML = minimalBanner
+              + '<div class="metric"><span class="metric-label">Main loop heartbeat</span><span class="metric-value ' + hbClass + '">' + hbLabel
+              + (age != null && age !== undefined ? ' (' + age.toFixed(1) + 's ago)' : '') + '</span></div>'
+              + '<div class="metric"><span class="metric-label">Registered jobs</span><span class="metric-value">' + (sch.job_count != null ? sch.job_count : 0) + '</span></div>'
+              + '<table>' + jobRows + '</table>' + sub;
+          }
         }
 
         const openStrategies = strategies.filter(s => s.status === 'OPEN').length;
@@ -591,9 +662,18 @@ DASHBOARD_TEMPLATE = """
           if (botlog.error) {
             logPre.textContent = 'Error reading log: ' + botlog.error;
           } else if (botlog.missing) {
-            logPre.textContent = 'Log file not found: ' + (botlog.path || '') + ' (it is created when the bot starts logging).';
+            logPre.textContent = 'Log file not found: ' + (botlog.path || '') + ' (set BOT_LOG_PATH to the same absolute path the bot uses, or ensure the bot process has created the file).';
+          } else if (botlog.empty_file) {
+            logPre.textContent = 'Log file exists but is empty — the bot may not have written yet, or the UI is reading a different path than the bot (check BOT_LOG_PATH).';
           } else if (botlog.filtered_empty) {
-            logPre.textContent = 'No survivor SL-to-cost lines in this tail yet. Check "Show full log" to see all messages.';
+            const n = botlog.tail_line_count != null ? botlog.tail_line_count : '?';
+            logPre.textContent = [
+              'No survivor SL-to-cost lines in the last ' + n + ' line(s) of this tail.',
+              '',
+              'That is normal until one leg is stopped and the bot tightens the survivor SL to cost (then you will see WARNING lines here).',
+              '',
+              'To see everything in this tail (warnings, errors, routine INFO), enable "Show full log" above — Refresh alone does not show the full tail.'
+            ].join('\\n');
           } else {
             const lines = botlog.lines || [];
             const note = botlog.truncated ? '\\n\\n… (large file; showing tail only)\\n' : '';

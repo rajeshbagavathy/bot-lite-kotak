@@ -1,10 +1,11 @@
 import datetime
+import functools
 import logging
 import math
 import os
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import schedule
 
@@ -17,7 +18,9 @@ def _configure_bot_logging() -> None:
     - ``xts-bot-lite``: INFO to stderr + bot.log file, propagate=False so app logs are isolated.
     - Werkzeug / boto / urllib3: effectively silent (CRITICAL, no propagate).
     """
-    log_path = os.environ.get("BOT_LOG_PATH", "bot.log")
+    log_path = os.path.abspath(os.environ.get("BOT_LOG_PATH", "bot.log"))
+    # Same path for UI tail (`ui.read_bot_log_tail`) even if cwd differs between processes.
+    os.environ["BOT_LOG_PATH"] = log_path
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 
     root = logging.getLogger()
@@ -1461,6 +1464,8 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
             _close_strategy(client, index_config, strategy, positions, "Strategy SL hit")
 
     if overall <= portfolio_sl:
+        # State-only halt: strategies closed below. We intentionally do not schedule.clear() here;
+        # the MTM monitor job keeps firing until process exit (see portfolio_sl_note in scheduler diagnostics).
         _square_off_all(client, index_config, positions, "Portfolio SL hit")
         # After squaring off all broker positions, cancel any remaining SL orders
         # and clear them from in-memory state so they can't be reused.
@@ -1494,17 +1499,122 @@ def _update_available_margin(client: XTSClient) -> None:
 
 STRATEGY_STATE: Dict[str, dict] = {}
 
+# Scheduler observability (main thread / schedule library)
+_MAIN_LOOP_LAST_TICK: float = 0.0
+_JOBS_SCHEDULED_FLAG: bool = False
+_SCHEDULER_MINIMAL_MODE: bool = False
+
+
+def _callable_name(fn: Any) -> str:
+    if fn is None:
+        return "unknown"
+    if isinstance(fn, functools.partial):
+        inner = fn.func
+        return getattr(inner, "__name__", str(inner))
+    return getattr(fn, "__name__", str(fn))
+
+
+def _job_schedule_summary(job: Any) -> str:
+    """Human-readable interval for a schedule.Job."""
+    unit = getattr(job, "unit", None) or ""
+    interval = getattr(job, "interval", None)
+    at_time = getattr(job, "at_time", None)
+    if at_time is not None:
+        return f"daily at {at_time}"
+    if interval is not None and unit:
+        return f"every {interval} {unit}"
+    return str(unit or "scheduled")
+
+
+def _job_display_label(job: Any) -> str:
+    fn = getattr(job, "job_func", None)
+    name = _callable_name(fn)
+    titles = {
+        "_monitor_mtm": "Monitor MTM & sync (includes survivor SL-to-cost)",
+        "_execute_strategy": "Execute strategy",
+        "_update_available_margin": "Update available margin",
+        "cleanup_old_data": "Daily DB cleanup (midnight IST)",
+    }
+    base = titles.get(name, name)
+    if isinstance(fn, functools.partial) and name == "_execute_strategy":
+        strat = (fn.keywords or {}).get("strategy") or {}
+        sn = strat.get("name")
+        if sn:
+            return f"{base}: {sn}"
+    return base
+
+
+def _serialize_job(job: Any, index: int) -> Dict[str, Any]:
+    nrun = getattr(job, "next_run", None)
+    lrun = getattr(job, "last_run", None)
+    should_run_val: Optional[bool] = None
+    try:
+        sr = getattr(job, "should_run", None)
+        if callable(sr):
+            should_run_val = bool(sr())
+    except Exception:
+        should_run_val = None
+    return {
+        "id": index,
+        "function": _callable_name(getattr(job, "job_func", None)),
+        "label": _job_display_label(job),
+        "schedule": _job_schedule_summary(job),
+        "next_run": nrun.isoformat() if nrun is not None and hasattr(nrun, "isoformat") else None,
+        "last_run": lrun.isoformat() if lrun is not None and hasattr(lrun, "isoformat") else None,
+        "should_run": should_run_val,
+    }
+
+
+def get_scheduler_diagnostics() -> Dict[str, Any]:
+    """
+    Snapshot for UI: schedule jobs, main-loop heartbeat, flags.
+    Safe to call from Flask thread (read-only on schedule.jobs).
+    """
+    now = time.time()
+    tick = _MAIN_LOOP_LAST_TICK
+    age = None if tick <= 0 else max(0.0, now - tick)
+    jobs_raw = list(schedule.jobs)
+    jobs = [_serialize_job(j, i) for i, j in enumerate(jobs_raw)]
+    return {
+        "main_loop_last_tick_unix": tick if tick > 0 else None,
+        "heartbeat_age_sec": age,
+        "jobs_scheduled_at_startup": _JOBS_SCHEDULED_FLAG,
+        "minimal_schedule_non_expiry": _SCHEDULER_MINIMAL_MODE,
+        "job_count": len(jobs),
+        "jobs": jobs,
+        "survivor_note": (
+            "Survivor SL-to-cost runs inside the _monitor_mtm job (every 3s when full schedule is active), "
+            "not as a separate named job."
+        ),
+        "portfolio_sl_note": (
+            "Portfolio SL closes strategies in state but does not clear the Python schedule; "
+            "the monitor job may still run until process exit."
+        ),
+    }
+
+
+def register_scheduler_snapshot_with_state() -> None:
+    """Wire diagnostics into /state (call after _schedule_jobs)."""
+    from state import set_scheduler_snapshot_fn
+
+    set_scheduler_snapshot_fn(get_scheduler_diagnostics)
+
 
 def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
+    global _SCHEDULER_MINIMAL_MODE, _JOBS_SCHEDULED_FLAG
 
     if not _is_expiry_day(expiry) and not get_trading_flag_or("trade_non_expiry_day", TRADE_NON_EXPIRY_DAY):
         logger.debug("Non-expiry day and TRADE_NON_EXPIRY_DAY is disabled — skipping all strategy scheduling")
+        _SCHEDULER_MINIMAL_MODE = True
         for strategy in STRATEGY_STATE.values():
             update_strategy(strategy["name"], status="DISABLED", message="No trading on non-expiry day")
         schedule.every(60).seconds.do(_update_available_margin, client=client)
         schedule.every().day.at("00:00").do(cleanup_old_data)
+        _JOBS_SCHEDULED_FLAG = True
+        register_scheduler_snapshot_with_state()
         return
 
+    _SCHEDULER_MINIMAL_MODE = False
     test_mode = os.getenv("TEST_FIRST_STRATEGY_IN_1MIN", "false").lower() == "true"
     
     for idx, strategy in enumerate(STRATEGY_STATE.values()):
@@ -1526,6 +1636,8 @@ def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
     schedule.every(3).seconds.do(_monitor_mtm, client=client, index_config=index_config, portfolio_sl=PORTFOLIO_SL_LIMIT)
     schedule.every(60).seconds.do(_update_available_margin, client=client)
     schedule.every().day.at("00:00").do(cleanup_old_data)
+    _JOBS_SCHEDULED_FLAG = True
+    register_scheduler_snapshot_with_state()
 
 
 def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
@@ -1627,7 +1739,7 @@ def main() -> None:
     cleanup_previous_day_data()
 
     # Build today's strategy plan (per index) and STRATEGY_STATE
-    global STRATEGY_STATE
+    global STRATEGY_STATE, _MAIN_LOOP_LAST_TICK
     STRATEGY_STATE = {}
     if index_config is not None:
         todays_cfgs = get_today_strategies(index_config.name)
@@ -1686,6 +1798,8 @@ def main() -> None:
     if not DEMO_MODE and index_config is not None:
         _schedule_jobs(client, index_config, expiry)
         jobs_scheduled = True
+    elif not DEMO_MODE:
+        register_scheduler_snapshot_with_state()
 
     from threading import Thread
     ui_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=80, debug=False, use_reloader=False))
@@ -1712,10 +1826,14 @@ def main() -> None:
                 realized=100.0,
                 unrealized=400.0 - (idx * 200),
             )
+        register_scheduler_snapshot_with_state()
         while True:
+            _MAIN_LOOP_LAST_TICK = time.time()
             time.sleep(1)
     else:
+        _MAIN_LOOP_LAST_TICK = time.time()
         while True:
+            _MAIN_LOOP_LAST_TICK = time.time()
             schedule.run_pending()
             time.sleep(1)
 
