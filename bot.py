@@ -1967,6 +1967,8 @@ def main() -> None:
                     "strike": restored_strategy["strike"],
                     "entry_time": restored_strategy["entry_time"],
                     "positions": restored_strategy["positions"],
+                    "sl_orders": restored_strategy.get("sl_orders") or [],
+                    "sl_tag_map": restored_strategy.get("sl_tag_map") or {},
                 })
 
     init_state(STRATEGY_STATE)

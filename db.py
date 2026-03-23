@@ -496,6 +496,65 @@ def restore_positions_for_strategy(strategy_id: int) -> List[Dict[str, Any]]:
         return []
 
 
+def restore_sl_orders_for_strategy(strategy_name: str) -> Dict[str, Any]:
+    """
+    Restore SL linkage for a strategy from orders table.
+
+    Returns:
+      {
+        "sl_orders": [{"app_order_id": int, "tag": str}, ...],
+        "sl_tag_map": {tag: instrument_id, ...}
+      }
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT app_order_id, order_tag, instrument_id
+            FROM orders
+            WHERE strategy_name = ? AND order_type = 'SL'
+            ORDER BY id DESC
+            """,
+            (strategy_name,),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        # Keep latest record per tag (rows are DESC by id), then re-sort by tag for stability.
+        by_tag: Dict[str, sqlite3.Row] = {}
+        for row in rows:
+            tag = row["order_tag"]
+            if not tag:
+                continue
+            if tag not in by_tag:
+                by_tag[str(tag)] = row
+
+        sl_orders: List[Dict[str, Any]] = []
+        sl_tag_map: Dict[str, int] = {}
+        for tag in sorted(by_tag.keys()):
+            row = by_tag[tag]
+            iid = row["instrument_id"]
+            if iid is not None:
+                try:
+                    sl_tag_map[tag] = int(iid)
+                except (TypeError, ValueError):
+                    pass
+            app_oid = row["app_order_id"]
+            if app_oid is None:
+                continue
+            try:
+                sl_orders.append({"app_order_id": int(app_oid), "tag": tag})
+            except (TypeError, ValueError):
+                continue
+
+        return {"sl_orders": sl_orders, "sl_tag_map": sl_tag_map}
+    except Exception as e:
+        logger.error(f"Failed to restore SL orders for strategy {strategy_name}: {e}")
+        return {"sl_orders": [], "sl_tag_map": {}}
+
+
 def restore_todays_strategies() -> List[Dict[str, Any]]:
     """Restore today's strategies (OPEN and CLOSED) from database.
     
@@ -523,6 +582,7 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
         
         restored_strategies = []
         for row in rows:
+            sl_restore = restore_sl_orders_for_strategy(row["strategy_name"])
             strategy_data = {
                 "db_id": row["id"],
                 "strategy_name": row["strategy_name"],
@@ -533,6 +593,8 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
                 "leg_sl_pct": row["leg_sl_pct"],
                 "strategy_sl": row["strategy_sl"],
                 "positions": restore_positions_for_strategy(row["id"]),
+                "sl_orders": sl_restore["sl_orders"],
+                "sl_tag_map": sl_restore["sl_tag_map"],
             }
             restored_strategies.append(strategy_data)
             logger.debug(f"Restored strategy from DB: {row['strategy_name']} (strike={row['strike']}, {len(strategy_data['positions'])} positions)")
