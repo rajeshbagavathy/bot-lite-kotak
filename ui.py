@@ -24,6 +24,47 @@ def _bot_log_abs_path() -> str:
     return os.path.abspath(os.environ.get("BOT_LOG_PATH", "bot.log"))
 
 
+def silence_werkzeug_http_access_log() -> None:
+    """
+    Stop Flask/Werkzeug dev server from logging each request (GET ... HTTP/1.1) to Python logging.
+
+    Werkzeug's _internal._log() may add handlers back to the 'werkzeug' logger; muting loggers alone
+    is not reliable. Disabling log_request prevents access lines from being emitted at all.
+    """
+    try:
+        from werkzeug.serving import WSGIRequestHandler
+
+        def _silent_log_request(self, code="-", size="-") -> None:  # noqa: ANN001
+            return
+
+        WSGIRequestHandler.log_request = _silent_log_request  # type: ignore[assignment]
+    except Exception:
+        pass
+
+
+def _muzzle_werkzeug_and_flask_loggers() -> None:
+    """Ensure HTTP/access noise does not propagate to root or bot file handlers."""
+    import logging as _logging
+
+    for _name in (
+        "werkzeug",
+        "werkzeug.serving",
+        "werkzeug._internal",
+        "flask",
+        "flask.app",
+    ):
+        _lg = _logging.getLogger(_name)
+        _lg.handlers.clear()
+        _lg.propagate = False
+        _lg.setLevel(_logging.ERROR)
+
+
+def ensure_http_access_not_logged() -> None:
+    """Call from create_app and again right before app.run() (Werkzeug may re-init loggers)."""
+    silence_werkzeug_http_access_log()
+    _muzzle_werkzeug_and_flask_loggers()
+
+
 def read_bot_log_tail(
     max_lines: int = 500,
     max_bytes: int = 512_000,
@@ -152,6 +193,10 @@ DASHBOARD_TEMPLATE = """
         <div class="card">
           <div class="card-title">Margin Gate</div>
           <div id="margin-gate-card">Loading...</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Survivor SL → cost</div>
+          <div id="survivor-cost-card" class="meta-label">Loading...</div>
         </div>
         <div class="card">
           <div class="card-title">Settings</div>
@@ -481,6 +526,25 @@ DASHBOARD_TEMPLATE = """
           `;
         }
 
+        const botMeta = state.bot || {};
+        const survEn = botMeta.survivor_sl_to_cost_enabled;
+        const survivorCostEl = document.getElementById('survivor-cost-card');
+        if (survivorCostEl) {
+          let survHtml = '<div class="metric"><span class="metric-label">Feature enabled</span><span class="metric-value">' +
+            (survEn === true ? 'Yes' : survEn === false ? 'No' : '—') + '</span></div>';
+          const openRows = [];
+          for (const [name, st] of Object.entries(stateStrategies)) {
+            if (st && st.status === 'OPEN') {
+              const adj = !!st.survivor_sl_adjusted_to_cost;
+              openRows.push('<div class="metric"><span class="metric-label">' + escHtml(name) + '</span><span class="metric-value">' +
+                (adj ? 'Tightened to cost' : 'Not yet') + '</span></div>');
+            }
+          }
+          survHtml += openRows.length ? openRows.join('') : '<div class="subtext">No OPEN strategies in live state.</div>';
+          survHtml += '<div class="subtext" style="margin-top:8px">From live /state (same as bot memory). Use this if survivor lines are missing from the log tail.</div>';
+          survivorCostEl.innerHTML = survHtml;
+        }
+
         const sch = state.scheduler;
         const schedCard = document.getElementById('scheduler-card');
         const schedNotesEl = document.getElementById('scheduler-notes');
@@ -670,9 +734,11 @@ DASHBOARD_TEMPLATE = """
             logPre.textContent = [
               'No survivor SL-to-cost lines in the last ' + n + ' line(s) of this tail.',
               '',
-              'That is normal until one leg is stopped and the bot tightens the survivor SL to cost (then you will see WARNING lines here).',
+              'That is normal until one leg is stopped and the bot tightens the survivor SL to cost (WARNING in log). Older lines may rotate out of this tail.',
               '',
-              'To see everything in this tail (warnings, errors, routine INFO), enable "Show full log" above — Refresh alone does not show the full tail.'
+              'Tip: Overview tab → card "Survivor SL → cost" shows live state (feature on/off and per OPEN strategy: tightened or not) — more reliable than the log tail.',
+              '',
+              'Enable "Show full log" for the raw tail; Refresh only reloads.'
             ].join('\\n');
           } else {
             const lines = botlog.lines || [];
@@ -1033,14 +1099,10 @@ def create_app(username: str, password: str) -> Flask:
             mode = "survivor"
         return jsonify(read_bot_log_tail(max_lines=n, mode=mode))
 
-    # Flask may attach loggers after startup; keep HTTP access off bot.log / journal.
+    # Flask/Werkzeug: access lines must not hit bot.log (see silence_werkzeug_http_access_log docstring).
+    ensure_http_access_not_logged()
     import logging as _logging
 
-    for _name in ("werkzeug", "werkzeug.serving"):
-        _lg = _logging.getLogger(_name)
-        _lg.handlers.clear()
-        _lg.propagate = False
-        _lg.setLevel(_logging.CRITICAL)
     app.logger.setLevel(_logging.WARNING)
 
     return app

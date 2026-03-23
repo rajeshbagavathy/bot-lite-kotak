@@ -121,6 +121,7 @@ from state import (
     get_trading_flag_or,
     init_state,
     init_trading_flags,
+    set_bot_runtime_flags,
     set_index,
     set_index_error,
     set_mtm_snapshots_enabled,
@@ -129,7 +130,7 @@ from state import (
     update_portfolio_margin,
     update_strategy,
 )
-from ui import create_app
+from ui import create_app, ensure_http_access_not_logged
 from xts_client import XTSClient
 
 logger = logging.getLogger("xts-bot-lite")
@@ -1785,6 +1786,7 @@ def main() -> None:
 
     init_state(STRATEGY_STATE)
     init_trading_flags(USE_PREMIUM_BASED_STRIKE, STRATEGY_SL_ENABLED, TRADE_NON_EXPIRY_DAY)
+    set_bot_runtime_flags(survivor_sl_to_cost_enabled=bool(SURVIVOR_SL_TO_COST_ENABLED))
     set_mtm_snapshots_enabled(DB_ENABLE_MTM_SNAPSHOTS)
     if index_config is not None:
         set_index(index_config.name, expiry)
@@ -1802,7 +1804,11 @@ def main() -> None:
         register_scheduler_snapshot_with_state()
 
     from threading import Thread
-    ui_thread = Thread(target=lambda: app.run(host="0.0.0.0", port=80, debug=False, use_reloader=False))
+    def _run_flask_server() -> None:
+        ensure_http_access_not_logged()
+        app.run(host="0.0.0.0", port=80, debug=False, use_reloader=False)
+
+    ui_thread = Thread(target=_run_flask_server)
     ui_thread.daemon = True
     ui_thread.start()
 

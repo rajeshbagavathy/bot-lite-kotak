@@ -32,6 +32,7 @@ STATE: Dict[str, dict] = {
     "portfolio": {},
     "strategies": {},
     "settings": {},
+    "bot": {},
 }
 
 
@@ -50,6 +51,15 @@ def init_state(strategies: Dict[str, dict]) -> None:
         STATE["strategies"] = strategies
         if "settings" not in STATE or not STATE["settings"]:
             STATE["settings"] = {"mtm_snapshots_enabled": False}
+        STATE["bot"] = {"survivor_sl_to_cost_enabled": None}
+
+
+def set_bot_runtime_flags(**kwargs) -> None:
+    """Runtime flags from bot (e.g. config mirrors for UI)."""
+    with STATE_LOCK:
+        if "bot" not in STATE:
+            STATE["bot"] = {}
+        STATE["bot"].update(kwargs)
 
 
 def set_index(name: str, expiry: str) -> None:
