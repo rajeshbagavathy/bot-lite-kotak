@@ -1912,7 +1912,7 @@ def main() -> None:
     from threading import Thread
 
     try:
-        ui_port = int(os.getenv("WEB_UI_PORT", "80"))
+        ui_port = int(os.getenv("WEB_UI_PORT", "8001"))
     except ValueError:
         ui_port = 80
 
