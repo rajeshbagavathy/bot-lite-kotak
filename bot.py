@@ -367,6 +367,26 @@ def _round_to_tick(price: float, tick_size: float = 0.05) -> float:
     return math.ceil(price / tick_size) * tick_size
 
 
+def _order_book_status_is_filled(status_raw: Optional[str]) -> bool:
+    """
+    XTS/broker may return FILLED, Complete, Traded, etc. Normalize for SL exit detection.
+    """
+    s = (status_raw or "").replace(" ", "").replace("_", "").upper()
+    return s in (
+        "FILLED",
+        "COMPLETE",
+        "COMPLETED",
+        "TRADED",
+        "CLOSED",
+        "EXECUTED",
+        "FULLYTRADED",
+    )
+
+
+# Closed-leg reasons that still imply one straddle leg is gone; tighten survivor SL to cost.
+_SURVIVOR_PEER_CLOSED_VIA_OK = frozenset({"SL_FILLED", "BROKER_SYNC"})
+
+
 def _place_leg_sl_orders(
     client: XTSClient,
     index_config,
@@ -863,7 +883,8 @@ def _sync_sl_order_status_and_capture_exits(
             order_detail = order_book_map_by_tag.get(str(tag))
         if not order_detail:
             continue
-        order_status = order_detail.get("OrderStatus", "").upper()
+        order_status_raw = order_detail.get("OrderStatus", "")
+        order_status = order_status_raw.upper()
         
         # Map SL tag to instrument_id
         instrument_id = sl_tag_map.get(tag)
@@ -881,10 +902,21 @@ def _sync_sl_order_status_and_capture_exits(
             continue
         
         # **MAIN LOGIC: Check XTS order book status**
-        if order_status == "FILLED":
+        if _order_book_status_is_filled(order_status_raw):
             # ✅ SL order was executed - position is CLOSED
             try:
-                exit_price = float(order_detail.get("OrderAverageTradedPrice", 0.0))
+                exit_price = float(order_detail.get("OrderAverageTradedPrice") or 0.0)
+                if exit_price <= 0:
+                    for alt in ("OrderLastTradedPrice", "LastTradedPrice", "AverageTradedPrice"):
+                        v = order_detail.get(alt)
+                        if v is not None:
+                            try:
+                                fv = float(v)
+                                if fv > 0:
+                                    exit_price = fv
+                                    break
+                            except (TypeError, ValueError):
+                                continue
                 if exit_price > 0:
                     matching_position["exit_price"] = exit_price
                     matching_position["exit_time"] = get_ist_timestamp()
@@ -911,6 +943,13 @@ def _sync_sl_order_status_and_capture_exits(
                             )
                         except Exception as e:
                             logger.error(f"Failed to log position exit: {e}")
+                else:
+                    logger.warning(
+                        "[%s] SL order shows filled-like status but no usable exit price (instrument %s status=%s)",
+                        strategy["name"],
+                        instrument_id,
+                        order_status_raw,
+                    )
             except (TypeError, ValueError) as e:
                 logger.warning(f"Failed to parse exit price from order {tag}: {e}")
         
@@ -922,7 +961,13 @@ def _sync_sl_order_status_and_capture_exits(
                 f"Instrument {instrument_id} (position still exposed)"
             )
         
-        elif order_status in ("PENDING", "OPEN", "PARTIALLY_FILLED"):
+        elif order_status.replace(" ", "").replace("_", "") in (
+            "PENDING",
+            "OPEN",
+            "PARTIALLYFILLED",
+            "NEW",
+            "REPLACED",
+        ):
             # ⏳ SL order still active - position still OPEN
             matching_position["sl_status"] = "WAITING"
 
@@ -954,7 +999,14 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
     open_pos = [p for p in positions if p.get("exit_price") is None]
     if len(closed) != 1 or len(open_pos) != 1:
         return
-    if closed[0].get("closed_via") != "SL_FILLED":
+    peer_via = closed[0].get("closed_via")
+    if peer_via not in _SURVIVOR_PEER_CLOSED_VIA_OK:
+        logger.debug(
+            "[%s] Survivor SL-to-cost skipped: closed leg closed_via=%s (allowed %s)",
+            strategy["name"],
+            peer_via,
+            sorted(_SURVIVOR_PEER_CLOSED_VIA_OK),
+        )
         return
 
     survivor = open_pos[0]
@@ -1314,14 +1366,15 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         # **FIRST**: Sync SL order status from XTS order book (single source of truth)
         _sync_sl_order_status_and_capture_exits(client, strategy, order_book=order_book)
 
-        # **SURVIVOR SL**: After one leg's SL fills, tighten the other leg's SL to original short price (cost)
-        _adjust_survivor_sl_to_cost_after_peer_sl(client, index_config, strategy, order_book=order_book)
-
         # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to market
         _check_leg_target_and_close(client, strategy, ltp_map)
         
         # Sync strategy positions with broker positions to keep state real-time
         _sync_strategy_positions_from_broker(client, strategy, positions, ltp_map, order_book=order_book)
+
+        # **SURVIVOR SL**: After one leg is closed (order-book SL_FILLED or broker sync), tighten survivor SL to cost.
+        # Runs after broker sync so BROKER_SYNC closes are visible the same tick.
+        _adjust_survivor_sl_to_cost_after_peer_sl(client, index_config, strategy, order_book=order_book)
         
         # Compute strategy MTM from local strategy positions (exit_price -> realized, else LTP -> unrealized)
         # Do this BEFORE we potentially clear positions during closure.

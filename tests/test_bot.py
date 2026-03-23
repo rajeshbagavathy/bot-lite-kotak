@@ -1648,7 +1648,33 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
 
     @patch("bot.update_strategy")
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
-    def test_skips_when_first_leg_not_sl_filled(self, mock_update):
+    def test_skips_when_closed_via_unknown(self, mock_update):
+        """Only SL_FILLED and BROKER_SYNC trigger survivor adjust; other reasons skip."""
+        mock_client = MagicMock()
+        mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
+        strategy = self._strategy_two_leg()
+        strategy["positions"][0]["closed_via"] = "MANUAL"
+        order_book = [
+            {
+                "AppOrderID": 202,
+                "OrderStatus": "NEW",
+                "OrderQuantity": 65,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            }
+        ]
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=order_book
+            )
+        mock_client.modify_order.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("bot.update_strategy")
+    @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
+    def test_tightens_when_peer_closed_via_broker_sync(self, mock_update):
+        """Live: order book may miss FILLED; broker sync marks peer closed — still tighten survivor."""
         mock_client = MagicMock()
         mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
         strategy = self._strategy_two_leg()
@@ -1667,8 +1693,10 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
                 mock_client, self.index_config, strategy, order_book=order_book
             )
-        mock_client.modify_order.assert_not_called()
-        mock_update.assert_not_called()
+        mock_client.modify_order.assert_called_once()
+        mock_update.assert_called_once_with(
+            "N_T_1031", survivor_sl_adjusted_to_cost=True
+        )
 
     @patch("bot.update_strategy")
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
