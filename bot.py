@@ -1911,14 +1911,34 @@ def main() -> None:
 
     from threading import Thread
 
-    try:
-        ui_port = int(os.getenv("WEB_UI_PORT", "8001"))
-    except ValueError:
-        ui_port = 80
+    def _parse_web_ui_port() -> int:
+        """Default 80 (EC2 setup). Ignore empty/invalid env values."""
+        raw = (os.getenv("WEB_UI_PORT") or "80").strip()
+        try:
+            p = int(raw)
+        except ValueError:
+            logger.warning("WEB_UI_PORT=%r invalid; using 80", os.getenv("WEB_UI_PORT"))
+            return 80
+        if not (1 <= p <= 65535):
+            logger.warning("WEB_UI_PORT=%s out of range; using 80", p)
+            return 80
+        return p
+
+    ui_port = _parse_web_ui_port()
 
     def _run_flask_server() -> None:
-        ensure_http_access_not_logged()
-        app.run(host="0.0.0.0", port=ui_port, debug=False, use_reloader=False)
+        try:
+            ensure_http_access_not_logged()
+            app.run(host="0.0.0.0", port=ui_port, debug=False, use_reloader=False)
+        except OSError as e:
+            logger.error(
+                "Flask UI failed to bind port %s (Permission denied on ports <1024 without root, "
+                "or address already in use): %s",
+                ui_port,
+                e,
+            )
+        except Exception as e:
+            logger.exception("Flask UI thread crashed: %s", e)
 
     ui_thread = Thread(target=_run_flask_server)
     ui_thread.daemon = True
