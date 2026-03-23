@@ -477,14 +477,18 @@ def restore_positions_for_strategy(strategy_id: int) -> List[Dict[str, Any]]:
         for row in rows:
             entry = float(row["entry_price"]) if row["entry_price"] is not None else 0.0
             target_price = round(entry * (1 - LEG_TARGET_PCT / 100.0), 2) if entry > 0 else None
-            positions.append({
+            pos: Dict[str, Any] = {
                 "symbol": row["symbol"],
                 "instrument_id": row["instrument_id"],
                 "quantity": row["quantity"],
                 "entry_price": row["entry_price"],
                 "target_price": target_price,
                 "exit_price": row["exit_price"],
-            })
+            }
+            # Positions table has no closed_via column; after restart the bot needs a reason to allow survivor SL→cost.
+            if row["exit_price"] is not None:
+                pos["closed_via"] = "RESTORED"
+            positions.append(pos)
         
         return positions
     except Exception as e:

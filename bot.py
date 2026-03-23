@@ -438,7 +438,8 @@ def _order_book_status_is_filled(status_raw: Optional[str]) -> bool:
 
 
 # Closed-leg reasons that still imply one straddle leg is gone; tighten survivor SL to cost.
-_SURVIVOR_PEER_CLOSED_VIA_OK = frozenset({"SL_FILLED", "BROKER_SYNC"})
+# RESTORED: exit_price loaded from DB on restart (closed_via not persisted in SQLite).
+_SURVIVOR_PEER_CLOSED_VIA_OK = frozenset({"SL_FILLED", "BROKER_SYNC", "RESTORED"})
 
 
 def _place_leg_sl_orders(
@@ -1026,6 +1027,11 @@ def _sync_sl_order_status_and_capture_exits(
             matching_position["sl_status"] = "WAITING"
 
 
+def _hint_survivor_sl_to_cost(strategy: dict, msg: str) -> None:
+    """Expose why survivor adjust did/didn't run (Overview card)."""
+    update_strategy(strategy["name"], survivor_sl_to_cost_hint=msg[:240])
+
+
 def _adjust_survivor_sl_to_cost_after_peer_sl(
     client: XTSClient,
     index_config,
@@ -1041,17 +1047,24 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
     if strategy["status"] != "OPEN" or strategy.get("survivor_sl_adjusted_to_cost"):
         return
     if not strategy.get("sl_orders"):
+        _hint_survivor_sl_to_cost(strategy, "Waiting: no SL orders in state (need entry SL tags).")
         return
     if client is None:
+        _hint_survivor_sl_to_cost(strategy, "No broker client (DEMO?).")
         return
 
     positions = strategy.get("positions") or []
     if len(positions) != 2:
+        _hint_survivor_sl_to_cost(strategy, f"Need exactly 2 legs; have {len(positions)}.")
         return
 
     closed = [p for p in positions if p.get("exit_price") is not None]
     open_pos = [p for p in positions if p.get("exit_price") is None]
     if len(closed) != 1 or len(open_pos) != 1:
+        _hint_survivor_sl_to_cost(
+            strategy,
+            f"Need 1 closed + 1 open leg (have {len(closed)} closed, {len(open_pos)} open).",
+        )
         return
     peer_via = closed[0].get("closed_via")
     if peer_via not in _SURVIVOR_PEER_CLOSED_VIA_OK:
@@ -1061,12 +1074,17 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             peer_via,
             sorted(_SURVIVOR_PEER_CLOSED_VIA_OK),
         )
+        _hint_survivor_sl_to_cost(
+            strategy,
+            f"Peer leg closed_via={peer_via!r} — need SL_FILLED, BROKER_SYNC, or RESTORED (DB restart).",
+        )
         return
 
     survivor = open_pos[0]
     instrument_id = survivor.get("instrument_id")
     entry_price = survivor.get("entry_price")
     if instrument_id is None or entry_price is None or float(entry_price) <= 0:
+        _hint_survivor_sl_to_cost(strategy, "Survivor leg missing instrument_id or entry_price.")
         return
 
     sl_orders = strategy.get("sl_orders", []) or []
@@ -1081,6 +1099,10 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             survivor_sl = (int(app_order_id), str(tag))
             break
     if not survivor_sl:
+        _hint_survivor_sl_to_cost(
+            strategy,
+            "No SL order tag maps to survivor instrument (check sl_tag_map vs survivor leg).",
+        )
         return
 
     app_order_id, tag = survivor_sl
@@ -1094,6 +1116,7 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
                 strategy["name"],
                 e,
             )
+            _hint_survivor_sl_to_cost(strategy, f"Order book fetch failed: {e!s}"[:240])
             return
 
     order_book_map_by_id: Dict[int, dict] = {}
@@ -1112,6 +1135,10 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             strategy["name"],
             app_order_id,
         )
+        _hint_survivor_sl_to_cost(
+            strategy,
+            f"Survivor SL app_order_id={app_order_id} not in order book (sync delay or cancelled).",
+        )
         return
 
     order_status = (order_detail.get("OrderStatus") or "").replace(" ", "").upper()
@@ -1124,6 +1151,10 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         "PARTIALLY_FILLED",
     }
     if order_status not in _open_sl:
+        _hint_survivor_sl_to_cost(
+            strategy,
+            f"Survivor SL status={order_status!r} — not active; cannot modify.",
+        )
         return
 
     tick = float(index_config.tick_size)
@@ -1142,7 +1173,11 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             time_in_force=order_detail.get("TimeInForce"),
             tag=tag,
         )
-        update_strategy(strategy["name"], survivor_sl_adjusted_to_cost=True)
+        update_strategy(
+            strategy["name"],
+            survivor_sl_adjusted_to_cost=True,
+            survivor_sl_to_cost_hint="Done: survivor SL tightened to cost.",
+        )
         logger.warning(
             "[%s] Survivor leg SL tightened to cost: instrument=%s limit=%.2f trigger=%.2f (entry=%.2f)",
             strategy["name"],
@@ -1157,6 +1192,7 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             strategy["name"],
             e,
         )
+        _hint_survivor_sl_to_cost(strategy, f"modify_order failed: {e!s}"[:220])
 
 
 def _check_leg_target_and_close(
@@ -1767,6 +1803,7 @@ def main() -> None:
                 "sl_tag_map": {},
                 "db_id": None,
                 "survivor_sl_adjusted_to_cost": False,
+                "survivor_sl_to_cost_hint": None,
             }
 
     # Restore today's strategies from database (before init_state)

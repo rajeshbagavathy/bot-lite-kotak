@@ -536,12 +536,18 @@ DASHBOARD_TEMPLATE = """
           for (const [name, st] of Object.entries(stateStrategies)) {
             if (st && st.status === 'OPEN') {
               const adj = !!st.survivor_sl_adjusted_to_cost;
-              openRows.push('<div class="metric"><span class="metric-label">' + escHtml(name) + '</span><span class="metric-value">' +
-                (adj ? 'Tightened to cost' : 'Not yet') + '</span></div>');
+              const hint = st.survivor_sl_to_cost_hint ? escHtml(String(st.survivor_sl_to_cost_hint)) : '';
+              openRows.push(
+                '<div style="margin-bottom:10px;border-bottom:1px solid #334155;padding-bottom:8px">' +
+                '<div class="metric"><span class="metric-label">' + escHtml(name) + '</span><span class="metric-value">' +
+                (adj ? 'Tightened to cost' : 'Not yet') + '</span></div>' +
+                (hint ? '<div class="subtext" style="margin-top:4px">' + hint + '</div>' : '') +
+                '</div>'
+              );
             }
           }
           survHtml += openRows.length ? openRows.join('') : '<div class="subtext">No OPEN strategies in live state.</div>';
-          survHtml += '<div class="subtext" style="margin-top:8px">From live /state (same as bot memory). Use this if survivor lines are missing from the log tail.</div>';
+          survHtml += '<div class="subtext" style="margin-top:8px">Hints update every ~3s while the strategy is OPEN. If one leg is closed from DB restart, closed_via=RESTORED is set so adjust can run. Peer leg must be SL_FILLED/BROKER_SYNC/RESTORED.</div>';
           survivorCostEl.innerHTML = survHtml;
         }
 

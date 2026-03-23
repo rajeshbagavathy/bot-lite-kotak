@@ -191,15 +191,18 @@ class XTSClient:
     ) -> None:
         """
         Modify an existing order (e.g., convert SL to market execution).
-        
+
+        Connect.modify_order(...) expects XTS params in this order (see Connect.py):
+        modifiedLimitPrice, modifiedStopPrice — same as typical xt.modify_order(modifiedLimitPrice=..., modifiedStopPrice=...).
+
         Args:
             app_order_id: AppOrderID of the order to modify
             product_type: Product type (MIS, CNC, etc.)
             order_type: New order type (MARKET, LIMIT, STOPLIMIT)
             quantity: Order quantity
             disclosed_quantity: Disclosed quantity
-            stop_price: Stop price (0 for market orders)
-            limit_price: Limit price (0 for market orders)
+            limit_price: Limit leg (STOPLIMIT); use 0 for market
+            stop_price: Stop/trigger leg (STOPLIMIT); use 0 for market
             time_in_force: Time in force (DAY, etc.)
             tag: Order unique identifier
         """
@@ -209,8 +212,8 @@ class XTSClient:
             order_type,
             quantity,
             disclosed_quantity,
-            stop_price,
             limit_price,
+            stop_price,
             time_in_force,
             tag,
             self.client_id,
