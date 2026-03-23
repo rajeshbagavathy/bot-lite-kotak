@@ -1385,8 +1385,8 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
         call_kwargs = self.mock_client.modify_order.call_args[1]
         self.assertEqual(call_kwargs["app_order_id"], 102)
         
-        # CE should be logged as already filled
-        self.assertTrue(mock_logger.info.called)
+        # CE should be logged as already filled (debug)
+        self.assertTrue(mock_logger.debug.called)
 
     def test_replaced_status_also_modifies(self):
         """Should modify SL orders with REPLACED status (reopened)."""

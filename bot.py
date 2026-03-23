@@ -11,35 +11,53 @@ import schedule
 
 def _configure_bot_logging() -> None:
     """
-    Configure root logging before any Flask/ui imports.
-    Otherwise logging.basicConfig is a no-op if Flask already configured the root logger,
-    and bot lines may not appear in journald or bot.log.
+    Configure logging before any Flask/ui imports.
+
+    - Root logger: WARNING only (drops boto/botocore/urllib3 INFO noise).
+    - ``xts-bot-lite``: INFO to stderr + bot.log file, propagate=False so app logs are isolated.
+    - Werkzeug / boto / urllib3: effectively silent (CRITICAL, no propagate).
     """
     log_path = os.environ.get("BOT_LOG_PATH", "bot.log")
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.WARNING)
     for h in root.handlers[:]:
         root.removeHandler(h)
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(fmt)
-    root.addHandler(stderr_handler)
+    stderr_root = logging.StreamHandler(sys.stderr)
+    stderr_root.setFormatter(fmt)
+    root.addHandler(stderr_root)
+
+    bot_log = logging.getLogger("xts-bot-lite")
+    bot_log.handlers.clear()
+    bot_log.setLevel(logging.INFO)
+    bot_log.propagate = False
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    bot_log.addHandler(sh)
     try:
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setFormatter(fmt)
-        root.addHandler(file_handler)
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        bot_log.addHandler(fh)
     except OSError as e:
-        # Still run the bot if log file cannot be created (e.g. read-only cwd)
         sys.stderr.write(f"WARNING: Could not open {log_path} for logging: {e}\n")
 
-    # Do not propagate Werkzeug/Flask HTTP access logs to root (avoids flooding bot.log / journal).
-    for _name in ("werkzeug", "werkzeug.serving"):
+    for _name in (
+        "werkzeug",
+        "werkzeug.serving",
+        "boto3",
+        "botocore",
+        "botocore.credentials",
+        "urllib3",
+        "urllib3.connectionpool",
+        "s3transfer",
+    ):
         _lg = logging.getLogger(_name)
         _lg.handlers.clear()
         _lg.propagate = False
         _lg.setLevel(logging.CRITICAL)
 
-    logging.info("Bot logging: stderr (journald) + file %s (override with BOT_LOG_PATH)", log_path)
+    bot_log.debug("Bot logging: stderr (journald) + file %s (override with BOT_LOG_PATH)", log_path)
 
 
 _configure_bot_logging()
@@ -122,7 +140,7 @@ def _pick_index_and_expiry(client: XTSClient) -> Tuple[dict, str]:
         expiries = client.get_expiry_dates(config)
         if expiries:
             expiry_map[config.name] = expiries[0]
-            logger.info(f"  {config.name} expiry: {expiries[0]}")
+            logger.debug(f"  {config.name} expiry: {expiries[0]}")
 
     if not expiry_map:
         logger.error("No expiries found for any index")
@@ -132,7 +150,7 @@ def _pick_index_and_expiry(client: XTSClient) -> Tuple[dict, str]:
     candidates = [name for name, date in expiry_map.items() if date == earliest]
     chosen_name = "SENSEX" if "SENSEX" in candidates else candidates[0]
     expiry = client.format_expiry_for_options(earliest)
-    logger.info(f"Selected: {chosen_name} expiry: {expiry}")
+    logger.debug(f"Selected: {chosen_name} expiry: {expiry}")
     return INDEX_CONFIGS[chosen_name], expiry
 
 
@@ -741,7 +759,7 @@ def _close_strategy_via_open_sl_orders(client: XTSClient, strategy: dict) -> Non
     """
     sl_orders = strategy.get("sl_orders", []) or []
     if not sl_orders:
-        logger.info(f"No SL orders found for strategy {strategy['name']}")
+        logger.debug(f"No SL orders found for strategy {strategy['name']}")
         return
     
     try:
@@ -790,7 +808,7 @@ def _close_strategy_via_open_sl_orders(client: XTSClient, strategy: dict) -> Non
                     time_in_force=order_detail.get("TimeInForce"),
                     tag=tag,
                 )
-                logger.info(
+                logger.debug(
                     f"✅ [{strategy['name']}] Modified SL order to market: {tag} "
                     f"(Qty: {order_detail.get('OrderQuantity')})"
                 )
@@ -801,7 +819,7 @@ def _close_strategy_via_open_sl_orders(client: XTSClient, strategy: dict) -> Non
         
         elif order_status == "FILLED":
             # ℹ️ SL already executed - position already closed
-            logger.info(
+            logger.debug(
                 f"ℹ️  [{strategy['name']}] SL already FILLED, skipping: {tag}"
             )
         
@@ -954,7 +972,7 @@ def _sync_sl_order_status_and_capture_exits(
                     matching_position["exit_time"] = get_ist_timestamp()
                     matching_position["closed_via"] = "SL_FILLED"
                     
-                    logger.info(
+                    logger.debug(
                         f"✅ [{strategy['name']}] Position CLOSED via SL: "
                         f"Instrument {instrument_id}, Exit Price: {exit_price}"
                     )
@@ -1121,7 +1139,7 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             tag=tag,
         )
         update_strategy(strategy["name"], survivor_sl_adjusted_to_cost=True)
-        logger.info(
+        logger.warning(
             "[%s] Survivor leg SL tightened to cost: instrument=%s limit=%.2f trigger=%.2f (entry=%.2f)",
             strategy["name"],
             instrument_id,
@@ -1231,7 +1249,7 @@ def _check_leg_target_and_close(
             )
             target_triggered.add(instrument_id)
             update_strategy(strategy["name"], target_triggered_instruments=list(target_triggered))
-            logger.info(
+            logger.debug(
                 "✅ [%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%); modified SL to market",
                 strategy["name"], float(LEG_TARGET_PCT), instrument_id, profit_pct,
             )
@@ -1425,7 +1443,7 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         
         # **CHECK**: If all positions are closed via SL orders, close strategy (logs to trades_closed)
         if strategy["status"] == "OPEN" and _check_all_positions_closed(strategy):
-            logger.info(f"✅ [{strategy['name']}] All positions closed via SL orders - closing strategy")
+            logger.debug(f"✅ [{strategy['name']}] All positions closed via SL orders - closing strategy")
             _close_strategy(
                 client, index_config, strategy, positions,
                 "All positions closed via SL orders",
@@ -1480,7 +1498,7 @@ STRATEGY_STATE: Dict[str, dict] = {}
 def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
 
     if not _is_expiry_day(expiry) and not get_trading_flag_or("trade_non_expiry_day", TRADE_NON_EXPIRY_DAY):
-        logger.info("Non-expiry day and TRADE_NON_EXPIRY_DAY is disabled — skipping all strategy scheduling")
+        logger.debug("Non-expiry day and TRADE_NON_EXPIRY_DAY is disabled — skipping all strategy scheduling")
         for strategy in STRATEGY_STATE.values():
             update_strategy(strategy["name"], status="DISABLED", message="No trading on non-expiry day")
         schedule.every(60).seconds.do(_update_available_margin, client=client)
@@ -1491,7 +1509,7 @@ def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
     
     for idx, strategy in enumerate(STRATEGY_STATE.values()):
         if idx == 0 and test_mode:
-            logger.info("TEST MODE: First strategy in 1 minute")
+            logger.debug("TEST MODE: First strategy in 1 minute")
             schedule.every(1).minutes.do(
                 _execute_strategy,
                 client=client,
@@ -1522,10 +1540,10 @@ def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
         attempt += 1
         
         try:
-            logger.info(f"🔄 Retry {attempt}: Checking for expiry data...")
+            logger.debug(f"🔄 Retry {attempt}: Checking for expiry data...")
             index_config, expiry = _pick_index_and_expiry(client)
             
-            logger.info(f"✓ Expiry found! Index: {index_config.name} | Expiry: {expiry}")
+            logger.debug(f"✓ Expiry found! Index: {index_config.name} | Expiry: {expiry}")
             set_index(index_config.name, expiry)
             
             # Schedule jobs now that we have expiry
@@ -1536,7 +1554,7 @@ def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
             for restored_strategy in restored:
                 strategy_name = restored_strategy["strategy_name"]
                 if strategy_name in STRATEGY_STATE:
-                    logger.info(f"Restoring {strategy_name} from database...")
+                    logger.debug(f"Restoring {strategy_name} from database...")
                     STRATEGY_STATE[strategy_name].update({
                         "db_id": restored_strategy["db_id"],
                         "status": restored_strategy.get("status", "OPEN"),
@@ -1545,7 +1563,7 @@ def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
                         "positions": restored_strategy["positions"],
                     })
             
-            logger.info("✓ Bot is now operational")
+            logger.debug("✓ Bot is now operational")
             return  # Success, exit retry loop
             
         except RuntimeError as e:
@@ -1557,12 +1575,12 @@ def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
             # Increase retry interval, but cap at max
             retry_interval = min(retry_interval + 5, max_interval)
             current_time = get_ist_now().strftime("%H:%M:%S")
-            logger.info(f"⏳ Retrying in {retry_interval}s... Current time: {current_time} (Market hours: 09:15-15:30)")
+            logger.debug(f"⏳ Retrying in {retry_interval}s... Current time: {current_time} (Market hours: 09:15-15:30)")
 
 
 def main() -> None:
     if DEMO_MODE:
-        logger.info("DEMO MODE - Simulated data")
+        logger.debug("DEMO MODE - Simulated data")
         client = None
         index_config = INDEX_CONFIGS["NIFTY"]
         expiry = "08FEB2026"
@@ -1603,7 +1621,7 @@ def main() -> None:
             expiry = None
             client_for_retry = client
 
-    logger.info("Index: %s | Expiry: %s", index_config.name if index_config else "NOT SET", expiry if expiry else "NOT SET")
+    logger.debug("Index: %s | Expiry: %s", index_config.name if index_config else "NOT SET", expiry if expiry else "NOT SET")
     init_db()
     # Clean up all previous day data on startup
     cleanup_previous_day_data()
@@ -1644,7 +1662,7 @@ def main() -> None:
         for restored_strategy in restored:
             strategy_name = restored_strategy["strategy_name"]
             if strategy_name in STRATEGY_STATE:
-                logger.info(f"Restoring %s from database...", strategy_name)
+                logger.debug(f"Restoring %s from database...", strategy_name)
                 STRATEGY_STATE[strategy_name].update({
                     "db_id": restored_strategy["db_id"],
                     "status": restored_strategy.get("status", "OPEN"),
@@ -1674,11 +1692,11 @@ def main() -> None:
     ui_thread.daemon = True
     ui_thread.start()
 
-    logger.info("UI at http://localhost:8001 | %s / %s", auth["username"], auth["password"])
+    logger.debug("UI at http://localhost:8001 | %s / %s", auth["username"], auth["password"])
     
     # If no expiry was found, retry periodically
     if index_config is None and not DEMO_MODE:
-        logger.info("⏳ Waiting for expiry data... Current time: %s (Market hours: 09:15-15:30)", get_ist_now().strftime("%H:%M:%S"))
+        logger.debug("⏳ Waiting for expiry data... Current time: %s (Market hours: 09:15-15:30)", get_ist_now().strftime("%H:%M:%S"))
         retry_thread = Thread(target=lambda: _retry_pick_expiry(client, auth), daemon=True)
         retry_thread.start()
 

@@ -12,6 +12,8 @@ from state import (
     set_trading_flag,
 )
 
+from bot_log_filter import bot_log_line_is_survivor_event
+
 try:
     from config import LEG_TARGET_PCT
 except ImportError:
@@ -22,13 +24,25 @@ def _bot_log_abs_path() -> str:
     return os.path.abspath(os.environ.get("BOT_LOG_PATH", "bot.log"))
 
 
-def read_bot_log_tail(max_lines: int = 500, max_bytes: int = 512_000) -> dict:
+def read_bot_log_tail(
+    max_lines: int = 500,
+    max_bytes: int = 512_000,
+    mode: str = "survivor",
+) -> dict:
     """
     Read the last chunk of the bot log file (same path as bot.py FileHandler).
     Does not accept arbitrary paths from the client (fixed path only).
     """
     path = _bot_log_abs_path()
-    out: dict = {"path": path, "lines": [], "truncated": False, "missing": False}
+    if mode not in ("survivor", "all"):
+        mode = "survivor"
+    out: dict = {
+        "path": path,
+        "lines": [],
+        "truncated": False,
+        "missing": False,
+        "mode": mode,
+    }
     if not os.path.isfile(path):
         out["missing"] = True
         return out
@@ -45,7 +59,12 @@ def read_bot_log_tail(max_lines: int = 500, max_bytes: int = 512_000) -> dict:
         lines = chunk.splitlines()
         if len(lines) > max_lines:
             lines = lines[-max_lines:]
-        out["lines"] = lines
+        if mode == "survivor":
+            filtered = [ln for ln in lines if bot_log_line_is_survivor_event(ln)]
+            out["lines"] = filtered
+            out["filtered_empty"] = len(filtered) == 0 and len(lines) > 0
+        else:
+            out["lines"] = lines
         return out
     except OSError as e:
         out["error"] = str(e)
@@ -228,7 +247,11 @@ DASHBOARD_TEMPLATE = """
     <div id="botlog" class="tab-content">
       <div class="card" style="margin-bottom: 12px;">
         <div class="card-title">Bot log file</div>
-        <p class="meta-label" style="margin-bottom: 8px;">Tail of <span id="bot-log-path">—</span> (HTTP/API access lines are not written here). Auto-refreshes with the dashboard.</p>
+        <p class="meta-label" style="margin-bottom: 8px;">Tail of <span id="bot-log-path">—</span>. By default only <strong>survivor SL-to-cost</strong> lines (WARNING/ERROR) are shown. Auto-refreshes with the dashboard.</p>
+        <label class="setting-row" style="margin-bottom: 8px;">
+          <input type="checkbox" id="bot-log-show-full" />
+          <span>Show full log (all levels in tail)</span>
+        </label>
         <button type="button" class="tab-btn" id="bot-log-refresh" style="padding: 6px 12px;">Refresh now</button>
       </div>
       <pre id="bot-log-pre" class="log-view">Loading...</pre>
@@ -269,6 +292,8 @@ DASHBOARD_TEMPLATE = """
 
     async function loadDashboard() {
       try {
+        const showFullLog = document.getElementById('bot-log-show-full')?.checked;
+        const logMode = showFullLog ? 'all' : 'survivor';
         const [state, strategies, positions, orders, trades, mtm, botlog] = await Promise.all([
           fetch('/state').then(r => r.json()),
           fetch('/api/strategies').then(r => r.json()),
@@ -276,7 +301,7 @@ DASHBOARD_TEMPLATE = """
           fetch('/api/orders').then(r => r.json()),
           fetch('/api/trades').then(r => r.json()),
           fetch('/api/mtm').then(r => r.json()),
-          fetch('/api/bot-log?lines=800').then(r => r.json()),
+          fetch('/api/bot-log?lines=800&mode=' + encodeURIComponent(logMode)).then(r => r.json()),
         ]);
 
         const portfolio = state.portfolio || {};
@@ -567,6 +592,8 @@ DASHBOARD_TEMPLATE = """
             logPre.textContent = 'Error reading log: ' + botlog.error;
           } else if (botlog.missing) {
             logPre.textContent = 'Log file not found: ' + (botlog.path || '') + ' (it is created when the bot starts logging).';
+          } else if (botlog.filtered_empty) {
+            logPre.textContent = 'No survivor SL-to-cost lines in this tail yet. Check "Show full log" to see all messages.';
           } else {
             const lines = botlog.lines || [];
             const note = botlog.truncated ? '\\n\\n… (large file; showing tail only)\\n' : '';
@@ -577,6 +604,11 @@ DASHBOARD_TEMPLATE = """
         if (logRefresh && !logRefresh.dataset.bound) {
           logRefresh.dataset.bound = '1';
           logRefresh.addEventListener('click', function() { loadDashboard(); });
+        }
+        const logShowFull = document.getElementById('bot-log-show-full');
+        if (logShowFull && !logShowFull.dataset.bound) {
+          logShowFull.dataset.bound = '1';
+          logShowFull.addEventListener('change', function() { loadDashboard(); });
         }
 
         document.getElementById('update-time').textContent = new Date().toLocaleTimeString();
@@ -916,6 +948,19 @@ def create_app(username: str, password: str) -> Flask:
         except ValueError:
             n = 800
         n = max(50, min(n, 5000))
-        return jsonify(read_bot_log_tail(max_lines=n))
+        mode = (request.args.get("mode") or "survivor").strip().lower()
+        if mode not in ("survivor", "all"):
+            mode = "survivor"
+        return jsonify(read_bot_log_tail(max_lines=n, mode=mode))
+
+    # Flask may attach loggers after startup; keep HTTP access off bot.log / journal.
+    import logging as _logging
+
+    for _name in ("werkzeug", "werkzeug.serving"):
+        _lg = _logging.getLogger(_name)
+        _lg.handlers.clear()
+        _lg.propagate = False
+        _lg.setLevel(_logging.CRITICAL)
+    app.logger.setLevel(_logging.WARNING)
 
     return app

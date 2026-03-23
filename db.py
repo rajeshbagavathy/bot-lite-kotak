@@ -129,7 +129,7 @@ def init_db() -> None:
         
         conn.commit()
         conn.close()
-        logger.info(f"Database initialized at {DB_PATH}")
+        logger.debug(f"Database initialized at {DB_PATH}")
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
@@ -296,7 +296,7 @@ def log_trade_closed(
         
         conn.commit()
         conn.close()
-        logger.info(f"Logged closed trade: {strategy_name} P&L={realized_pnl:.2f}")
+        logger.debug(f"Logged closed trade: {strategy_name} P&L={realized_pnl:.2f}")
     except Exception as e:
         logger.error(f"Failed to log closed trade: {e}")
 
@@ -338,7 +338,7 @@ def cleanup_old_data(days: int = RETENTION_DAYS) -> None:
         
         conn.commit()
         conn.close()
-        logger.info(f"Cleanup: Deleted {deleted_count} old trades (before {cutoff_date})")
+        logger.debug(f"Cleanup: Deleted {deleted_count} old trades (before {cutoff_date})")
     except Exception as e:
         logger.error(f"Failed to cleanup old data: {e}")
 
@@ -394,12 +394,12 @@ def cleanup_previous_day_data() -> None:
         conn.commit()
         conn.close()
         
-        logger.info(f"🧹 Startup Cleanup: Deleted data from previous days (before {today})")
+        logger.debug(f"🧹 Startup Cleanup: Deleted data from previous days (before {today})")
         if deleted > 0 or deleted_orders > 0 or deleted_trades > 0 or deleted_mtm > 0:
-            logger.info(f"   - Strategies: {deleted} | Orders: {deleted_orders} | Closed Trades: {deleted_trades} | MTM: {deleted_mtm}")
-            logger.info(f"✅ Previous day data cleaned up. Today starts fresh!")
+            logger.debug(f"   - Strategies: {deleted} | Orders: {deleted_orders} | Closed Trades: {deleted_trades} | MTM: {deleted_mtm}")
+            logger.debug(f"✅ Previous day data cleaned up. Today starts fresh!")
         else:
-            logger.info(f"✅ No previous day data to cleanup. Today ({today}) starts clean.")
+            logger.debug(f"✅ No previous day data to cleanup. Today ({today}) starts clean.")
             
     except Exception as e:
         logger.error(f"Failed to cleanup previous day data: {e}")
@@ -531,12 +531,12 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
                 "positions": restore_positions_for_strategy(row["id"]),
             }
             restored_strategies.append(strategy_data)
-            logger.info(f"Restored strategy from DB: {row['strategy_name']} (strike={row['strike']}, {len(strategy_data['positions'])} positions)")
+            logger.debug(f"Restored strategy from DB: {row['strategy_name']} (strike={row['strike']}, {len(strategy_data['positions'])} positions)")
         
         if restored_strategies:
-            logger.info(f"✅ Restored {len(restored_strategies)} strategies from TODAY ({today})")
+            logger.debug(f"✅ Restored {len(restored_strategies)} strategies from TODAY ({today})")
         else:
-            logger.info(f"No strategies to restore from today ({today})")
+            logger.debug(f"No strategies to restore from today ({today})")
         
         return restored_strategies
     except Exception as e:
