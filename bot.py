@@ -2,10 +2,40 @@ import datetime
 import logging
 import math
 import os
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
 import schedule
+
+
+def _configure_bot_logging() -> None:
+    """
+    Configure root logging before any Flask/ui imports.
+    Otherwise logging.basicConfig is a no-op if Flask already configured the root logger,
+    and bot lines may not appear in journald or bot.log.
+    """
+    log_path = os.environ.get("BOT_LOG_PATH", "bot.log")
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(fmt)
+    root.addHandler(stderr_handler)
+    try:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except OSError as e:
+        # Still run the bot if log file cannot be created (e.g. read-only cwd)
+        sys.stderr.write(f"WARNING: Could not open {log_path} for logging: {e}\n")
+
+    logging.info("Bot logging: stderr (journald) + file %s (override with BOT_LOG_PATH)", log_path)
+
+
+_configure_bot_logging()
 
 from config import (
     ACC_NAME,
@@ -74,11 +104,6 @@ from state import (
 from ui import create_app
 from xts_client import XTSClient
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
-)
 logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
 _LAST_MTM_LOG: Dict[str, float] = {}  # strategy_name -> last log timestamp (for throttling)
