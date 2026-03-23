@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, jsonify, render_template_string
 from flask_basicauth import BasicAuth
 import sqlite3
@@ -14,6 +16,41 @@ try:
     from config import LEG_TARGET_PCT
 except ImportError:
     LEG_TARGET_PCT = 65.0
+
+
+def _bot_log_abs_path() -> str:
+    return os.path.abspath(os.environ.get("BOT_LOG_PATH", "bot.log"))
+
+
+def read_bot_log_tail(max_lines: int = 500, max_bytes: int = 512_000) -> dict:
+    """
+    Read the last chunk of the bot log file (same path as bot.py FileHandler).
+    Does not accept arbitrary paths from the client (fixed path only).
+    """
+    path = _bot_log_abs_path()
+    out: dict = {"path": path, "lines": [], "truncated": False, "missing": False}
+    if not os.path.isfile(path):
+        out["missing"] = True
+        return out
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return out
+            out["truncated"] = size > max_bytes
+            read_size = min(max_bytes, size)
+            f.seek(-read_size, os.SEEK_END)
+            chunk = f.read().decode("utf-8", errors="replace")
+        lines = chunk.splitlines()
+        if len(lines) > max_lines:
+            lines = lines[-max_lines:]
+        out["lines"] = lines
+        return out
+    except OSError as e:
+        out["error"] = str(e)
+        return out
+
 
 DASHBOARD_TEMPLATE = """
 <!doctype html>
@@ -61,6 +98,7 @@ DASHBOARD_TEMPLATE = """
     .subtext { color: #94a3b8; font-size: 12px; margin-top: 4px; line-height: 1.35; }
     .warn-box { background: #7c2d12; color: #fed7aa; padding: 10px 12px; border-radius: 6px; border: 1px solid #fb923c; font-size: 12px; line-height: 1.4; }
     .refresh-time { color: #64748b; font-size: 11px; margin-top: 20px; text-align: center; }
+    .log-view { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.45; max-height: 70vh; overflow: auto; background: #0f172a; padding: 14px; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; }
   </style>
 </head>
 <body>
@@ -77,6 +115,7 @@ DASHBOARD_TEMPLATE = """
       <button class="tab-btn" onclick="switchTab(event, 'orders')">Orders</button>
       <button class="tab-btn" onclick="switchTab(event, 'trades')">Closed Trades</button>
       <button class="tab-btn" onclick="switchTab(event, 'mtm')">MTM Snapshots</button>
+      <button class="tab-btn" onclick="switchTab(event, 'botlog')">Bot log</button>
     </div>
 
     <div id="overview" class="tab-content active">
@@ -186,6 +225,15 @@ DASHBOARD_TEMPLATE = """
       </table>
     </div>
 
+    <div id="botlog" class="tab-content">
+      <div class="card" style="margin-bottom: 12px;">
+        <div class="card-title">Bot log file</div>
+        <p class="meta-label" style="margin-bottom: 8px;">Tail of <span id="bot-log-path">—</span> (HTTP/API access lines are not written here). Auto-refreshes with the dashboard.</p>
+        <button type="button" class="tab-btn" id="bot-log-refresh" style="padding: 6px 12px;">Refresh now</button>
+      </div>
+      <pre id="bot-log-pre" class="log-view">Loading...</pre>
+    </div>
+
     <div class="refresh-time">Last updated: <span id="update-time">-</span> (Auto-refresh every 2 seconds)</div>
   </div>
 
@@ -221,13 +269,14 @@ DASHBOARD_TEMPLATE = """
 
     async function loadDashboard() {
       try {
-        const [state, strategies, positions, orders, trades, mtm] = await Promise.all([
+        const [state, strategies, positions, orders, trades, mtm, botlog] = await Promise.all([
           fetch('/state').then(r => r.json()),
           fetch('/api/strategies').then(r => r.json()),
           fetch('/api/positions').then(r => r.json()),
           fetch('/api/orders').then(r => r.json()),
           fetch('/api/trades').then(r => r.json()),
           fetch('/api/mtm').then(r => r.json()),
+          fetch('/api/bot-log?lines=800').then(r => r.json()),
         ]);
 
         const portfolio = state.portfolio || {};
@@ -509,6 +558,26 @@ DASHBOARD_TEMPLATE = """
           `;
         }
         document.getElementById('mtm-rows').innerHTML = mtmHTML || '<tr><td colspan="5">No data</td></tr>';
+
+        const logPathEl = document.getElementById('bot-log-path');
+        const logPre = document.getElementById('bot-log-pre');
+        if (logPathEl && logPre && botlog) {
+          logPathEl.textContent = botlog.path || '—';
+          if (botlog.error) {
+            logPre.textContent = 'Error reading log: ' + botlog.error;
+          } else if (botlog.missing) {
+            logPre.textContent = 'Log file not found: ' + (botlog.path || '') + ' (it is created when the bot starts logging).';
+          } else {
+            const lines = botlog.lines || [];
+            const note = botlog.truncated ? '\\n\\n… (large file; showing tail only)\\n' : '';
+            logPre.textContent = lines.join('\\n') + note;
+          }
+        }
+        const logRefresh = document.getElementById('bot-log-refresh');
+        if (logRefresh && !logRefresh.dataset.bound) {
+          logRefresh.dataset.bound = '1';
+          logRefresh.addEventListener('click', function() { loadDashboard(); });
+        }
 
         document.getElementById('update-time').textContent = new Date().toLocaleTimeString();
       } catch (err) {
@@ -835,5 +904,18 @@ def create_app(username: str, password: str) -> Flask:
             return jsonify([dict(row) for row in rows])
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/bot-log")
+    @basic_auth.required
+    def api_bot_log():
+        """Tail of bot log file (BOT_LOG_PATH or bot.log in cwd). Same file as bot FileHandler."""
+        from flask import request
+
+        try:
+            n = int(request.args.get("lines", "800"))
+        except ValueError:
+            n = 800
+        n = max(50, min(n, 5000))
+        return jsonify(read_bot_log_tail(max_lines=n))
 
     return app

@@ -32,6 +32,13 @@ def _configure_bot_logging() -> None:
         # Still run the bot if log file cannot be created (e.g. read-only cwd)
         sys.stderr.write(f"WARNING: Could not open {log_path} for logging: {e}\n")
 
+    # Do not propagate Werkzeug/Flask HTTP access logs to root (avoids flooding bot.log / journal).
+    for _name in ("werkzeug", "werkzeug.serving"):
+        _lg = logging.getLogger(_name)
+        _lg.handlers.clear()
+        _lg.propagate = False
+        _lg.setLevel(logging.CRITICAL)
+
     logging.info("Bot logging: stderr (journald) + file %s (override with BOT_LOG_PATH)", log_path)
 
 
