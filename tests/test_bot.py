@@ -1556,6 +1556,149 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
         self.assertEqual(s2_modify_count, 0)
 
 
+class TestAdjustSurvivorSlToCost(unittest.TestCase):
+    """Test _adjust_survivor_sl_to_cost_after_peer_sl — tighten survivor SL to entry after peer SL fills."""
+
+    def setUp(self):
+        self.index_config = IndexConfig(
+            name="NIFTY",
+            fno_symbol="NIFTY",
+            lot_size=65,
+            strike_diff=50,
+            spot_exchange_segment=1,
+            spot_instrument_id=26000,
+            option_ltp_segment=2,
+            option_exchange_segment="OPTIDX",
+            order_exchange_segment="NSEFO",
+            tick_size=0.05,
+        )
+
+    def _strategy_two_leg(self):
+        return {
+            "name": "N_T_1031",
+            "status": "OPEN",
+            "survivor_sl_adjusted_to_cost": False,
+            "sl_orders": [
+                {"app_order_id": 201, "tag": "N_T_1031_SL_111"},
+                {"app_order_id": 202, "tag": "N_T_1031_SL_222"},
+            ],
+            "sl_tag_map": {
+                "N_T_1031_SL_111": 111,
+                "N_T_1031_SL_222": 222,
+            },
+            "positions": [
+                {
+                    "instrument_id": 111,
+                    "entry_price": 100.0,
+                    "exit_price": 120.0,
+                    "closed_via": "SL_FILLED",
+                },
+                {"instrument_id": 222, "entry_price": 100.0, "exit_price": None},
+            ],
+        }
+
+    @patch("bot.update_strategy")
+    @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
+    def test_tightens_survivor_sl_to_cost(self, mock_update):
+        mock_client = MagicMock()
+        mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
+        order_book = [
+            {
+                "AppOrderID": 202,
+                "OrderStatus": "NEW",
+                "OrderQuantity": 65,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            }
+        ]
+        strategy = self._strategy_two_leg()
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=order_book
+            )
+        mock_client.modify_order.assert_called_once()
+        kwargs = mock_client.modify_order.call_args[1]
+        self.assertEqual(kwargs["order_type"], "STOPLIMIT")
+        self.assertEqual(kwargs["limit_price"], 100.0)
+        self.assertEqual(kwargs["stop_price"], 99.5)
+        mock_update.assert_called_once_with(
+            "N_T_1031", survivor_sl_adjusted_to_cost=True
+        )
+
+    @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", False)
+    def test_skips_when_feature_disabled(self):
+        mock_client = MagicMock()
+        strategy = self._strategy_two_leg()
+        order_book = [
+            {
+                "AppOrderID": 202,
+                "OrderStatus": "NEW",
+                "OrderQuantity": 65,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            }
+        ]
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=order_book
+            )
+        mock_client.modify_order.assert_not_called()
+
+    @patch("bot.update_strategy")
+    @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
+    def test_skips_when_first_leg_not_sl_filled(self, mock_update):
+        mock_client = MagicMock()
+        mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
+        strategy = self._strategy_two_leg()
+        strategy["positions"][0]["closed_via"] = "BROKER_SYNC"
+        order_book = [
+            {
+                "AppOrderID": 202,
+                "OrderStatus": "NEW",
+                "OrderQuantity": 65,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            }
+        ]
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=order_book
+            )
+        mock_client.modify_order.assert_not_called()
+        mock_update.assert_not_called()
+
+    @patch("bot.update_strategy")
+    @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
+    def test_second_call_noop_when_flag_set(self, mock_update):
+        mock_client = MagicMock()
+        mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
+        order_book = [
+            {
+                "AppOrderID": 202,
+                "OrderStatus": "NEW",
+                "OrderQuantity": 65,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            }
+        ]
+        strategy = self._strategy_two_leg()
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=order_book
+            )
+        self.assertEqual(mock_client.modify_order.call_count, 1)
+        strategy["survivor_sl_adjusted_to_cost"] = True
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=order_book
+            )
+        self.assertEqual(mock_client.modify_order.call_count, 1)
+
+
 class TestMainBlock(unittest.TestCase):
     """Test __main__ execution block."""
 

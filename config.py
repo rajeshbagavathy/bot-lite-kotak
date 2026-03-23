@@ -72,14 +72,17 @@ STRATEGIES = []  # Deprecated: use day-based plans below.
 #
 # Example: N_M_S10_1146 → NIFTY, Monday, slot S10 at 11:46.
 
-# Monday NIFTY – 14 lots total (sorted by time)
+# Monday NIFTY – 72 lots total (sorted by time)
+# S2_9.31am, S4_10.01am, S9_11.16am, S11_11.46am, S13_12.16pm, S16_1.01pm, S18_1.31pm, S21_2.16pm
 MONDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_M_1001", "10:01:00", 3, 20.0, 0.0),
-    StrategyConfig("N_M_1146", "11:46:00", 5, 20.0, 0.0),
-    StrategyConfig("N_M_1201", "12:01:00", 3, 20.0, 0.0),
-    StrategyConfig("N_M_1216", "12:16:00", 2, 20.0, 0.0),
-    StrategyConfig("N_M_1246", "12:46:00", 3, 20.0, 0.0),
-    StrategyConfig("N_M_1301", "13:01:00", 4, 20.0, 0.0),
+    StrategyConfig("N_M_0931", "09:31:00", 6, 20.0, 0.0),   # S2_9.31am
+    StrategyConfig("N_M_1001", "10:01:00", 14, 20.0, 0.0),  # S4_10.01am
+    StrategyConfig("N_M_1116", "11:16:00", 6, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("N_M_1146", "11:46:00", 15, 20.0, 0.0),  # S11_11.46am
+    StrategyConfig("N_M_1216", "12:16:00", 6, 20.0, 0.0),   # S13_12.16pm
+    StrategyConfig("N_M_1301", "13:01:00", 13, 20.0, 0.0),  # S16_1.01pm
+    StrategyConfig("N_M_1331", "13:31:00", 6, 20.0, 0.0),   # S18_1.31pm
+    StrategyConfig("N_M_1416", "14:16:00", 6, 20.0, 0.0),   # S21_2.16pm
 ]
 
 # Monday SENSEX – 6 lots total (sorted by time)
@@ -90,15 +93,17 @@ MONDAY_SENSEX_STRATEGIES = [
     StrategyConfig("X_M_1446", "14:46:00", 1, 20.0, 0.0),
 ]
 
-# Tuesday NIFTY – 60 lots total (sorted by time, expiry day plan)
+# Tuesday NIFTY – 72 lots total (sorted by time)
+# S2_9.31am, S6_10.31am, S8_11.01am, S10_11.31am, S12_12.01pm, S14_12.31pm, S17_1.16pm, S21_2.16pm
 TUESDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_T_1031", "10:31:00", 10, 20.0, 0.0),  # S5_10.31am – 10 lots
-    StrategyConfig("N_T_1046", "10:46:00", 10, 20.0, 0.0),  # S6_10.46am – 10 lots
-    StrategyConfig("N_T_1116", "11:16:00", 8, 20.0, 0.0),   # S8_11.16am – 8 lots
-    StrategyConfig("N_T_1131", "11:31:00", 7, 20.0, 0.0),   # S9_11.31am – 7 lots
-    StrategyConfig("N_T_1146", "11:46:00", 8, 20.0, 0.0),   # S10_11.46am – 8 lots
-    StrategyConfig("N_T_1201", "12:01:00", 5, 20.0, 0.0),   # S11_12.01pm – 5 lots
-    StrategyConfig("N_T_1231", "12:31:00", 12, 20.0, 0.0),  # S13_12.31pm – 12 lots
+    StrategyConfig("N_T_0931", "09:31:00", 6, 20.0, 0.0),   # S2_9.31am
+    StrategyConfig("N_T_1031", "10:31:00", 6, 20.0, 0.0),   # S6_10.31am
+    StrategyConfig("N_T_1101", "11:01:00", 6, 20.0, 0.0),   # S8_11.01am
+    StrategyConfig("N_T_1131", "11:31:00", 14, 20.0, 0.0),  # S10_11.31am
+    StrategyConfig("N_T_1201", "12:01:00", 6, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("N_T_1231", "12:31:00", 15, 20.0, 0.0),  # S14_12.31pm
+    StrategyConfig("N_T_1316", "13:16:00", 13, 20.0, 0.0),  # S17_1.16pm
+    StrategyConfig("N_T_1416", "14:16:00", 6, 20.0, 0.0),   # S21_2.16pm
 ]
 
 # Thursday SENSEX – 40 lots total (sorted by time)
@@ -178,6 +183,9 @@ STRIKE_PREMIUM_BUFFER_SENSEX = float(os.getenv("STRIKE_PREMIUM_BUFFER_SENSEX", "
 
 # Strategy-level SL: if False or strategy_sl <= 0, per-strategy stop-loss is not applied (only portfolio SL and leg SL apply).
 STRATEGY_SL_ENABLED = os.getenv("STRATEGY_SL_ENABLED", "False").lower() in ("true", "1", "yes")
+
+# After one leg's SL fills, tighten the surviving leg's SL to original short price (entry/cost).
+SURVIVOR_SL_TO_COST_ENABLED = os.getenv("SURVIVOR_SL_TO_COST_ENABLED", "True").lower() in ("true", "1", "yes")
 
 # Target premium for hedge selection (approx LTP per option).
 HEDGE_TARGET_PREMIUM_EXPIRY = float(os.getenv("HEDGE_TARGET_PREMIUM_EXPIRY", "5"))

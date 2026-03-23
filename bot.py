@@ -27,6 +27,7 @@ from config import (
     PORTFOLIO_SL_LIMIT,
     SOURCE,
     STRATEGY_SL_ENABLED,
+    SURVIVOR_SL_TO_COST_ENABLED,
     STRIKE_PREMIUM_BUFFER_NIFTY,
     STRIKE_PREMIUM_BUFFER_SENSEX,
     STRIKE_PREMIUM_TARGET_NIFTY,
@@ -926,6 +927,132 @@ def _sync_sl_order_status_and_capture_exits(
             matching_position["sl_status"] = "WAITING"
 
 
+def _adjust_survivor_sl_to_cost_after_peer_sl(
+    client: XTSClient,
+    index_config,
+    strategy: dict,
+    order_book: Optional[List[dict]] = None,
+) -> None:
+    """
+    After one leg of a short straddle is stopped out via SL (closed_via SL_FILLED),
+    tighten the surviving leg's stop-limit SL to the original short price (entry/cost).
+    """
+    if not SURVIVOR_SL_TO_COST_ENABLED:
+        return
+    if strategy["status"] != "OPEN" or strategy.get("survivor_sl_adjusted_to_cost"):
+        return
+    if not strategy.get("sl_orders"):
+        return
+    if client is None:
+        return
+
+    positions = strategy.get("positions") or []
+    if len(positions) != 2:
+        return
+
+    closed = [p for p in positions if p.get("exit_price") is not None]
+    open_pos = [p for p in positions if p.get("exit_price") is None]
+    if len(closed) != 1 or len(open_pos) != 1:
+        return
+    if closed[0].get("closed_via") != "SL_FILLED":
+        return
+
+    survivor = open_pos[0]
+    instrument_id = survivor.get("instrument_id")
+    entry_price = survivor.get("entry_price")
+    if instrument_id is None or entry_price is None or float(entry_price) <= 0:
+        return
+
+    sl_orders = strategy.get("sl_orders", []) or []
+    sl_tag_map = strategy.get("sl_tag_map", {}) or {}
+    survivor_sl: Optional[Tuple[int, str]] = None
+    for so in sl_orders:
+        tag = so.get("tag")
+        app_order_id = so.get("app_order_id")
+        if not tag or app_order_id is None:
+            continue
+        if sl_tag_map.get(tag) == instrument_id:
+            survivor_sl = (int(app_order_id), str(tag))
+            break
+    if not survivor_sl:
+        return
+
+    app_order_id, tag = survivor_sl
+
+    if order_book is None:
+        try:
+            order_book = client.get_order_book()
+        except Exception as e:
+            logger.error(
+                "Failed to fetch order book for survivor SL adjust %s: %s",
+                strategy["name"],
+                e,
+            )
+            return
+
+    order_book_map_by_id: Dict[int, dict] = {}
+    for order in order_book or []:
+        oid = order.get("AppOrderID")
+        try:
+            if oid is not None:
+                order_book_map_by_id[int(oid)] = order
+        except Exception:
+            pass
+
+    order_detail = order_book_map_by_id.get(app_order_id)
+    if not order_detail:
+        logger.warning(
+            "Survivor SL order not in order book for %s app_order_id=%s",
+            strategy["name"],
+            app_order_id,
+        )
+        return
+
+    order_status = (order_detail.get("OrderStatus") or "").replace(" ", "").upper()
+    _open_sl = {
+        "NEW",
+        "REPLACED",
+        "PENDING",
+        "OPEN",
+        "PARTIALLYFILLED",
+        "PARTIALLY_FILLED",
+    }
+    if order_status not in _open_sl:
+        return
+
+    tick = float(index_config.tick_size)
+    limit_price = _round_to_tick(float(entry_price), tick)
+    trigger = _round_to_tick(max(limit_price - 0.5, 0.05), tick)
+
+    try:
+        client.modify_order(
+            app_order_id=app_order_id,
+            product_type=order_detail.get("ProductType"),
+            order_type=client.interactive.ORDER_TYPE_STOPLIMIT,
+            quantity=int(order_detail.get("OrderQuantity", 0)),
+            disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
+            stop_price=float(round(trigger, 2)),
+            limit_price=float(round(limit_price, 2)),
+            time_in_force=order_detail.get("TimeInForce"),
+            tag=tag,
+        )
+        update_strategy(strategy["name"], survivor_sl_adjusted_to_cost=True)
+        logger.info(
+            "[%s] Survivor leg SL tightened to cost: instrument=%s limit=%.2f trigger=%.2f (entry=%.2f)",
+            strategy["name"],
+            instrument_id,
+            limit_price,
+            trigger,
+            float(entry_price),
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to modify survivor SL to cost for %s: %s",
+            strategy["name"],
+            e,
+        )
+
+
 def _check_leg_target_and_close(
     client: XTSClient, strategy: dict, ltp_map: Dict[int, float]
 ) -> None:
@@ -1187,6 +1314,9 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         # **FIRST**: Sync SL order status from XTS order book (single source of truth)
         _sync_sl_order_status_and_capture_exits(client, strategy, order_book=order_book)
 
+        # **SURVIVOR SL**: After one leg's SL fills, tighten the other leg's SL to original short price (cost)
+        _adjust_survivor_sl_to_cost_after_peer_sl(client, index_config, strategy, order_book=order_book)
+
         # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to market
         _check_leg_target_and_close(client, strategy, ltp_map)
         
@@ -1420,6 +1550,7 @@ def main() -> None:
                 "last_update": None,
                 "sl_tag_map": {},
                 "db_id": None,
+                "survivor_sl_adjusted_to_cost": False,
             }
 
     # Restore today's strategies from database (before init_state)
