@@ -1612,8 +1612,11 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
+                "OrderPrice": 100.0,
+                "OrderStopPrice": 99.5,
             }
         ]
+        mock_client.get_order_book.return_value = order_book
         strategy = self._strategy_two_leg()
         with patch("bot.logger"):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
@@ -1645,8 +1648,11 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
+                "OrderPrice": 100.0,
+                "OrderStopPrice": 99.5,
             }
         ]
+        mock_client.get_order_book.return_value = order_book
         strategy = self._strategy_two_leg()
         with patch("bot.logger"):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
@@ -1668,8 +1674,11 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
+                "OrderPrice": 100.0,
+                "OrderStopPrice": 99.5,
             }
         ]
+        mock_client.get_order_book.return_value = order_book
         with patch("bot.logger"):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
                 mock_client, self.index_config, strategy, order_book=order_book
@@ -1693,8 +1702,11 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
+                "OrderPrice": 100.0,
+                "OrderStopPrice": 99.5,
             }
         ]
+        mock_client.get_order_book.return_value = order_book
         with patch("bot.logger"):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
                 mock_client, self.index_config, strategy, order_book=order_book
@@ -1723,8 +1735,11 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
+                "OrderPrice": 100.0,
+                "OrderStopPrice": 99.5,
             }
         ]
+        mock_client.get_order_book.return_value = order_book
         with patch("bot.logger"):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
                 mock_client, self.index_config, strategy, order_book=order_book
@@ -1753,8 +1768,11 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
+                "OrderPrice": 100.0,
+                "OrderStopPrice": 99.5,
             }
         ]
+        mock_client.get_order_book.return_value = order_book
         with patch("bot.logger"):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(
                 mock_client, self.index_config, strategy, order_book=order_book
@@ -1782,6 +1800,7 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
                 "TimeInForce": "DAY",
             }
         ]
+        mock_client.get_order_book.return_value = order_book
         strategy = self._strategy_two_leg()
         with patch("bot.logger"):
             bot._adjust_survivor_sl_to_cost_after_peer_sl(

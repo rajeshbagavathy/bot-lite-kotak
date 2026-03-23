@@ -1071,6 +1071,19 @@ def _xts_modify_order_ok(resp: Any) -> bool:
     return True
 
 
+def _extract_first_float(order: dict, *keys: str) -> Optional[float]:
+    """Best-effort float extractor across broker field name variants."""
+    for k in keys:
+        try:
+            v = order.get(k)
+            if v is None:
+                continue
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _adjust_survivor_sl_to_cost_after_peer_sl(
     client: XTSClient,
     index_config,
@@ -1202,26 +1215,44 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
     trigger = _round_to_tick(max(limit_price - 0.5, 0.05), tick)
 
     qty = int(order_detail.get("OrderQuantity", 0))
+    if qty <= 0:
+        qty = int(abs(float(survivor.get("quantity") or 0)))
+    if qty <= 0:
+        _hint_survivor_sl_to_cost(strategy, "Survivor SL modify skipped: quantity resolved to 0.")
+        return
+    product_type = (
+        order_detail.get("ProductType")
+        or getattr(client.interactive, "PRODUCT_MIS", None)
+        or "MIS"
+    )
+    time_in_force = (
+        order_detail.get("TimeInForce")
+        or getattr(client.interactive, "VALIDITY_DAY", None)
+        or "DAY"
+    )
+    disclosed_qty = int(order_detail.get("OrderDisclosedQuantity", 0) or 0)
     try:
         logger.warning(
             "[%s] Survivor SL-to-cost ATTEMPT: modify_order STOPLIMIT app_order_id=%s tag=%s "
-            "limit_price=%.2f stop_price=%.2f qty=%s",
+            "product=%s tif=%s limit_price=%.2f stop_price=%.2f qty=%s",
             strategy["name"],
             app_order_id,
             tag,
+            product_type,
+            time_in_force,
             limit_price,
             trigger,
             qty,
         )
         resp = client.modify_order(
             app_order_id=app_order_id,
-            product_type=order_detail.get("ProductType"),
+            product_type=product_type,
             order_type=client.interactive.ORDER_TYPE_STOPLIMIT,
             quantity=qty,
-            disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
+            disclosed_quantity=disclosed_qty,
             stop_price=float(round(trigger, 2)),
             limit_price=float(round(limit_price, 2)),
-            time_in_force=order_detail.get("TimeInForce"),
+            time_in_force=time_in_force,
             tag=tag,
         )
         try:
@@ -1243,6 +1274,52 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
                 strategy,
                 f"modify_order API no result: {resp_str[:200]}",
             )
+            return
+        # Verify broker-side price update in order book before marking done.
+        verified = False
+        verify_reason = "unknown"
+        for _ in range(2):
+            try:
+                verify_book = client.get_order_book()
+                verify_map: Dict[int, dict] = {}
+                for o in verify_book or []:
+                    oid = o.get("AppOrderID")
+                    try:
+                        if oid is not None:
+                            verify_map[int(oid)] = o
+                    except Exception:
+                        continue
+                vo = verify_map.get(app_order_id)
+                if not vo:
+                    verify_reason = f"app_order_id={app_order_id} missing in verify order book"
+                    time.sleep(0.25)
+                    continue
+                v_limit = _extract_first_float(vo, "OrderPrice", "LimitPrice")
+                v_stop = _extract_first_float(vo, "OrderStopPrice", "StopPrice", "TriggerPrice")
+                if v_limit is None or v_stop is None:
+                    verify_reason = "verify order missing limit/stop fields"
+                    time.sleep(0.25)
+                    continue
+                tol = max(tick, 0.05) + 0.01
+                if abs(v_limit - limit_price) <= tol and abs(v_stop - trigger) <= tol:
+                    verified = True
+                    break
+                verify_reason = (
+                    f"verify mismatch expected(limit={limit_price:.2f},stop={trigger:.2f}) "
+                    f"got(limit={v_limit:.2f},stop={v_stop:.2f})"
+                )
+                time.sleep(0.25)
+            except Exception as e:
+                verify_reason = f"verify order book fetch failed: {e}"
+                time.sleep(0.25)
+        if not verified:
+            logger.error(
+                "[%s] Survivor SL-to-cost: modify accepted but not verified; %s. "
+                "Will retry on next MTM.",
+                strategy["name"],
+                verify_reason,
+            )
+            _hint_survivor_sl_to_cost(strategy, f"verify failed: {verify_reason}"[:220])
             return
         update_strategy(
             strategy["name"],
