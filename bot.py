@@ -1,5 +1,6 @@
 import datetime
 import functools
+import json
 import logging
 import math
 import os
@@ -1032,6 +1033,35 @@ def _hint_survivor_sl_to_cost(strategy: dict, msg: str) -> None:
     update_strategy(strategy["name"], survivor_sl_to_cost_hint=msg[:240])
 
 
+_SURVIVOR_SL_TO_COST_LOG_THROTTLE: Dict[str, float] = {}
+
+
+def _survivor_sl_to_cost_warn_throttled(
+    strategy_name: str, msg: str, interval_sec: float = 90.0
+) -> None:
+    """Avoid spamming WARNING every MTM tick when survivor adjust is blocked."""
+    key = f"{strategy_name}|{msg[:160]}"
+    now = time.time()
+    if now - _SURVIVOR_SL_TO_COST_LOG_THROTTLE.get(key, 0) < interval_sec:
+        return
+    _SURVIVOR_SL_TO_COST_LOG_THROTTLE[key] = now
+    logger.warning("[%s] Survivor SL-to-cost: %s", strategy_name, msg)
+
+
+def _xts_modify_order_ok(resp: Any) -> bool:
+    """
+    True if modify_order returned a successful XTS payload.
+    None/unknown is treated as OK for backward compatibility (e.g. mocks).
+    """
+    if resp is None:
+        return True
+    if isinstance(resp, str):
+        return False
+    if isinstance(resp, dict):
+        return resp.get("result") is not None
+    return True
+
+
 def _adjust_survivor_sl_to_cost_after_peer_sl(
     client: XTSClient,
     index_config,
@@ -1068,11 +1098,10 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         return
     peer_via = closed[0].get("closed_via")
     if peer_via not in _SURVIVOR_PEER_CLOSED_VIA_OK:
-        logger.debug(
-            "[%s] Survivor SL-to-cost skipped: closed leg closed_via=%s (allowed %s)",
+        _survivor_sl_to_cost_warn_throttled(
             strategy["name"],
-            peer_via,
-            sorted(_SURVIVOR_PEER_CLOSED_VIA_OK),
+            f"blocked: closed leg closed_via={peer_via!r} (allowed {sorted(_SURVIVOR_PEER_CLOSED_VIA_OK)})",
+            interval_sec=90.0,
         )
         _hint_survivor_sl_to_cost(
             strategy,
@@ -1131,7 +1160,7 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
     order_detail = order_book_map_by_id.get(app_order_id)
     if not order_detail:
         logger.warning(
-            "Survivor SL order not in order book for %s app_order_id=%s",
+            "[%s] Survivor SL-to-cost: SL order not in order book app_order_id=%s",
             strategy["name"],
             app_order_id,
         )
@@ -1161,25 +1190,56 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
     limit_price = _round_to_tick(float(entry_price), tick)
     trigger = _round_to_tick(max(limit_price - 0.5, 0.05), tick)
 
+    qty = int(order_detail.get("OrderQuantity", 0))
     try:
-        client.modify_order(
+        logger.warning(
+            "[%s] Survivor SL-to-cost ATTEMPT: modify_order STOPLIMIT app_order_id=%s tag=%s "
+            "limit_price=%.2f stop_price=%.2f qty=%s",
+            strategy["name"],
+            app_order_id,
+            tag,
+            limit_price,
+            trigger,
+            qty,
+        )
+        resp = client.modify_order(
             app_order_id=app_order_id,
             product_type=order_detail.get("ProductType"),
             order_type=client.interactive.ORDER_TYPE_STOPLIMIT,
-            quantity=int(order_detail.get("OrderQuantity", 0)),
+            quantity=qty,
             disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
             stop_price=float(round(trigger, 2)),
             limit_price=float(round(limit_price, 2)),
             time_in_force=order_detail.get("TimeInForce"),
             tag=tag,
         )
+        try:
+            resp_str = json.dumps(resp, default=str)[:1500]
+        except Exception:
+            resp_str = repr(resp)[:1500]
+        logger.warning(
+            "[%s] Survivor SL-to-cost API response: %s",
+            strategy["name"],
+            resp_str,
+        )
+        if not _xts_modify_order_ok(resp):
+            logger.error(
+                "[%s] Survivor SL-to-cost: broker rejected modify (empty/missing result). "
+                "SL not marked tightened; will retry on next MTM.",
+                strategy["name"],
+            )
+            _hint_survivor_sl_to_cost(
+                strategy,
+                f"modify_order API no result: {resp_str[:200]}",
+            )
+            return
         update_strategy(
             strategy["name"],
             survivor_sl_adjusted_to_cost=True,
             survivor_sl_to_cost_hint="Done: survivor SL tightened to cost.",
         )
         logger.warning(
-            "[%s] Survivor leg SL tightened to cost: instrument=%s limit=%.2f trigger=%.2f (entry=%.2f)",
+            "[%s] Survivor SL-to-cost OK: instrument=%s limit=%.2f trigger=%.2f (entry=%.2f)",
             strategy["name"],
             instrument_id,
             limit_price,
@@ -1188,7 +1248,7 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         )
     except Exception as e:
         logger.error(
-            "Failed to modify survivor SL to cost for %s: %s",
+            "[%s] Survivor SL-to-cost: modify_order raised: %s",
             strategy["name"],
             e,
         )

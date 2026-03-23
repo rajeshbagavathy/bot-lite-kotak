@@ -1,7 +1,7 @@
 import datetime
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from Connect import XTSConnect
 from config import IndexConfig
@@ -188,7 +188,7 @@ class XTSClient:
         limit_price: float,
         time_in_force: str,
         tag: str,
-    ) -> None:
+    ) -> Any:
         """
         Modify an existing order (e.g., convert SL to market execution).
 
@@ -205,8 +205,11 @@ class XTSClient:
             stop_price: Stop/trigger leg (STOPLIMIT); use 0 for market
             time_in_force: Time in force (DAY, etc.)
             tag: Order unique identifier
+
+        Returns:
+            Raw API response dict from Connect (or error string on some failures). Caller should check ``result``.
         """
-        self.interactive.modify_order(
+        return self.interactive.modify_order(
             app_order_id,
             product_type,
             order_type,

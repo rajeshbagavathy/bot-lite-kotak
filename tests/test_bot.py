@@ -1602,6 +1602,7 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
     def test_tightens_survivor_sl_to_cost(self, mock_update):
         mock_client = MagicMock()
+        mock_client.modify_order.return_value = {"result": {"AppOrderID": 202}}
         mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
         order_book = [
             {
@@ -1628,6 +1629,32 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
             survivor_sl_adjusted_to_cost=True,
             survivor_sl_to_cost_hint="Done: survivor SL tightened to cost.",
         )
+
+    @patch("bot.update_strategy")
+    @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
+    def test_no_mark_done_when_api_returns_no_result(self, mock_update):
+        """Empty API result: do not set survivor_sl_adjusted_to_cost (retry next MTM)."""
+        mock_client = MagicMock()
+        mock_client.modify_order.return_value = {"result": None}
+        mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
+        order_book = [
+            {
+                "AppOrderID": 202,
+                "OrderStatus": "NEW",
+                "OrderQuantity": 65,
+                "OrderDisclosedQuantity": 0,
+                "ProductType": "MIS",
+                "TimeInForce": "DAY",
+            }
+        ]
+        strategy = self._strategy_two_leg()
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=order_book
+            )
+        mock_client.modify_order.assert_called_once()
+        for call in mock_update.call_args_list:
+            self.assertNotIn("survivor_sl_adjusted_to_cost", call[1])
 
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", False)
     def test_skips_when_feature_disabled(self):
@@ -1680,6 +1707,7 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
     def test_tightens_when_peer_closed_via_restored_db(self, mock_update):
         """After DB restart, closed leg has closed_via=RESTORED — survivor adjust still runs."""
         mock_client = MagicMock()
+        mock_client.modify_order.return_value = {"result": {"AppOrderID": 202}}
         mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
         strategy = self._strategy_two_leg()
         strategy["positions"][0]["closed_via"] = "RESTORED"
@@ -1709,6 +1737,7 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
     def test_tightens_when_peer_closed_via_broker_sync(self, mock_update):
         """Live: order book may miss FILLED; broker sync marks peer closed — still tighten survivor."""
         mock_client = MagicMock()
+        mock_client.modify_order.return_value = {"result": {"AppOrderID": 202}}
         mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
         strategy = self._strategy_two_leg()
         strategy["positions"][0]["closed_via"] = "BROKER_SYNC"
@@ -1737,6 +1766,7 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
     def test_second_call_noop_when_flag_set(self, mock_update):
         mock_client = MagicMock()
+        mock_client.modify_order.return_value = {"result": {"AppOrderID": 202}}
         mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
         order_book = [
             {

@@ -13,5 +13,8 @@ def bot_log_line_is_survivor_event(line: str) -> bool:
             "failed to fetch order book for survivor",
             "survivor sl order not in order book",
             "survivor sl-to-cost",
+            "survivor sl-to-cost attempt",
+            "survivor sl-to-cost api response",
+            "survivor sl-to-cost ok",
         )
     )
