@@ -106,12 +106,17 @@ TUESDAY_NIFTY_STRATEGIES = [
     StrategyConfig("N_T_1416", "14:16:00", 6, 20.0, 0.0),   # S21_2.16pm
 ]
 
-# Thursday SENSEX – 40 lots total (sorted by time)
+# Thursday SENSEX – 72 lots total (sorted by time)
+# Slot / score / note from expectancy backtest (see table in repo history).
 THURSDAY_SENSEX_STRATEGIES = [
-    StrategyConfig("X_H_1001", "10:01:00", 8, 20.0, 0.0),
-    StrategyConfig("X_H_1016", "10:16:00", 12, 20.0, 0.0),
-    StrategyConfig("X_H_1031", "10:31:00", 10, 20.0, 0.0),
-    StrategyConfig("X_H_1131", "11:31:00", 10, 20.0, 0.0),
+    StrategyConfig("X_H_0946", "09:46:00", 14, 20.0, 0.0),  # S3_9.46am  score 2.876  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("X_H_1016", "10:16:00", 15, 20.0, 0.0),  # S5_10.16am score 2.436  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("X_H_1101", "11:01:00", 6, 20.0, 0.0),   # S8_11.01am score -0.081 High expectancy, solid Return/MDD
+    StrategyConfig("X_H_1131", "11:31:00", 6, 20.0, 0.0),  # S10_11.31am score -3.693 Diversification / score
+    StrategyConfig("X_H_1231", "12:31:00", 6, 20.0, 0.0),  # S14_12.31pm score -1.267 Diversification / score
+    StrategyConfig("X_H_1301", "13:01:00", 6, 20.0, 0.0),  # S16_1.01pm  score 0.317  High expectancy, stable streaks
+    StrategyConfig("X_H_1331", "13:31:00", 6, 20.0, 0.0),  # S18_1.31pm  score -2.149 Diversification / score
+    StrategyConfig("X_H_1401", "14:01:00", 13, 20.0, 0.0),  # S20_2.01pm  score 1.560  solid Return/MDD, stable streaks
 ]
 
 # Friday NIFTY – 20 lots total (sorted by time)
