@@ -119,13 +119,16 @@ THURSDAY_SENSEX_STRATEGIES = [
     StrategyConfig("X_H_1401", "14:01:00", 13, 20.0, 0.0),  # S20_2.01pm  score 1.560  solid Return/MDD, stable streaks
 ]
 
-# Friday NIFTY – 20 lots total (sorted by time)
+# Friday NIFTY – 72 lots total (sorted by time)
 FRIDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_F_0931", "09:31:00", 5, 20.0, 0.0),  # S1_9.31am – 5 lots
-    StrategyConfig("N_F_0946", "09:46:00", 2, 20.0, 0.0),  # S2_9.46am – 2 lots
-    StrategyConfig("N_F_1001", "10:01:00", 4, 20.0, 0.0),  # S3_10.01am – 4 lots
-    StrategyConfig("N_F_1031", "10:31:00", 3, 20.0, 0.0),  # S5_10.31am – 3 lots
-    StrategyConfig("N_F_1116", "11:16:00", 6, 20.0, 0.0),  # S8_11.16am – 6 lots
+    StrategyConfig("N_F_0931", "09:31:00", 14, 20.0, 0.0),  # S2_9.31am  score 2.912  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1031", "10:31:00", 13, 20.0, 0.0),  # S6_10.31am score 1.318  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1101", "11:01:00", 15, 20.0, 0.0),  # S8_11.01am score 1.710  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1131", "11:31:00", 6, 20.0, 0.0),   # S10_11.31am score -2.037 High expectancy
+    StrategyConfig("N_F_1231", "12:31:00", 6, 20.0, 0.0),   # S14_12.31pm score -0.951 solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1301", "13:01:00", 6, 20.0, 0.0),   # S16_1.01pm  score -2.403 Diversification / score
+    StrategyConfig("N_F_1401", "14:01:00", 6, 20.0, 0.0),   # S20_2.01pm  score -0.548 stable streaks
+    StrategyConfig("N_F_1431", "14:31:00", 6, 20.0, 0.0),   # S22_2.31pm  score -0.000 stable streaks
 ]
 
 
