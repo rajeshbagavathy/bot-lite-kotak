@@ -198,7 +198,8 @@ def _find_hedge_by_target_premium(
     max_steps: int = 40,
 ) -> Optional[dict]:
     """
-    Find a far-OTM hedge option with LTP within [min_premium, max_premium], closest to target_premium.
+    Find a far-OTM hedge option with LTP within [min_premium, max_premium], preferring
+    the *lowest* premium in range (closest to min_premium).
     For CE: scans strikes above ATM; For PE: scans strikes below ATM.
     Returns dict with strike, instrument_id, ltp.
     """
@@ -224,7 +225,7 @@ def _find_hedge_by_target_premium(
     ]
     ltp_map = client.get_ltp_map(instruments)
 
-    best = None  # (abs_diff, strike, instrument_id, ltp)
+    best = None  # (distance_from_min, strike, instrument_id, ltp)
     for strike, instrument_id in candidates:
         ltp = ltp_map.get(instrument_id)
         if ltp is None:
@@ -235,7 +236,9 @@ def _find_hedge_by_target_premium(
             continue
         if not (min_premium <= ltp_val <= max_premium):
             continue
-        diff = abs(ltp_val - float(target_premium))
+        # User intent: when range is 2-8, prefer 2-ish hedge (cheapest in range),
+        # not mid/high values. Keep stable tiebreak by strike proximity via scan order.
+        diff = ltp_val - float(min_premium)
         if best is None or diff < best[0]:
             best = (diff, strike, instrument_id, ltp_val)
 
@@ -344,85 +347,100 @@ def _ensure_margin_or_skip_strategy(
         ),
     )
 
-    pe_hedge = _find_hedge_by_target_premium(
-        client=client,
-        index_config=index_config,
-        expiry=expiry,
-        option_type="PE",
-        atm_strike=atm_strike,
-        target_premium=target_premium,
-        min_premium=min_premium,
-        max_premium=max_premium,
-    )
-    ce_hedge = _find_hedge_by_target_premium(
-        client=client,
-        index_config=index_config,
-        expiry=expiry,
-        option_type="CE",
-        atm_strike=atm_strike,
-        target_premium=target_premium,
-        min_premium=min_premium,
-        max_premium=max_premium,
-    )
-
-    if not pe_hedge or not ce_hedge:
-        update_strategy(name, status="ERROR", message="Margin low; unable to find hedge options")
-        return False
-
     hedge_multiplier = float(HEDGE_QTY_MULTIPLIER_EXPIRY) if is_expiry else float(HEDGE_QTY_MULTIPLIER_NON_EXPIRY)
     hedge_qty = int(math.ceil(strategy_lots * hedge_multiplier)) * int(index_config.lot_size)
-    hedge_orders = []
-    for hedge, side in ((pe_hedge, "PE"), (ce_hedge, "CE")):
-        tag = f"{name}_HEDGE_{side}_BUY_{int(time.time())}"
-        oid = client.place_market_order(
-            index_config=index_config,
-            instrument_id=int(hedge["instrument_id"]),
-            order_side=client.interactive.TRANSACTION_TYPE_BUY,
-            quantity=hedge_qty,
-            tag=tag,
-            product_type=client.interactive.PRODUCT_MIS,
-        )
-        if oid:
-            hedge_orders.append({"app_order_id": oid, "tag": tag, "instrument_id": int(hedge["instrument_id"])})
-        else:
-            # Rollback any hedge order already placed
-            for placed in hedge_orders:
-                try:
-                    client.cancel_order(placed["app_order_id"], placed["tag"])
-                except Exception:
-                    logger.exception("Failed to cancel hedge order %s", placed)
-            # If anything got filled, close using broker positions
-            try:
-                positions = client.get_positions()
-                _close_positions_for_instruments(
-                    client,
-                    index_config,
-                    positions,
-                    [p["instrument_id"] for p in hedge_orders],
-                )
-            except Exception:
-                logger.exception("Failed to rollback hedge positions for %s", name)
+    all_hedge_orders: List[dict] = []
+    last_available = available
+    max_rounds = 2
 
-            update_strategy(name, status="ERROR", message="Margin low; hedge order placement failed")
+    for round_idx in range(1, max_rounds + 1):
+        pe_hedge = _find_hedge_by_target_premium(
+            client=client,
+            index_config=index_config,
+            expiry=expiry,
+            option_type="PE",
+            atm_strike=atm_strike,
+            target_premium=target_premium,
+            min_premium=min_premium,
+            max_premium=max_premium,
+        )
+        ce_hedge = _find_hedge_by_target_premium(
+            client=client,
+            index_config=index_config,
+            expiry=expiry,
+            option_type="CE",
+            atm_strike=atm_strike,
+            target_premium=target_premium,
+            min_premium=min_premium,
+            max_premium=max_premium,
+        )
+
+        if not pe_hedge or not ce_hedge:
+            update_strategy(name, status="ERROR", message="Margin low; unable to find hedge options")
             return False
 
+        round_orders: List[dict] = []
+        for hedge, side in ((pe_hedge, "PE"), (ce_hedge, "CE")):
+            tag = f"{name}_HEDGE_R{round_idx}_{side}_BUY_{int(time.time())}"
+            oid = client.place_market_order(
+                index_config=index_config,
+                instrument_id=int(hedge["instrument_id"]),
+                order_side=client.interactive.TRANSACTION_TYPE_BUY,
+                quantity=hedge_qty,
+                tag=tag,
+                product_type=client.interactive.PRODUCT_MIS,
+            )
+            if oid:
+                order_rec = {"app_order_id": oid, "tag": tag, "instrument_id": int(hedge["instrument_id"])}
+                round_orders.append(order_rec)
+                all_hedge_orders.append(order_rec)
+            else:
+                # Rollback orders from this round only.
+                for placed in round_orders:
+                    try:
+                        client.cancel_order(placed["app_order_id"], placed["tag"])
+                    except Exception:
+                        logger.exception("Failed to cancel hedge order %s", placed)
+                # If anything got filled, close using broker positions.
+                try:
+                    positions = client.get_positions()
+                    _close_positions_for_instruments(
+                        client,
+                        index_config,
+                        positions,
+                        [p["instrument_id"] for p in round_orders],
+                    )
+                except Exception:
+                    logger.exception("Failed to rollback hedge positions for %s", name)
+
+                update_strategy(name, status="ERROR", message="Margin low; hedge order placement failed")
+                return False
+
+        update_strategy(
+            name,
+            hedge_orders=all_hedge_orders,
+            hedge_target_premium=target_premium,
+            hedge_qty=hedge_qty,
+            hedge_strikes={"PE": pe_hedge.get("strike"), "CE": ce_hedge.get("strike")},
+            message=f"Hedge round {round_idx}/{max_rounds} placed; rechecking margin",
+        )
+
+        time.sleep(3)
+        last_available = client.get_available_margin()
+        update_portfolio_margin(last_available)
+        if last_available is not None and float(last_available) >= required_margin:
+            update_strategy(name, message=f"Margin improved ({last_available}); proceeding with straddle")
+            return True
+
+    # Still insufficient after both rounds: keep hedges open and skip strategy.
     update_strategy(
         name,
-        hedge_orders=hedge_orders,
-        hedge_target_premium=target_premium,
-        hedge_qty=hedge_qty,
-        hedge_strikes={"PE": pe_hedge.get("strike"), "CE": ce_hedge.get("strike")},
+        status="ERROR",
+        message=(
+            "MARGIN_NOT_AVAILABLE: margin not available even after two hedge rounds "
+            f"(required {required_margin:.0f}, available {last_available})"
+        ),
     )
-
-    time.sleep(3)
-    available2 = client.get_available_margin()
-    update_portfolio_margin(available2)
-    if available2 is not None and float(available2) >= required_margin:
-        update_strategy(name, message=f"Margin improved ({available2}); proceeding with straddle")
-        return True
-
-    # Still insufficient: leave hedge positions open and skip strategy.
-    update_strategy(name, status="ERROR", message="MARGIN_NOT_AVAILABLE: margin not available even after hedges")
     return False
 
 

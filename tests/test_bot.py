@@ -437,12 +437,14 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     def test_non_expiry_day_hedge_quantity_and_failure(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
     ):
-        self.client.get_available_margin.side_effect = [1000000.0, 2000000.0]
+        self.client.get_available_margin.side_effect = [1000000.0, 2000000.0, 2200000.0]
         mock_find_hedge.side_effect = [
             {"strike": 100, "instrument_id": 111, "ltp": 5.0},
             {"strike": 200, "instrument_id": 222, "ltp": 5.1},
+            {"strike": 100, "instrument_id": 111, "ltp": 5.0},
+            {"strike": 200, "instrument_id": 222, "ltp": 5.1},
         ]
-        self.client.place_market_order.side_effect = [201, 202]
+        self.client.place_market_order.side_effect = [201, 202, 203, 204]
 
         with patch("bot.time.sleep") as mock_sleep:
             result = bot._ensure_margin_or_skip_strategy(
@@ -454,11 +456,13 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
             )
 
         self.assertFalse(result)
-        mock_sleep.assert_called_once_with(3)
-        self.assertEqual(self.client.place_market_order.call_count, 2)
+        self.assertEqual(mock_sleep.call_count, 2)
+        self.assertEqual(self.client.place_market_order.call_count, 4)
         self.assertEqual(self.client.place_market_order.call_args_list[0][1]["quantity"], 750)
         self.assertEqual(self.client.place_market_order.call_args_list[1][1]["quantity"], 750)
-        mock_update_strategy.assert_any_call("S0920", status="ERROR", message="MARGIN_NOT_AVAILABLE: margin not available even after hedges")
+        self.assertEqual(self.client.place_market_order.call_args_list[2][1]["quantity"], 750)
+        self.assertEqual(self.client.place_market_order.call_args_list[3][1]["quantity"], 750)
+        self.assertIn("MARGIN_NOT_AVAILABLE: margin not available even after two hedge rounds", str(mock_update_strategy.call_args_list))
 
 
 class TestClosePositionsForInstruments(unittest.TestCase):
