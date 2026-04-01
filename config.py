@@ -106,17 +106,28 @@ TUESDAY_NIFTY_STRATEGIES = [
     StrategyConfig("N_T_1416", "14:16:00", 6, 20.0, 0.0),   # S21_2.16pm
 ]
 
-# Wednesday NIFTY – lots = floor(table_lots / 2) per slot (e.g. S1 15 → 7)
+# Wednesday – same slots/lots for NIFTY and SENSEX; lots = floor(table_lots / 2).
+# Bot picks one index by nearest expiry (SENSEX wins ties), so both lists must exist or the portal shows no rows.
 # S1_9.21am, S3_9.46am, S7_10.46am, S9_11.16am, S12_12.01pm, S16_1.01pm, S19_1.46pm, S21_2.16pm
+WEDNESDAY_NIFTY_STRATEGIES = [
+    StrategyConfig("N_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am
+    StrategyConfig("N_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am
+    StrategyConfig("N_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am
+    StrategyConfig("N_W_1116", "11:16:00", 3, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("N_W_1201", "12:01:00", 3, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("N_W_1301", "13:01:00", 3, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("N_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm
+    StrategyConfig("N_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm
+]
 WEDNESDAY_SENSEX_STRATEGIES = [
-    StrategyConfig("N_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am  score 2.256
-    StrategyConfig("N_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am  score 3.991
-    StrategyConfig("N_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am score 1.237
-    StrategyConfig("N_W_1116", "11:16:00", 3, 20.0, 0.0),   # S9_11.16am score -2.248
-    StrategyConfig("N_W_1201", "12:01:00", 3, 20.0, 0.0),   # S12_12.01pm score -2.906
-    StrategyConfig("N_W_1301", "13:01:00", 3, 20.0, 0.0),   # S16_1.01pm  score -1.043
-    StrategyConfig("N_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm score -0.961
-    StrategyConfig("N_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm score -0.326
+    StrategyConfig("X_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am
+    StrategyConfig("X_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am
+    StrategyConfig("X_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am
+    StrategyConfig("X_W_1116", "11:16:00", 3, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("X_W_1201", "12:01:00", 3, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("X_W_1301", "13:01:00", 3, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("X_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm
+    StrategyConfig("X_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm
 ]
 
 # Thursday SENSEX – 72 lots total (sorted by time)
@@ -163,6 +174,8 @@ def get_today_strategies(index_name: str) -> list[StrategyConfig]:
     if weekday == 2:  # Wednesday
         if index_name.upper() == "NIFTY":
             return WEDNESDAY_NIFTY_STRATEGIES
+        if index_name.upper() == "SENSEX":
+            return WEDNESDAY_SENSEX_STRATEGIES
     if weekday == 3:  # Thursday
         if index_name.upper() == "SENSEX":
             return THURSDAY_SENSEX_STRATEGIES
