@@ -108,7 +108,7 @@ TUESDAY_NIFTY_STRATEGIES = [
 
 # Wednesday NIFTY – lots = floor(table_lots / 2) per slot (e.g. S1 15 → 7)
 # S1_9.21am, S3_9.46am, S7_10.46am, S9_11.16am, S12_12.01pm, S16_1.01pm, S19_1.46pm, S21_2.16pm
-WEDNESDAY_NIFTY_STRATEGIES = [
+WEDNESDAY_SENSEX_STRATEGIES = [
     StrategyConfig("N_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am  score 2.256
     StrategyConfig("N_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am  score 3.991
     StrategyConfig("N_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am score 1.237
