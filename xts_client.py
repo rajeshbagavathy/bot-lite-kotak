@@ -4,9 +4,30 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from Connect import XTSConnect
-from config import IndexConfig
+from config import IndexConfig, MARKETABLE_LIMIT_SLIPPAGE_PCT
 
 logger = logging.getLogger(__name__)
+
+
+def round_to_tick(price: float, tick_size: float) -> float:
+    if tick_size and tick_size > 0:
+        return round(price / tick_size) * tick_size
+    return price
+
+
+def marketable_limit_price(
+    ltp: float,
+    order_side: str,
+    slippage_pct: float,
+    tick_size: float,
+) -> float:
+    """BUY: LTP * (1 + s); SELL: LTP * (1 - s). ``slippage_pct`` is fractional (0.01 = 1%)."""
+    side = (order_side or "").strip().upper()
+    if side == XTSConnect.TRANSACTION_TYPE_BUY:
+        raw = ltp * (1 + slippage_pct)
+    else:
+        raw = ltp * (1 - slippage_pct)
+    return round_to_tick(raw, tick_size)
 
 
 class XTSClient:
@@ -115,6 +136,19 @@ class XTSClient:
         ltp_map = self.get_ltp_map(instruments)
         return ltp_map.get(index_config.spot_instrument_id)
 
+    def get_option_ltp(self, index_config: IndexConfig, instrument_id: int) -> Optional[float]:
+        instruments = [
+            {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": instrument_id}
+        ]
+        ltp_map = self.get_ltp_map(instruments)
+        ltp = ltp_map.get(int(instrument_id))
+        if ltp is None:
+            return None
+        try:
+            return float(ltp)
+        except (TypeError, ValueError):
+            return None
+
     def place_market_order(
         self,
         index_config: IndexConfig,
@@ -123,17 +157,33 @@ class XTSClient:
         quantity: int,
         tag: str,
         product_type: str,
+        ltp: Optional[float] = None,
+        slippage_pct: Optional[float] = None,
     ) -> Optional[int]:
+        """
+        Place a marketable LIMIT order (LTP +/- slippage, tick-rounded). ``ltp`` optional when caller batched quotes.
+        """
+        s = MARKETABLE_LIMIT_SLIPPAGE_PCT if slippage_pct is None else slippage_pct
+        ltp_val = ltp if ltp is not None else self.get_option_ltp(index_config, instrument_id)
+        if ltp_val is None:
+            logger.warning("No LTP for instrument %s; cannot place marketable limit order", instrument_id)
+            return None
+        limit_price = marketable_limit_price(
+            float(ltp_val),
+            order_side,
+            s,
+            float(index_config.tick_size),
+        )
         response = self.interactive.place_order(
             exchangeSegment=index_config.order_exchange_segment,
             exchangeInstrumentID=instrument_id,
             productType=product_type,
-            orderType=self.interactive.ORDER_TYPE_MARKET,
+            orderType=self.interactive.ORDER_TYPE_LIMIT,
             orderSide=order_side,
             timeInForce=self.interactive.VALIDITY_DAY,
             disclosedQuantity=0,
             orderQuantity=quantity,
-            limitPrice=0,
+            limitPrice=float(limit_price),
             stopPrice=0,
             orderUniqueIdentifier=tag,
             clientID=self.client_id,
@@ -190,7 +240,7 @@ class XTSClient:
         tag: str,
     ) -> Any:
         """
-        Modify an existing order (e.g., convert SL to market execution).
+        Modify an existing order (e.g., convert SL to marketable LIMIT execution).
 
         Connect.modify_order(...) expects XTS params in this order (see Connect.py):
         modifiedLimitPrice, modifiedStopPrice — same as typical xt.modify_order(modifiedLimitPrice=..., modifiedStopPrice=...).
@@ -198,11 +248,11 @@ class XTSClient:
         Args:
             app_order_id: AppOrderID of the order to modify
             product_type: Product type (MIS, CNC, etc.)
-            order_type: New order type (MARKET, LIMIT, STOPLIMIT)
+            order_type: New order type (LIMIT, STOPLIMIT, etc.)
             quantity: Order quantity
             disclosed_quantity: Disclosed quantity
-            limit_price: Limit leg (STOPLIMIT); use 0 for market
-            stop_price: Stop/trigger leg (STOPLIMIT); use 0 for market
+            limit_price: Limit price for LIMIT; limit leg for STOPLIMIT
+            stop_price: Stop/trigger leg (STOPLIMIT); use 0 for plain LIMIT
             time_in_force: Time in force (DAY, etc.)
             tag: Order unique identifier
 

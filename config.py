@@ -208,6 +208,9 @@ LEG_SL_PCT_NON_EXPIRY = float(os.getenv("LEG_SL_PCT_NON_EXPIRY", "20.0"))
 # Default is 60% (can be overridden via LEG_TARGET_PCT env).
 LEG_TARGET_PCT = float(os.getenv("LEG_TARGET_PCT", "60.0"))
 
+# Fractional buffer for market-style LIMIT orders (e.g. 0.01 = 1%). BUY: LTP*(1+s), SELL: LTP*(1-s).
+MARKETABLE_LIMIT_SLIPPAGE_PCT = float(os.getenv("MARKETABLE_LIMIT_SLIPPAGE_PCT", "0.01"))
+
 # Premium-based straddle strike selection (optional). If set, CE/PE strikes are chosen by option LTP, not ATM.
 # NIFTY: target 100, buffer 15 → allowed range 85–115. SENSEX: target 300, buffer 40 → 260–340.
 # Within range, the strike with premium closest to target is picked. If no strike in range, strategy is skipped.

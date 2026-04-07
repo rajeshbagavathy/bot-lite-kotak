@@ -88,6 +88,7 @@ from config import (
     ITM_STRIKES_SENSEX,
     LEG_SL_PCT_NON_EXPIRY,
     LEG_TARGET_PCT,
+    MARKETABLE_LIMIT_SLIPPAGE_PCT,
     MARGIN_BUFFER_EXPIRY,
     MARGIN_BUFFER_NON_EXPIRY,
     MARGIN_REQUIRED_PER_LOT_EXPIRY,
@@ -141,7 +142,7 @@ from state import (
     update_strategy,
 )
 from ui import create_app, ensure_http_access_not_logged
-from xts_client import XTSClient
+from xts_client import XTSClient, marketable_limit_price
 
 logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
@@ -379,16 +380,30 @@ def _ensure_margin_or_skip_strategy(
             update_strategy(name, status="ERROR", message="Margin low; unable to find hedge options")
             return False
 
+        hedge_ltps = client.get_ltp_map(
+            [
+                {
+                    "exchangeSegment": index_config.option_ltp_segment,
+                    "exchangeInstrumentID": int(pe_hedge["instrument_id"]),
+                },
+                {
+                    "exchangeSegment": index_config.option_ltp_segment,
+                    "exchangeInstrumentID": int(ce_hedge["instrument_id"]),
+                },
+            ]
+        )
         round_orders: List[dict] = []
         for hedge, side in ((pe_hedge, "PE"), (ce_hedge, "CE")):
             tag = f"{name}_HEDGE_R{round_idx}_{side}_BUY_{int(time.time())}"
+            iid = int(hedge["instrument_id"])
             oid = client.place_market_order(
                 index_config=index_config,
-                instrument_id=int(hedge["instrument_id"]),
+                instrument_id=iid,
                 order_side=client.interactive.TRANSACTION_TYPE_BUY,
                 quantity=hedge_qty,
                 tag=tag,
                 product_type=client.interactive.PRODUCT_MIS,
+                ltp=hedge_ltps.get(iid),
             )
             if oid:
                 order_rec = {"app_order_id": oid, "tag": tag, "instrument_id": int(hedge["instrument_id"])}
@@ -600,6 +615,13 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     ce_tag = f"{name}_CE_SELL_{int(time.time())}"
     pe_tag = f"{name}_PE_SELL_{int(time.time())}"
 
+    entry_ltps = client.get_ltp_map(
+        [
+            {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": int(ce_id)},
+            {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": int(pe_id)},
+        ]
+    )
+
     placed_entry = []
     for instrument_id, tag in [(ce_id, ce_tag), (pe_id, pe_tag)]:
         order_id = client.place_market_order(
@@ -609,6 +631,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
             quantity=qty,
             tag=tag,
             product_type=client.interactive.PRODUCT_MIS,
+            ltp=entry_ltps.get(int(instrument_id)),
         )
         if order_id:
             placed_entry.append({"app_order_id": order_id, "tag": tag, "instrument_id": int(instrument_id)})
@@ -642,7 +665,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
             int(placed["instrument_id"]),
             "",
             qty,
-            "MARKET",
+            "LIMIT",
             "SELL",
         )
 
@@ -777,16 +800,16 @@ def _cancel_strategy_sl_orders(client: XTSClient, strategy: dict) -> None:
             logger.exception("Failed to cancel SL order %s", sl_order)
 
 
-def _close_strategy_via_open_sl_orders(client: XTSClient, strategy: dict) -> None:
+def _close_strategy_via_open_sl_orders(client: XTSClient, index_config, strategy: dict) -> None:
     """
-    Close strategy by converting open SL orders to market execution.
-    
+    Close strategy by converting open SL orders to marketable LIMIT execution.
+
     This approach:
     1. Checks order book status of each SL order
-    2. If status = 'New'/'Replaced' → SL still open, modify to market execution
+    2. If status = 'New'/'Replaced' → SL still open, modify to LIMIT at LTP +/- slippage
     3. If status = 'Filled' → Already closed by individual leg SL, skip
     4. If status = 'Cancelled'/'Rejected' → Failed, skip
-    
+
     Benefit: Only closes still-open legs, avoids double-closing already-filled positions.
     This handles scenarios where one leg SL hit before strategy SL.
     """
@@ -794,13 +817,15 @@ def _close_strategy_via_open_sl_orders(client: XTSClient, strategy: dict) -> Non
     if not sl_orders:
         logger.debug(f"No SL orders found for strategy {strategy['name']}")
         return
-    
+
+    sl_tag_map = strategy.get("sl_tag_map", {}) or {}
+
     try:
         order_book = client.get_order_book()
     except Exception as e:
         logger.error(f"Failed to fetch order book for {strategy['name']}: {e}")
         return
-    
+
     # Create map: app_order_id / tag → order details from order book
     order_book_map = {}
     for order in order_book:
@@ -809,58 +834,96 @@ def _close_strategy_via_open_sl_orders(client: XTSClient, strategy: dict) -> Non
         if app_order_id or tag:
             order_book_map[app_order_id] = order
             order_book_map[tag] = order
-    
-    # Process each SL order
+
+    pending: List[Tuple[Any, Any, dict, Optional[int]]] = []
     for sl_order in sl_orders:
         app_order_id = sl_order.get("app_order_id")
         tag = sl_order.get("tag")
-        
-        # Find this SL order in the order book
+
         order_detail = order_book_map.get(app_order_id) or order_book_map.get(tag)
-        
+
         if not order_detail:
             logger.warning(
                 f"SL order not found in order book: {strategy['name']} - {tag}"
             )
             continue
-        
+
         order_status = order_detail.get("OrderStatus", "").upper()
-        
-        # Check if SL order is still open
+
         if order_status in ("NEW", "REPLACED"):
-            # ✅ SL is still open - modify to market execution
-            try:
-                client.modify_order(
-                    app_order_id=app_order_id,
-                    product_type=order_detail.get("ProductType"),
-                    order_type=client.interactive.ORDER_TYPE_MARKET,
-                    quantity=int(order_detail.get("OrderQuantity", 0)),
-                    disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
-                    stop_price=0,  # Market execution
-                    limit_price=0,  # Market execution
-                    time_in_force=order_detail.get("TimeInForce"),
-                    tag=tag,
-                )
-                logger.debug(
-                    f"✅ [{strategy['name']}] Modified SL order to market: {tag} "
-                    f"(Qty: {order_detail.get('OrderQuantity')})"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to modify SL order for {strategy['name']}: {tag} - {e}"
-                )
-        
+            iid: Optional[int] = None
+            if tag and tag in sl_tag_map:
+                try:
+                    iid = int(sl_tag_map[tag])
+                except (TypeError, ValueError):
+                    iid = None
+            if iid is None:
+                for k in ("ExchangeInstrumentID", "ExchangeInstrumentId", "InstrumentID", "InstrumentId"):
+                    v = order_detail.get(k)
+                    if v is not None:
+                        try:
+                            iid = int(v)
+                            break
+                        except (TypeError, ValueError):
+                            continue
+            pending.append((app_order_id, tag, order_detail, iid))
         elif order_status == "FILLED":
-            # ℹ️ SL already executed - position already closed
             logger.debug(
                 f"ℹ️  [{strategy['name']}] SL already FILLED, skipping: {tag}"
             )
-        
         elif order_status in ("CANCELLED", "REJECTED"):
-            # ⚠️ SL order failed - position is exposed
             logger.warning(
                 f"⚠️  [{strategy['name']}] SL order {order_status}: {tag} "
                 f"(position exposed, manual intervention may be needed)"
+            )
+
+    iids = [x[3] for x in pending if x[3] is not None]
+    instruments = [
+        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": int(i)}
+        for i in sorted(set(iids))
+    ]
+    ltp_batch = client.get_ltp_map(instruments) if instruments else {}
+
+    for app_order_id, tag, order_detail, iid in pending:
+        ltp = ltp_batch.get(int(iid)) if iid is not None else None
+        if ltp is None:
+            logger.warning(
+                "[%s] No LTP for SL modify (tag=%s instrument=%s); skip LIMIT conversion",
+                strategy["name"],
+                tag,
+                iid,
+            )
+            continue
+        try:
+            ltp_f = float(ltp)
+        except (TypeError, ValueError):
+            continue
+        order_side = order_detail.get("OrderSide") or client.interactive.TRANSACTION_TYPE_BUY
+        limit_price = marketable_limit_price(
+            ltp_f,
+            str(order_side),
+            MARKETABLE_LIMIT_SLIPPAGE_PCT,
+            float(index_config.tick_size),
+        )
+        try:
+            client.modify_order(
+                app_order_id=app_order_id,
+                product_type=order_detail.get("ProductType"),
+                order_type=client.interactive.ORDER_TYPE_LIMIT,
+                quantity=int(order_detail.get("OrderQuantity", 0)),
+                disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
+                stop_price=0,
+                limit_price=float(limit_price),
+                time_in_force=order_detail.get("TimeInForce"),
+                tag=tag,
+            )
+            logger.debug(
+                f"✅ [{strategy['name']}] Modified SL order to marketable LIMIT: {tag} "
+                f"(Qty: {order_detail.get('OrderQuantity')}, limit={limit_price})"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to modify SL order for {strategy['name']}: {tag} - {e}"
             )
 
 
@@ -868,7 +931,7 @@ def _close_strategy(client: XTSClient, index_config, strategy: dict, positions: 
     if strategy["status"] in ("CLOSED", "CLOSING"):
         return
     update_strategy(strategy["name"], status="CLOSING", message=reason)
-    _close_strategy_via_open_sl_orders(client, strategy)
+    _close_strategy_via_open_sl_orders(client, index_config, strategy)
     
     # Log closed trade to database
     db_id = strategy.get("db_id")
@@ -1438,11 +1501,11 @@ def _rebuild_sl_links_from_order_book_for_restored_strategy(
 
 
 def _check_leg_target_and_close(
-    client: XTSClient, strategy: dict, ltp_map: Dict[int, float]
+    client: XTSClient, index_config, strategy: dict, ltp_map: Dict[int, float]
 ) -> None:
     """
     If any leg's profit from collected premium reaches LEG_TARGET_PCT (e.g. 65%),
-    close that leg by modifying its SL order to market (single action: leg closed + SL order executed).
+    close that leg by modifying its SL order to marketable LIMIT (single action: leg closed + SL order executed).
     Target is calculated on executed sell order premium (entry_price): profit_pct = (entry_price - ltp) / entry_price * 100.
     """
     if strategy["status"] != "OPEN" or not strategy.get("sl_orders"):
@@ -1517,27 +1580,34 @@ def _check_leg_target_and_close(
         if order_status not in ("NEW", "REPLACED"):
             continue
 
+        order_side = order_detail.get("OrderSide") or client.interactive.TRANSACTION_TYPE_BUY
+        limit_px = marketable_limit_price(
+            ltp_f,
+            str(order_side),
+            MARKETABLE_LIMIT_SLIPPAGE_PCT,
+            float(index_config.tick_size),
+        )
         try:
             client.modify_order(
                 app_order_id=app_order_id,
                 product_type=order_detail.get("ProductType"),
-                order_type=client.interactive.ORDER_TYPE_MARKET,
+                order_type=client.interactive.ORDER_TYPE_LIMIT,
                 quantity=int(order_detail.get("OrderQuantity", 0)),
                 disclosed_quantity=int(order_detail.get("OrderDisclosedQuantity", 0)),
                 stop_price=0,
-                limit_price=0,
+                limit_price=float(limit_px),
                 time_in_force=order_detail.get("TimeInForce"),
                 tag=tag,
             )
             target_triggered.add(instrument_id)
             update_strategy(strategy["name"], target_triggered_instruments=list(target_triggered))
             logger.debug(
-                "✅ [%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%); modified SL to market",
-                strategy["name"], float(LEG_TARGET_PCT), instrument_id, profit_pct,
+                "✅ [%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%); modified SL to marketable LIMIT (limit=%s)",
+                strategy["name"], float(LEG_TARGET_PCT), instrument_id, profit_pct, limit_px,
             )
         except Exception as e:
             logger.error(
-                "Failed to modify SL to market for leg target [%s] instrument %s: %s",
+                "Failed to modify SL to LIMIT for leg target [%s] instrument %s: %s",
                 strategy["name"], instrument_id, e,
             )
 
@@ -1698,8 +1768,8 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         # **FIRST**: Sync SL order status from XTS order book (single source of truth)
         _sync_sl_order_status_and_capture_exits(client, strategy, order_book=order_book)
 
-        # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to market
-        _check_leg_target_and_close(client, strategy, ltp_map)
+        # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to marketable LIMIT
+        _check_leg_target_and_close(client, index_config, strategy, ltp_map)
         
         # Sync strategy positions with broker positions to keep state real-time
         _sync_strategy_positions_from_broker(client, strategy, positions, ltp_map, order_book=order_book)

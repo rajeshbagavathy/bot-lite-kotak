@@ -269,6 +269,7 @@ class TestExecuteStrategy(unittest.TestCase):
         self.index_config = MagicMock()
         self.index_config.lot_size = 65
         self.index_config.tick_size = 0.05  # Add tick_size for SL order rounding
+        self.index_config.option_ltp_segment = 2
         self.expiry = "12FEB2026"
         # For tests we disable premium-based strike so logic uses ATM/ITM path
         self._orig_use_premium = bot.USE_PREMIUM_BASED_STRIKE
@@ -338,7 +339,8 @@ class TestExecuteStrategy(unittest.TestCase):
         mock_dt.now.return_value.isoformat.return_value = "2026-02-08T09:20:01"
         mock_get_atm.return_value = 21900
         self.client.get_option_instrument_id.side_effect = [12345, 67890]
-        # place_market_order now returns numeric AppOrderIDs
+        self.client.get_ltp_map.return_value = {12345: 150.0, 67890: 145.0}
+        # place_market_order now returns numeric AppOrderIDs (marketable LIMIT under the hood)
         self.client.place_market_order.side_effect = [1001, 1002]
         self.client.get_order_book.return_value = []
         mock_filled.return_value = [
@@ -391,6 +393,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
         self.client = MagicMock()
         self.index_config = MagicMock()
         self.index_config.lot_size = 50
+        self.index_config.option_ltp_segment = 2
         self.strategy = {"name": "S0920", "lots": 10}
 
     @patch("bot.update_strategy")
@@ -405,6 +408,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
             {"strike": 100, "instrument_id": 111, "ltp": 2.0},
             {"strike": 200, "instrument_id": 222, "ltp": 2.1},
         ]
+        self.client.get_ltp_map.return_value = {111: 2.0, 222: 2.1}
         self.client.place_market_order.side_effect = [101, 102]
 
         with patch("bot.time.sleep") as mock_sleep:
@@ -444,6 +448,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
             {"strike": 100, "instrument_id": 111, "ltp": 5.0},
             {"strike": 200, "instrument_id": 222, "ltp": 5.1},
         ]
+        self.client.get_ltp_map.return_value = {111: 5.0, 222: 5.1}
         self.client.place_market_order.side_effect = [201, 202, 203, 204]
 
         with patch("bot.time.sleep") as mock_sleep:
@@ -598,7 +603,7 @@ class TestCloseStrategy(unittest.TestCase):
         bot._close_strategy(client, index_config, strategy, positions, "Test closure")
         
         # Should call the SL-based closing helper
-        mock_close_via_sl.assert_called_once_with(client, strategy)
+        mock_close_via_sl.assert_called_once_with(client, index_config, strategy)
         mock_update.assert_any_call("S0920", status="CLOSING", message="Test closure")
         mock_update.assert_any_call("S0920", status="CLOSED", sl_orders=[], sl_tag_map={})
 
@@ -826,7 +831,7 @@ class TestMonitorMTM(unittest.TestCase):
         # one call targeted S0921 (the one that hit SL). Additional calls for
         # other strategies are allowed by the new logic.
         self.assertGreaterEqual(mock_close_via_sl.call_count, 1)
-        called_names = [args[1]["name"] for args, _ in mock_close_via_sl.call_args_list]
+        called_names = [args[2]["name"] for args, _ in mock_close_via_sl.call_args_list]
         self.assertIn("S0921", called_names)
 
 
@@ -1274,6 +1279,20 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.mock_client = MagicMock()
+        self.mock_client.interactive.ORDER_TYPE_LIMIT = "LIMIT"
+        self.mock_client.interactive.TRANSACTION_TYPE_BUY = "BUY"
+        self.index_config = IndexConfig(
+            name="NIFTY",
+            fno_symbol="NIFTY",
+            lot_size=65,
+            strike_diff=50,
+            spot_exchange_segment=1,
+            spot_instrument_id=26000,
+            option_ltp_segment=2,
+            option_exchange_segment="OPTIDX",
+            order_exchange_segment="NSEFO",
+            tick_size=0.05,
+        )
         self.strategy = {
             "name": "S0921",
             "status": "OPEN",
@@ -1282,6 +1301,10 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 {"tag": "S0921_SL_CE_19900", "app_order_id": 101},
                 {"tag": "S0921_SL_PE_19900", "app_order_id": 102},
             ],
+            "sl_tag_map": {
+                "S0921_SL_CE_19900": 12345,
+                "S0921_SL_PE_19900": 12346,
+            },
             "positions": [
                 {
                     "instrument_id": 12345,
@@ -1299,12 +1322,13 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 },
             ],
         }
+        self.mock_client.get_ltp_map.return_value = {12345: 100.0, 12346: 100.0}
 
     def test_skips_if_no_sl_orders(self):
         """Should skip if strategy has no SL orders."""
         self.strategy["sl_orders"] = None
         with patch("bot.logger"):
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # No API calls should be made
         self.mock_client.get_order_book.assert_not_called()
@@ -1315,7 +1339,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
         self.mock_client.get_order_book.side_effect = Exception("API error")
         
         with patch("bot.logger") as mock_logger:
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # Should log error and return gracefully
         self.assertTrue(mock_logger.error.called)
@@ -1328,6 +1352,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "AppOrderID": 101,
                 "OrderUniqueIdentifier": "S0921_SL_CE_19900",
                 "OrderStatus": "NEW",
+                "OrderSide": "BUY",
                 "OrderQuantity": 260,
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
@@ -1337,6 +1362,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "AppOrderID": 102,
                 "OrderUniqueIdentifier": "S0921_SL_PE_19900",
                 "OrderStatus": "NEW",
+                "OrderSide": "BUY",
                 "OrderQuantity": 260,
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
@@ -1345,17 +1371,17 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
         ]
         
         with patch("bot.logger") as mock_logger:
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # Both SL orders should be modified
         self.assertEqual(self.mock_client.modify_order.call_count, 2)
         
-        # Verify calls include market order type
+        # Marketable LIMIT (BUY: LTP 100 * 1.01 = 101.0 at default slippage)
         for call_obj in self.mock_client.modify_order.call_args_list:
             kwargs = call_obj[1]
-            self.assertEqual(kwargs["order_type"], self.mock_client.interactive.ORDER_TYPE_MARKET)
+            self.assertEqual(kwargs["order_type"], self.mock_client.interactive.ORDER_TYPE_LIMIT)
             self.assertEqual(kwargs["stop_price"], 0)
-            self.assertEqual(kwargs["limit_price"], 0)
+            self.assertEqual(kwargs["limit_price"], 101.0)
 
     def test_partial_closure_one_leg_already_filled(self):
         """Should skip FILLED SL orders and only modify open ones."""
@@ -1373,15 +1399,17 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "AppOrderID": 102,
                 "OrderUniqueIdentifier": "S0921_SL_PE_19900",
                 "OrderStatus": "NEW",  # Still open
+                "OrderSide": "BUY",
                 "OrderQuantity": 260,
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
             },
         ]
+        self.mock_client.get_ltp_map.return_value = {12346: 100.0}
         
         with patch("bot.logger") as mock_logger:
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # Only PE SL should be modified (CE is already FILLED)
         self.assertEqual(self.mock_client.modify_order.call_count, 1)
@@ -1400,20 +1428,23 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "AppOrderID": 101,
                 "OrderUniqueIdentifier": "S0921_SL_CE_19900",
                 "OrderStatus": "REPLACED",  # Order was modified/reopened
+                "OrderSide": "BUY",
                 "OrderQuantity": 260,
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
             },
         ]
+        self.mock_client.get_ltp_map.return_value = {12345: 100.0}
         
         with patch("bot.logger"):
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # REPLACED status should also trigger modification
         self.assertEqual(self.mock_client.modify_order.call_count, 1)
         call_kwargs = self.mock_client.modify_order.call_args[1]
-        self.assertEqual(call_kwargs["order_type"], self.mock_client.interactive.ORDER_TYPE_MARKET)
+        self.assertEqual(call_kwargs["order_type"], self.mock_client.interactive.ORDER_TYPE_LIMIT)
+        self.assertEqual(call_kwargs["limit_price"], 101.0)
 
     def test_rejected_sl_warns_and_skips(self):
         """Should warn when SL order is REJECTED."""
@@ -1426,7 +1457,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
         ]
         
         with patch("bot.logger") as mock_logger:
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # Should warn about rejected SL
         self.assertTrue(mock_logger.warning.called)
@@ -1444,7 +1475,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
         ]
         
         with patch("bot.logger") as mock_logger:
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # Should warn about cancelled SL
         self.assertTrue(mock_logger.warning.called)
@@ -1455,7 +1486,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
         self.mock_client.get_order_book.return_value = []  # Empty order book
         
         with patch("bot.logger") as mock_logger:
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # Should warn about missing orders
         self.assertTrue(mock_logger.warning.called)
@@ -1468,16 +1499,18 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "AppOrderID": 101,
                 "OrderUniqueIdentifier": "S0921_SL_CE_19900",
                 "OrderStatus": "NEW",
+                "OrderSide": "BUY",
                 "OrderQuantity": 260,
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
                 "TimeInForce": "DAY",
             },
         ]
+        self.mock_client.get_ltp_map.return_value = {12345: 100.0}
         self.mock_client.modify_order.side_effect = Exception("XTS API error")
         
         with patch("bot.logger") as mock_logger:
-            bot._close_strategy_via_open_sl_orders(self.mock_client, self.strategy)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, self.strategy)
         
         # Should log error but not crash
         self.assertTrue(mock_logger.error.called)
@@ -1492,6 +1525,10 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 {"tag": "S0921_SL_CE_19900", "app_order_id": 101},
                 {"tag": "S0921_SL_PE_19900", "app_order_id": 102},
             ],
+            "sl_tag_map": {
+                "S0921_SL_CE_19900": 80001,
+                "S0921_SL_PE_19900": 80002,
+            },
         }
         
         strategy_2 = {
@@ -1501,6 +1538,10 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 {"tag": "S0955_SL_CE_19900", "app_order_id": 201},
                 {"tag": "S0955_SL_PE_19900", "app_order_id": 202},
             ],
+            "sl_tag_map": {
+                "S0955_SL_CE_19900": 90001,
+                "S0955_SL_PE_19900": 90002,
+            },
         }
         
         # Only S0921's SL orders are open
@@ -1509,6 +1550,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "AppOrderID": 101,
                 "OrderUniqueIdentifier": "S0921_SL_CE_19900",
                 "OrderStatus": "NEW",
+                "OrderSide": "BUY",
                 "OrderQuantity": 260,
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
@@ -1518,6 +1560,7 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "AppOrderID": 102,
                 "OrderUniqueIdentifier": "S0921_SL_PE_19900",
                 "OrderStatus": "NEW",
+                "OrderSide": "BUY",
                 "OrderQuantity": 260,
                 "OrderDisclosedQuantity": 0,
                 "ProductType": "MIS",
@@ -1542,17 +1585,18 @@ class TestCloseStrategyViaOpenSLOrders(unittest.TestCase):
                 "TimeInForce": "DAY",
             },
         ]
+        self.mock_client.get_ltp_map.return_value = {80001: 100.0, 80002: 100.0}
         
         with patch("bot.logger"):
             # Close S0921
-            bot._close_strategy_via_open_sl_orders(self.mock_client, strategy_1)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, strategy_1)
             s1_modify_count = self.mock_client.modify_order.call_count
             
             # Reset mock
             self.mock_client.reset_mock()
             
             # Close S0955
-            bot._close_strategy_via_open_sl_orders(self.mock_client, strategy_2)
+            bot._close_strategy_via_open_sl_orders(self.mock_client, self.index_config, strategy_2)
             s2_modify_count = self.mock_client.modify_order.call_count
         
         # S0921 should modify 2 orders (both NEW)
