@@ -2202,6 +2202,11 @@ def main() -> None:
     ui_thread.daemon = True
     ui_thread.start()
 
+    if not DEMO_MODE and client is not None:
+        from calm_zone_service import start_calm_zone_monitor_thread
+
+        start_calm_zone_monitor_thread(client)
+
     logger.info(
         "UI dashboard at http://0.0.0.0:%s (path /dashboard) | basic auth user: %s",
         ui_port,

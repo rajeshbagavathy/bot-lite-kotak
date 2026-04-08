@@ -14,11 +14,13 @@ from state import (
 )
 
 from bot_log_filter import bot_log_line_is_survivor_event
+from db import fetch_spot_market_rows
 
 try:
-    from config import LEG_TARGET_PCT
+    from config import CALM_ZONE_BAR_UNIX_OFFSET_SEC, LEG_TARGET_PCT
 except ImportError:
     LEG_TARGET_PCT = 65.0
+    CALM_ZONE_BAR_UNIX_OFFSET_SEC = 0
 
 
 def _default_bot_log_path() -> str:
@@ -175,7 +177,10 @@ DASHBOARD_TEMPLATE = """
     .warn-box { background: #7c2d12; color: #fed7aa; padding: 10px 12px; border-radius: 6px; border: 1px solid #fb923c; font-size: 12px; line-height: 1.4; }
     .refresh-time { color: #64748b; font-size: 11px; margin-top: 20px; text-align: center; }
     .log-view { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.45; max-height: 70vh; overflow: auto; background: #0f172a; padding: 14px; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; }
+    tr.row-calm td { background: rgba(16, 185, 129, 0.22) !important; }
+    #volatility-chart { width: 100%; height: 420px; min-height: 280px; }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 </head>
 <body>
   <div class="container">
@@ -191,6 +196,7 @@ DASHBOARD_TEMPLATE = """
       <button class="tab-btn" onclick="switchTab(event, 'orders')">Orders</button>
       <button class="tab-btn" onclick="switchTab(event, 'trades')">Closed Trades</button>
       <button class="tab-btn" onclick="switchTab(event, 'mtm')">MTM Snapshots</button>
+      <button class="tab-btn" onclick="switchTab(event, 'volatility')">Volatility Monitor</button>
       <button class="tab-btn" onclick="switchTab(event, 'botlog')">Bot log</button>
     </div>
 
@@ -310,6 +316,31 @@ DASHBOARD_TEMPLATE = """
       </table>
     </div>
 
+    <div id="volatility" class="tab-content">
+      <div class="card" style="margin-bottom: 12px;">
+        <div class="card-title">Calm zone — <span id="volatility-index-label">—</span></div>
+        <p class="meta-label" style="margin-bottom: 8px;">1-minute spot OHLC from the database; Range/Ratio use a 5-minute sliding window. Green rows: calm zone (NIFTY range &lt; 50, non-NIFTY indices &lt; 120, body/range &lt; 0.25). Timezone is IST. Index follows the bot&rsquo;s active index from <code>/state</code>.</p>
+        <label class="setting-row" style="font-size: 12px; color: #cbd5e1;">
+          <span>Chart mode:</span>
+          <select id="volatility-chart-mode" style="background: #0f172a; color: #e2e8f0; border: 1px solid #334155; padding: 4px 6px;">
+            <option value="candles">Candles</option>
+            <option value="line">Line</option>
+            <option value="both">Candles + Line</option>
+          </select>
+        </label>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Time (IST)</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Range</th><th>Ratio</th><th>Status</th></tr>
+        </thead>
+        <tbody id="volatility-rows">Loading...</tbody>
+      </table>
+      <div class="card" style="margin-top: 16px;">
+        <div class="card-title">1m candlestick + calm zones</div>
+        <div id="volatility-chart"></div>
+      </div>
+    </div>
+
     <div id="botlog" class="tab-content">
       <div class="card" style="margin-bottom: 12px;">
         <div class="card-title">Bot log file</div>
@@ -369,6 +400,173 @@ DASHBOARD_TEMPLATE = """
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       document.getElementById(tabName).classList.add('active');
       event.target.classList.add('active');
+      if (tabName === 'volatility' && window.__volatilityChart) {
+        setTimeout(function() { try { window.__volatilityChart.resize(); } catch (e) {} }, 80);
+      }
+    }
+
+    function buildCalmMarkAreas(rowsAsc) {
+      const areas = [];
+      let start = null;
+      for (let i = 0; i < rowsAsc.length; i++) {
+        const calm = rowsAsc[i].is_calmzone === 1 || rowsAsc[i].is_calmzone === true;
+        if (calm) {
+          if (start === null) start = i;
+        } else if (start !== null) {
+          areas.push([{ xAxis: start }, { xAxis: i - 1 }]);
+          start = null;
+        }
+      }
+      if (start !== null) {
+        areas.push([{ xAxis: start }, { xAxis: rowsAsc.length - 1 }]);
+      }
+      return areas;
+    }
+
+    function barUnixMs(r, offsetSec) {
+      const o = Number(offsetSec) || 0;
+      if (r.bar_unix != null && r.bar_unix !== '') {
+        const sec = Number(r.bar_unix);
+        if (!isNaN(sec)) return (sec + o) * 1000;
+      }
+      return null;
+    }
+
+    function inferBarUnixOffsetSec(rows, configuredOffsetSec) {
+      const base = Number(configuredOffsetSec) || 0;
+      if (!rows || !rows.length) return base;
+      let latest = null;
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i].bar_unix != null && rows[i].bar_unix !== '') {
+          latest = rows[i];
+          break;
+        }
+      }
+      if (!latest) return base;
+      const sec = Number(latest.bar_unix);
+      if (isNaN(sec)) return base;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const drift = nowSec - (sec + base);
+      // If vendor epoch is clearly shifted (few hours), auto-correct for display.
+      if (Math.abs(drift) >= 2 * 3600 && Math.abs(drift) <= 12 * 3600) {
+        return base + Math.round(drift / 60) * 60;
+      }
+      return base;
+    }
+
+    function formatVolBarTime(r, offsetSec) {
+      const ms = barUnixMs(r, offsetSec);
+      if (ms != null && !isNaN(ms)) {
+        const d = new Date(ms);
+        return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
+      }
+      const raw = String(r.bar_time || '').replace(/\s*IST\s*$/i, '').trim();
+      if (!raw) return '-';
+      const m = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
+      if (m) {
+        const d = new Date(m[1] + 'T' + m[2] + '+05:30');
+        if (!isNaN(d.getTime())) {
+          return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
+        }
+      }
+      return raw + ' IST';
+    }
+
+    function shortChartTimeLabel(r, offsetSec) {
+      const ms = barUnixMs(r, offsetSec);
+      if (ms != null && !isNaN(ms)) {
+        return new Date(ms).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true });
+      }
+      const s = String(r.bar_time || '');
+      const parts = s.split(/[ T]/);
+      return parts.length > 1 ? parts[1].slice(0, 8) : s.slice(-8);
+    }
+
+    function updateVolatilityMonitor(vol) {
+      const label = document.getElementById('volatility-index-label');
+      const tbody = document.getElementById('volatility-rows');
+      const chartEl = document.getElementById('volatility-chart');
+      const modeSel = document.getElementById('volatility-chart-mode');
+      if (!label || !tbody || !chartEl || !modeSel) return;
+      const mode = modeSel.value || 'candles';
+      const name = vol && vol.index ? vol.index : 'NIFTY';
+      label.textContent = name;
+      const rows = (vol && vol.rows) ? vol.rows : [];
+      const cfgOff = (vol && vol.bar_unix_offset_sec != null) ? Number(vol.bar_unix_offset_sec) : 0;
+      const off = inferBarUnixOffsetSec(rows, cfgOff);
+      let html = '';
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const calm = r.is_calmzone === 1 || r.is_calmzone === true;
+        const cls = calm ? 'row-calm' : '';
+        const ratio = (r.body_range_ratio != null && r.body_range_ratio !== '') ? Number(r.body_range_ratio).toFixed(4) : '-';
+        const rng = (r.range_5m != null && r.range_5m !== '') ? Number(r.range_5m).toFixed(2) : '-';
+        const st = calm ? 'Calm' : '—';
+        html += '<tr class="' + cls + '"><td>' + escHtml(formatVolBarTime(r, off)) + '</td><td>' + fmt(r.open) + '</td><td>' + fmt(r.high) + '</td><td>' + fmt(r.low) + '</td><td>' + fmt(r.close) + '</td><td>' + rng + '</td><td>' + ratio + '</td><td>' + st + '</td></tr>';
+      }
+      if (!html) {
+        html = '<tr><td colspan="8">No spot data yet (market hours / worker running).</td></tr>';
+      }
+      tbody.innerHTML = html;
+
+      if (typeof echarts === 'undefined') {
+        return;
+      }
+      const asc = rows.slice().sort(function(a, b) {
+        const ma = barUnixMs(a, off);
+        const mb = barUnixMs(b, off);
+        if (ma != null && mb != null) return ma - mb;
+        return String(a.bar_time).localeCompare(String(b.bar_time));
+      });
+      const cats = asc.map(function(r) { return shortChartTimeLabel(r, off); });
+      const candleData = asc.map(function(r) {
+        return [Number(r.open), Number(r.close), Number(r.low), Number(r.high)];
+      });
+      const lineData = asc.map(function(r) { return Number(r.close); });
+      const markAreas = buildCalmMarkAreas(asc);
+      if (!window.__volatilityChart) {
+        window.__volatilityChart = echarts.init(chartEl);
+      }
+      const ch = window.__volatilityChart;
+      const series = [];
+      if (mode === 'candles' || mode === 'both') {
+        series.push({
+          type: 'candlestick',
+          name: name + ' candles',
+          data: candleData,
+          itemStyle: {
+            color: '#22c55e',
+            color0: '#ef4444',
+            borderColor: '#22c55e',
+            borderColor0: '#ef4444'
+          },
+          markArea: {
+            silent: true,
+            itemStyle: { color: 'rgba(34, 197, 94, 0.22)' },
+            data: markAreas
+          }
+        });
+      }
+      if (mode === 'line' || mode === 'both') {
+        series.push({
+          type: 'line',
+          name: name + ' close',
+          data: lineData,
+          smooth: false,
+          showSymbol: false,
+          lineStyle: { color: '#38bdf8', width: 2 }
+        });
+      }
+      ch.setOption({
+        backgroundColor: 'transparent',
+        animation: false,
+        tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+        grid: { left: '52', right: '20', top: '20', bottom: '56' },
+        xAxis: { type: 'category', data: cats, axisLabel: { color: '#94a3b8', rotate: 40, fontSize: 10 } },
+        yAxis: { scale: true, axisLabel: { color: '#94a3b8' }, splitLine: { lineStyle: { color: '#334155' } } },
+        series: series
+      });
+      setTimeout(function() { try { ch.resize(); } catch (e) {} }, 60);
     }
 
     async function loadDashboard() {
@@ -376,13 +574,14 @@ DASHBOARD_TEMPLATE = """
         const showFullLog = document.getElementById('bot-log-show-full')?.checked;
         const logMode = showFullLog ? 'all' : 'survivor';
         const noCache = { cache: 'no-store', credentials: 'same-origin' };
-        const [state, strategies, positions, orders, trades, mtm, botlog] = await Promise.all([
+        const [state, strategies, positions, orders, trades, mtm, volmon, botlog] = await Promise.all([
           fetch('/state', noCache).then(r => r.json()),
           fetch('/api/strategies', noCache).then(r => r.json()),
           fetch('/api/positions', noCache).then(r => r.json()),
           fetch('/api/orders', noCache).then(r => r.json()),
           fetch('/api/trades', noCache).then(r => r.json()),
           fetch('/api/mtm', noCache).then(r => r.json()),
+          fetch('/api/volatility-monitor', noCache).then(r => r.json()),
           fetch('/api/bot-log?lines=2500&mode=' + encodeURIComponent(logMode) + '&_=' + Date.now(), noCache).then(r => r.json()),
         ]);
 
@@ -400,6 +599,11 @@ DASHBOARD_TEMPLATE = """
         const dsl = document.getElementById('dash-flag-strategy-sl');
         const dne = document.getElementById('dash-flag-non-expiry');
         const dm = document.getElementById('dash-flag-mtm');
+        const volMode = document.getElementById('volatility-chart-mode');
+        if (volMode && !volMode.dataset.bound) {
+          volMode.dataset.bound = '1';
+          volMode.addEventListener('change', function() { updateVolatilityMonitor(volmon); });
+        }
         if (toggle1 && !toggle1.dataset.bound) {
           toggle1.dataset.bound = '1';
           toggle1.addEventListener('change', async function() {
@@ -506,6 +710,8 @@ DASHBOARD_TEMPLATE = """
             <div class="meta-value">${fmt(portfolio.available_margin)}</div>
           </div>
         `;
+
+        updateVolatilityMonitor(volmon);
 
         document.getElementById('portfolio-status').innerHTML = `
           <div class="metric">
@@ -1127,6 +1333,37 @@ def create_app(username: str, password: str) -> Flask:
             return jsonify([dict(row) for row in rows])
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/volatility-monitor")
+    @basic_auth.required
+    def api_volatility_monitor():
+        """Latest 1m spot bars + calm metrics for the bot's active index (NIFTY/SENSEX)."""
+        try:
+            snap = get_snapshot()
+            idx = snap.get("index") or {}
+            name = (idx.get("name") or "NIFTY").strip().upper()
+            if name not in ("NIFTY", "SENSEX"):
+                name = "NIFTY"
+            rows = fetch_spot_market_rows(name, 120)
+            return jsonify(
+                {
+                    "index": name,
+                    "rows": rows,
+                    "bar_unix_offset_sec": CALM_ZONE_BAR_UNIX_OFFSET_SEC,
+                }
+            )
+        except Exception as e:
+            return (
+                jsonify(
+                    {
+                        "index": "NIFTY",
+                        "rows": [],
+                        "error": str(e),
+                        "bar_unix_offset_sec": CALM_ZONE_BAR_UNIX_OFFSET_SEC,
+                    }
+                ),
+                500,
+            )
 
     @app.route("/api/bot-log")
     @basic_auth.required

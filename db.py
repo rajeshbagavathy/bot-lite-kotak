@@ -8,13 +8,12 @@ from typing import Any, Dict, List, Optional
 import pytz
 
 try:
-    from config import LEG_TARGET_PCT
+    from config import LEG_TARGET_PCT, DB_PATH
 except ImportError:
     LEG_TARGET_PCT = 65.0
+    DB_PATH = "trades.db"
 
 logger = logging.getLogger("xts-bot-lite")
-
-DB_PATH = "trades.db"
 RETENTION_DAYS = 30
 
 # IST timezone
@@ -126,7 +125,35 @@ def init_db() -> None:
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
+        # Spot index 1m OHLC + calm-zone metrics (NIFTY / SENSEX)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS spot_market_data (
+                index_name TEXT NOT NULL,
+                bar_time TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL,
+                range_5m REAL,
+                net_body REAL,
+                body_range_ratio REAL,
+                is_calmzone INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (index_name, bar_time)
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_spot_market_data_time "
+            "ON spot_market_data (index_name, bar_time DESC)"
+        )
+
+        cursor.execute("PRAGMA table_info(spot_market_data)")
+        spot_cols = [row[1] for row in cursor.fetchall()]
+        if "bar_unix" not in spot_cols:
+            cursor.execute("ALTER TABLE spot_market_data ADD COLUMN bar_unix INTEGER")
+
         conn.commit()
         conn.close()
         logger.debug(f"Database initialized at {DB_PATH}")
@@ -611,4 +638,114 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
         return restored_strategies
     except Exception as e:
         logger.error(f"Failed to restore today's strategies: {e}")
+        return []
+
+
+def upsert_spot_bar(
+    index_name: str,
+    bar_time: str,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: Optional[float],
+    range_5m: Optional[float],
+    net_body: Optional[float],
+    body_range_ratio: Optional[float],
+    is_calmzone: bool,
+    bar_unix: Optional[int] = None,
+) -> None:
+    """Insert or replace one row in spot_market_data (bar_time = IST wall clock; bar_unix = raw API epoch seconds)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO spot_market_data (
+                index_name, bar_time, open, high, low, close, volume,
+                range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(index_name, bar_time) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume,
+                range_5m = excluded.range_5m,
+                net_body = excluded.net_body,
+                body_range_ratio = excluded.body_range_ratio,
+                is_calmzone = excluded.is_calmzone,
+                updated_at = excluded.updated_at,
+                bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix)
+            """,
+            (
+                index_name,
+                bar_time,
+                open_,
+                high,
+                low,
+                close,
+                volume,
+                range_5m,
+                net_body,
+                body_range_ratio,
+                1 if is_calmzone else 0,
+                get_ist_timestamp(),
+                bar_unix,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("Failed to upsert spot bar %s %s: %s", index_name, bar_time, e)
+
+
+def fetch_spot_market_rows(index_name: str, limit: int = 120) -> List[Dict[str, Any]]:
+    """Latest ``limit`` bars for index, newest first."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
+                   range_5m, net_body, body_range_ratio, is_calmzone
+            FROM spot_market_data
+            WHERE index_name = ?
+            ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC, bar_time DESC
+            LIMIT ?
+            """,
+            (index_name, limit),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error("fetch_spot_market_rows failed: %s", e)
+        return []
+
+
+def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """Oldest first, for sliding-window recompute."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
+                   range_5m, net_body, body_range_ratio, is_calmzone
+            FROM spot_market_data
+            WHERE index_name = ?
+            ORDER BY bar_time DESC
+            LIMIT ?
+            """,
+            (index_name, limit),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        rows.reverse()
+        return rows
+    except Exception as e:
+        logger.error("fetch_spot_bars_asc_for_recompute failed: %s", e)
         return []

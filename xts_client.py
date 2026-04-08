@@ -1,12 +1,20 @@
 import datetime
 import json
 import logging
+import threading
 from typing import Any, Dict, List, Optional
+
+import pytz
 
 from Connect import XTSConnect
 from config import IndexConfig, MARKETABLE_LIMIT_SLIPPAGE_PCT
 
 logger = logging.getLogger(__name__)
+
+# XTS intraday OHLC: 1-minute interval per Symphony Marketdata API (compression = seconds).
+OHLC_COMPRESSION_1_MINUTE = 60
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 
 def round_to_tick(price: float, tick_size: float) -> float:
@@ -35,6 +43,8 @@ class XTSClient:
         self.client_id = client_id
         self.interactive = XTSConnect(api_key, api_secret, source)
         self.market = XTSConnect(market_api_key, market_api_secret, source)
+        # Serialize REST market calls that may overlap with touchline subscription on the same session.
+        self._market_api_lock = threading.Lock()
 
     def login(self) -> None:
         self.interactive.interactive_login()
@@ -125,6 +135,97 @@ class XTSClient:
         finally:
             self.market.send_unsubscription(Instruments=instruments, xtsMessageCode=1502)
         return ltp_map
+
+    @staticmethod
+    def format_ohlc_request_time(dt: datetime.datetime) -> str:
+        """XTS expects e.g. ``Apr 08 2026 091500`` (MMM DD YYYY HHMMSS) in local session timezone; we use IST."""
+        if dt.tzinfo is None:
+            dt = _IST.localize(dt)
+        else:
+            dt = dt.astimezone(_IST)
+        return dt.strftime("%b %d %Y %H%M%S")
+
+    @staticmethod
+    def parse_ohlc_data_response(data_response: str) -> List[Dict[str, Any]]:
+        """
+        Parse ``dataReponse`` payload: lines of ``unix_ts|open|high|low|close|volume|...``.
+        Returns bar dicts with bar_unix (int), open, high, low, close, volume.
+        """
+        if not data_response or not str(data_response).strip():
+            return []
+        out: List[Dict[str, Any]] = []
+        for line in str(data_response).strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
+            try:
+                ts = int(float(parts[0]))
+                o, h, l, c = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                vol: Optional[float] = None
+                if len(parts) > 5 and parts[5] not in ("", None):
+                    try:
+                        vol = float(parts[5])
+                    except (TypeError, ValueError):
+                        vol = None
+            except (TypeError, ValueError) as e:
+                logger.debug("Skipping OHLC line %r: %s", line, e)
+                continue
+            out.append(
+                {
+                    "bar_unix": ts,
+                    "open": o,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                    "volume": vol,
+                }
+            )
+        return out
+
+    def get_spot_ohlc_bars(
+        self,
+        index_config: IndexConfig,
+        start: datetime.datetime,
+        end: datetime.datetime,
+        compression_seconds: int = OHLC_COMPRESSION_1_MINUTE,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch intraday OHLC for the index spot instrument. Times should be in IST (naive or aware).
+        """
+        st = self.format_ohlc_request_time(start)
+        et = self.format_ohlc_request_time(end)
+        with self._market_api_lock:
+            raw = self.market.get_ohlc(
+                index_config.spot_exchange_segment,
+                index_config.spot_instrument_id,
+                st,
+                et,
+                compression_seconds,
+            )
+        if not raw or not isinstance(raw, dict):
+            logger.warning("OHLC unexpected response type for %s", index_config.name)
+            return []
+        result = raw.get("result")
+        if result is None:
+            err = raw.get("description") or raw.get("message")
+            if err:
+                logger.warning("OHLC no result for %s: %s", index_config.name, err)
+            return []
+        payload = ""
+        if isinstance(result, dict):
+            payload = result.get("dataReponse") or result.get("dataResponse") or ""
+        elif isinstance(result, str):
+            payload = result
+        if not payload:
+            logger.debug("OHLC empty dataReponse for %s: %s", index_config.name, raw)
+            return []
+        bars = self.parse_ohlc_data_response(str(payload))
+        for b in bars:
+            b["index_name"] = index_config.name
+        return bars
 
     def get_spot_ltp(self, index_config: IndexConfig) -> Optional[float]:
         instruments = [

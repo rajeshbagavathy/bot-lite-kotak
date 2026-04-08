@@ -932,6 +932,7 @@ class TestMain(unittest.TestCase):
         # Should update all strategies with demo data
         self.assertGreater(mock_update_strat.call_count, 0)
 
+    @patch("calm_zone_service.start_calm_zone_monitor_thread")
     @patch("threading.Thread")
     @patch("bot._schedule_jobs")
     @patch("bot.create_app")
@@ -957,6 +958,7 @@ class TestMain(unittest.TestCase):
         mock_create_app,
         mock_schedule_jobs,
         mock_thread,
+        mock_start_calm_zone,
     ):
         """Test main() in normal mode."""
         # Mock credentials
@@ -994,6 +996,7 @@ class TestMain(unittest.TestCase):
         mock_pick_index.assert_called_once()
         mock_schedule_jobs.assert_called_once()
         mock_thread_instance.start.assert_called_once()
+        mock_start_calm_zone.assert_called_once_with(mock_client)
 
 
 class TestStrategyState(unittest.TestCase):

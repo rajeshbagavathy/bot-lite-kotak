@@ -249,6 +249,10 @@ DEMO_MODE = os.getenv("DEMO_MODE", "False").lower() in ("true", "1", "yes")  # R
 SSM_BASE_PATH = "/trade/config"
 ACC_NAME = os.getenv("ACC_NAME")
 
+# Calm zone / OHLC: optional correction (seconds) added to vendor unix timestamps before IST formatting.
+# Set only if candle times are consistently shifted vs India wall clock (default 0).
+CALM_ZONE_BAR_UNIX_OFFSET_SEC = int(os.getenv("CALM_ZONE_BAR_UNIX_OFFSET_SEC", "0"))
+
 # Database configuration
 DB_PATH = os.getenv("DB_PATH", "trades.db")
 DB_RETENTION_DAYS = int(os.getenv("DB_RETENTION_DAYS", "30"))
