@@ -119,17 +119,26 @@ WEDNESDAY_NIFTY_STRATEGIES = [
     StrategyConfig("N_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm
     StrategyConfig("N_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm
 ]
+# WEDNESDAY_SENSEX_STRATEGIES = [
+#     StrategyConfig("X_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am
+#     StrategyConfig("X_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am
+#     StrategyConfig("X_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am
+#     StrategyConfig("X_W_1116", "11:16:00", 3, 20.0, 0.0),   # S9_11.16am
+#     StrategyConfig("X_W_1201", "12:01:00", 3, 20.0, 0.0),   # S12_12.01pm
+#     StrategyConfig("X_W_1301", "13:01:00", 3, 20.0, 0.0),   # S16_1.01pm
+#     StrategyConfig("X_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm
+#     StrategyConfig("X_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm
+# ]
 WEDNESDAY_SENSEX_STRATEGIES = [
-    StrategyConfig("X_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am
-    StrategyConfig("X_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am
-    StrategyConfig("X_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am
-    StrategyConfig("X_W_1116", "11:16:00", 3, 20.0, 0.0),   # S9_11.16am
-    StrategyConfig("X_W_1201", "12:01:00", 3, 20.0, 0.0),   # S12_12.01pm
-    StrategyConfig("X_W_1301", "13:01:00", 3, 20.0, 0.0),   # S16_1.01pm
-    StrategyConfig("X_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm
-    StrategyConfig("X_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm
+    StrategyConfig("X_W_0921", "09:21:00", 1, 20.0, 0.0),   # S1_9.21am
+    StrategyConfig("X_W_0946", "09:46:00", 1, 20.0, 0.0),   # S3_9.46am
+    StrategyConfig("X_W_1046", "10:46:00", 1, 20.0, 0.0),   # S7_10.46am
+    StrategyConfig("X_W_1116", "11:16:00", 1, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("X_W_1201", "12:01:00", 1, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("X_W_1301", "13:01:00", 1, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("X_W_1346", "13:46:00", 1, 20.0, 0.0),   # S19_1.46pm
+    StrategyConfig("X_W_1416", "14:16:00", 1, 20.0, 0.0),   # S21_2.16pm
 ]
-
 # Thursday SENSEX – 72 lots total (sorted by time)
 # Slot / score / note from expectancy backtest (see table in repo history).
 THURSDAY_SENSEX_STRATEGIES = [
