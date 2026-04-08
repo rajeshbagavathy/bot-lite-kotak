@@ -749,3 +749,27 @@ def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 500) -> List
     except Exception as e:
         logger.error("fetch_spot_bars_asc_for_recompute failed: %s", e)
         return []
+
+
+def fetch_latest_spot_calm_row(index_name: str) -> Optional[Dict[str, Any]]:
+    """Latest spot row for index with calm flag for gatekeeper checks."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT index_name, bar_time, bar_unix, is_calmzone
+            FROM spot_market_data
+            WHERE index_name = ?
+            ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC, bar_time DESC
+            LIMIT 1
+            """,
+            (index_name,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error("fetch_latest_spot_calm_row failed: %s", e)
+        return None

@@ -107,6 +107,9 @@ from config import (
     USE_PREMIUM_BASED_STRIKE,
     DEMO_MODE,
     DB_ENABLE_MTM_SNAPSHOTS,
+    USE_CALM_ZONE_GATEKEEPER,
+    CALM_ZONE_WAIT_TIMEOUT_MINUTES,
+    CALM_ZONE_POLL_SECONDS,
     get_basic_auth_creds,
     get_today_strategies,
     load_credentials,
@@ -125,6 +128,7 @@ from db import (
     restore_todays_strategies,
     get_ist_timestamp,
     get_ist_now,
+    fetch_latest_spot_calm_row,
 )
 from mtm import calculate_mtm, calculate_strategy_mtm
 from state import (
@@ -553,13 +557,106 @@ def _get_filled_orders(order_book: List[dict], app_order_ids: List[int]) -> List
     ]
 
 
+def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Optional[dict]]:
+    """Gatekeeper decision: execute only when latest index row is calm."""
+    if not USE_CALM_ZONE_GATEKEEPER:
+        return True, "gatekeeper_disabled", None
+    row = fetch_latest_spot_calm_row(index_name)
+    if not row:
+        return False, "no_data", None
+    is_calm = bool(int(row.get("is_calmzone") or 0))
+    return (True, "calm", row) if is_calm else (False, "volatile", row)
+
+
+def _process_waiting_for_calm(client: XTSClient, index_config, expiry: str) -> None:
+    """Non-blocking retry path for strategies waiting on calm zone."""
+    now = get_ist_now()
+    now_ts = now.timestamp()
+    for strategy in STRATEGY_STATE.values():
+        if strategy.get("status") != "WAITING_FOR_CALM":
+            continue
+        started_at = strategy.get("gatekeeper_started_at")
+        if not started_at:
+            started_at = now.isoformat(timespec="seconds")
+            update_strategy(strategy["name"], gatekeeper_started_at=started_at)
+        try:
+            started_dt = datetime.datetime.fromisoformat(str(started_at))
+        except ValueError:
+            started_dt = now
+        elapsed_min = (now - started_dt).total_seconds() / 60.0
+        if elapsed_min > float(CALM_ZONE_WAIT_TIMEOUT_MINUTES):
+            msg = (
+                f"Strategy {strategy['name']} SKIPPED: No calm zone found within "
+                f"{CALM_ZONE_WAIT_TIMEOUT_MINUTES}-minute window."
+            )
+            logger.warning(msg)
+            update_strategy(
+                strategy["name"],
+                status="SKIPPED_VOLATILITY",
+                message=msg,
+                skip_reason="NO_CALM_ZONE_TIMEOUT",
+                gatekeeper_started_at=None,
+                next_gatekeeper_check_at=None,
+            )
+            continue
+        next_check_at = strategy.get("next_gatekeeper_check_at") or 0
+        try:
+            next_check_at_f = float(next_check_at)
+        except (TypeError, ValueError):
+            next_check_at_f = 0.0
+        if now_ts < next_check_at_f:
+            continue
+        can_run, reason, row = should_execute_now(strategy["name"], index_config.name)
+        if can_run:
+            update_strategy(
+                strategy["name"],
+                gatekeeper_started_at=None,
+                next_gatekeeper_check_at=None,
+                message=f"Calm Zone detected ({reason}); executing delayed strategy.",
+            )
+            _execute_strategy(client, index_config, expiry, strategy, force=True)
+        else:
+            update_strategy(
+                strategy["name"],
+                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
+                message=(
+                    f"Waiting for Calm Zone ({reason}; latest="
+                    f"{row.get('bar_time') if row else 'none'})"
+                ),
+            )
+
+
 def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, force: bool = False) -> None:
-    if strategy["status"] not in ("PENDING", "ERROR"):
+    if strategy["status"] not in ("PENDING", "ERROR", "WAITING_FOR_CALM"):
         return
     if not force and get_ist_now().strftime("%H:%M:%S") < strategy["time"]:
         return
 
     name = strategy["name"]
+    can_run, gate_reason, gate_row = should_execute_now(name, index_config.name)
+    if not can_run:
+        now_ts = get_ist_now().timestamp()
+        update_strategy(
+            name,
+            status="WAITING_FOR_CALM",
+            gatekeeper_started_at=strategy.get("gatekeeper_started_at") or get_ist_now().isoformat(timespec="seconds"),
+            next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
+            message=(
+                "Strategy "
+                + name
+                + " waiting for Calm Zone. Volatility detected."
+                + (
+                    f" (reason={gate_reason}, latest={gate_row.get('bar_time')})"
+                    if gate_row
+                    else f" (reason={gate_reason})"
+                )
+            ),
+        )
+        logger.info("Strategy %s waiting for Calm Zone. Volatility detected.", name)
+        return
+    if strategy.get("status") == "WAITING_FOR_CALM":
+        update_strategy(name, message="Calm Zone found; executing delayed strategy.")
+
     is_expiry = _is_expiry_day(expiry)
     atm_strike = _get_atm_strike(client, index_config)
     if atm_strike is None:
@@ -1983,6 +2080,9 @@ def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
             )
 
     schedule.every(3).seconds.do(_monitor_mtm, client=client, index_config=index_config, portfolio_sl=PORTFOLIO_SL_LIMIT)
+    schedule.every(max(1, int(CALM_ZONE_POLL_SECONDS))).seconds.do(
+        _process_waiting_for_calm, client=client, index_config=index_config, expiry=expiry
+    )
     schedule.every(60).seconds.do(_update_available_margin, client=client)
     schedule.every().day.at("00:00").do(cleanup_old_data)
     _JOBS_SCHEDULED_FLAG = True
@@ -2116,6 +2216,10 @@ def main() -> None:
                 "db_id": None,
                 "survivor_sl_adjusted_to_cost": False,
                 "survivor_sl_to_cost_hint": None,
+                "scheduled_time": cfg.time,
+                "gatekeeper_started_at": None,
+                "next_gatekeeper_check_at": None,
+                "skip_reason": None,
             }
 
     # Restore today's strategies from database (before init_state)

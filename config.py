@@ -135,7 +135,7 @@ WEDNESDAY_SENSEX_STRATEGIES = [
     StrategyConfig("X_W_1046", "10:46:00", 1, 20.0, 0.0),   # S7_10.46am
     StrategyConfig("X_W_1116", "11:16:00", 1, 20.0, 0.0),   # S9_11.16am
     StrategyConfig("X_W_1201", "12:01:00", 1, 20.0, 0.0),   # S12_12.01pm
-    StrategyConfig("X_W_1301", "13:01:00", 1, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("X_W_1301", "13:04:00", 1, 20.0, 0.0),   # S16_1.01pm
     StrategyConfig("X_W_1346", "13:46:00", 1, 20.0, 0.0),   # S19_1.46pm
     StrategyConfig("X_W_1416", "14:16:00", 1, 20.0, 0.0),   # S21_2.16pm
 ]
@@ -252,6 +252,9 @@ ACC_NAME = os.getenv("ACC_NAME")
 # Calm zone / OHLC: optional correction (seconds) added to vendor unix timestamps before IST formatting.
 # Set only if candle times are consistently shifted vs India wall clock (default 0).
 CALM_ZONE_BAR_UNIX_OFFSET_SEC = int(os.getenv("CALM_ZONE_BAR_UNIX_OFFSET_SEC", "0"))
+USE_CALM_ZONE_GATEKEEPER = os.getenv("USE_CALM_ZONE_GATEKEEPER", "True").lower() in ("true", "1", "yes")
+CALM_ZONE_WAIT_TIMEOUT_MINUTES = int(os.getenv("CALM_ZONE_WAIT_TIMEOUT_MINUTES", "30"))
+CALM_ZONE_POLL_SECONDS = int(os.getenv("CALM_ZONE_POLL_SECONDS", "60"))
 
 # Database configuration
 DB_PATH = os.getenv("DB_PATH", "trades.db")

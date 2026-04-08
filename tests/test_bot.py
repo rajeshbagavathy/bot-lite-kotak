@@ -1899,6 +1899,96 @@ class TestMainBlock(unittest.TestCase):
         self.assertTrue(callable(bot.main))
 
 
+class TestCalmZoneGatekeeper(unittest.TestCase):
+    def setUp(self):
+        self.index_config = MagicMock()
+        self.index_config.name = "NIFTY"
+        self.client = MagicMock()
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", False)
+    def test_should_execute_now_when_gatekeeper_disabled(self):
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "gatekeeper_disabled")
+        self.assertIsNone(row)
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
+    @patch("bot.fetch_latest_spot_calm_row")
+    def test_should_execute_now_from_calm_row(self, mock_latest):
+        mock_latest.return_value = {"bar_time": "2026-04-08 09:20:00", "is_calmzone": 1}
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "calm")
+        self.assertEqual(row["is_calmzone"], 1)
+
+    @patch("bot.get_ist_now")
+    @patch("bot.logger")
+    @patch("bot.update_strategy")
+    @patch("bot.should_execute_now")
+    @patch("bot._execute_strategy")
+    @patch("bot.CALM_ZONE_WAIT_TIMEOUT_MINUTES", 30)
+    @patch("bot.CALM_ZONE_POLL_SECONDS", 60)
+    def test_waiting_strategy_executes_when_calm(
+        self, mock_exec, mock_gate, mock_update, _mock_logger, mock_now
+    ):
+        now = datetime.datetime(2026, 4, 8, 9, 31, 0)
+        mock_now.return_value = now
+        mock_gate.return_value = (True, "calm", {"bar_time": "2026-04-08 09:30:00"})
+        bot.STRATEGY_STATE = {
+            "N_W_0921": {
+                "name": "N_W_0921",
+                "status": "WAITING_FOR_CALM",
+                "gatekeeper_started_at": "2026-04-08T09:21:00",
+                "next_gatekeeper_check_at": now.timestamp() - 1,
+            }
+        }
+        strategy = bot.STRATEGY_STATE["N_W_0921"]
+        bot._process_waiting_for_calm(self.client, self.index_config, "10APR2026")
+        mock_exec.assert_called_once_with(self.client, self.index_config, "10APR2026", strategy, force=True)
+        self.assertTrue(mock_update.call_count >= 1)
+
+    @patch("bot.get_ist_now")
+    @patch("bot.logger")
+    @patch("bot.update_strategy")
+    @patch("bot.should_execute_now")
+    @patch("bot.CALM_ZONE_WAIT_TIMEOUT_MINUTES", 30)
+    @patch("bot.CALM_ZONE_POLL_SECONDS", 60)
+    def test_waiting_strategy_skips_after_timeout(
+        self, mock_gate, mock_update, _mock_logger, mock_now
+    ):
+        now = datetime.datetime(2026, 4, 8, 10, 0, 0)
+        mock_now.return_value = now
+        mock_gate.return_value = (False, "volatile", {"bar_time": "2026-04-08 09:59:00"})
+        bot.STRATEGY_STATE = {
+            "N_W_0921": {
+                "name": "N_W_0921",
+                "status": "WAITING_FOR_CALM",
+                "gatekeeper_started_at": "2026-04-08T09:21:00",
+                "next_gatekeeper_check_at": now.timestamp() - 1,
+            }
+        }
+        bot._process_waiting_for_calm(self.client, self.index_config, "10APR2026")
+        last_args = mock_update.call_args_list[-1]
+        self.assertEqual(last_args.args[0], "N_W_0921")
+        self.assertEqual(last_args.kwargs["status"], "SKIPPED_VOLATILITY")
+
+    @patch("bot.get_ist_now")
+    @patch("bot.logger")
+    @patch("bot.update_strategy")
+    @patch("bot.should_execute_now")
+    @patch("bot._get_atm_strike")
+    def test_execute_strategy_moves_to_waiting_when_not_calm(
+        self, mock_atm, mock_gate, mock_update, _mock_logger, mock_now
+    ):
+        mock_now.return_value = datetime.datetime(2026, 4, 8, 9, 21, 0)
+        mock_gate.return_value = (False, "volatile", {"bar_time": "2026-04-08 09:20:00"})
+        mock_atm.return_value = 25000
+        strategy = {"name": "N_W_0921", "status": "PENDING", "time": "09:21:00"}
+        bot._execute_strategy(self.client, self.index_config, "10APR2026", strategy, force=False)
+        self.assertEqual(mock_update.call_args.kwargs["status"], "WAITING_FOR_CALM")
+        mock_atm.assert_not_called()
+
+
 if __name__ == "__main__":
     # Run tests with coverage report
     unittest.main(verbosity=2)
