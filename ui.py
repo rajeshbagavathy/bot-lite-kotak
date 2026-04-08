@@ -14,7 +14,7 @@ from state import (
 )
 
 from bot_log_filter import bot_log_line_is_survivor_event
-from db import fetch_spot_market_rows
+from db import count_spot_market_rows, fetch_spot_market_rows
 
 try:
     from config import CALM_ZONE_BAR_UNIX_OFFSET_SEC, LEG_TARGET_PCT
@@ -328,6 +328,17 @@ DASHBOARD_TEMPLATE = """
             <option value="both">Candles + Line</option>
           </select>
         </label>
+        <label class="setting-row" style="font-size: 12px; color: #cbd5e1;">
+          <span>Rows/page:</span>
+          <select id="volatility-page-size" style="background: #0f172a; color: #e2e8f0; border: 1px solid #334155; padding: 4px 6px;">
+            <option value="120">120</option>
+            <option value="240">240</option>
+            <option value="480">480</option>
+          </select>
+          <button type="button" class="tab-btn" id="volatility-prev" style="padding: 4px 10px;">Prev</button>
+          <button type="button" class="tab-btn" id="volatility-next" style="padding: 4px 10px;">Next</button>
+          <span id="volatility-page-meta" class="meta-label" style="font-size: 11px;">Page 1</span>
+        </label>
       </div>
       <table>
         <thead>
@@ -359,6 +370,9 @@ DASHBOARD_TEMPLATE = """
   </div>
 
   <script>
+    let __volatilityPage = 1;
+    let __volatilityPageSize = 120;
+
     function fmt(num) {
       if (num === null || num === undefined) return "-";
       const n = Number(num);
@@ -487,11 +501,21 @@ DASHBOARD_TEMPLATE = """
       const tbody = document.getElementById('volatility-rows');
       const chartEl = document.getElementById('volatility-chart');
       const modeSel = document.getElementById('volatility-chart-mode');
-      if (!label || !tbody || !chartEl || !modeSel) return;
+      const pageMeta = document.getElementById('volatility-page-meta');
+      const prevBtn = document.getElementById('volatility-prev');
+      const nextBtn = document.getElementById('volatility-next');
+      if (!label || !tbody || !chartEl || !modeSel || !pageMeta || !prevBtn || !nextBtn) return;
       const mode = modeSel.value || 'candles';
       const name = vol && vol.index ? vol.index : 'NIFTY';
       label.textContent = name;
       const rows = (vol && vol.rows) ? vol.rows : [];
+      const page = Number((vol && vol.page) || __volatilityPage || 1);
+      const pageSize = Number((vol && vol.page_size) || __volatilityPageSize || 120);
+      const total = Number((vol && vol.total_rows) || 0);
+      const totalPages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)));
+      pageMeta.textContent = 'Page ' + page + ' / ' + totalPages + ' · total rows: ' + total;
+      prevBtn.disabled = page <= 1;
+      nextBtn.disabled = page >= totalPages;
       const cfgOff = (vol && vol.bar_unix_offset_sec != null) ? Number(vol.bar_unix_offset_sec) : 0;
       const off = inferBarUnixOffsetSec(rows, cfgOff);
       let html = '';
@@ -581,7 +605,7 @@ DASHBOARD_TEMPLATE = """
           fetch('/api/orders', noCache).then(r => r.json()),
           fetch('/api/trades', noCache).then(r => r.json()),
           fetch('/api/mtm', noCache).then(r => r.json()),
-          fetch('/api/volatility-monitor', noCache).then(r => r.json()),
+          fetch('/api/volatility-monitor?page=' + encodeURIComponent(__volatilityPage) + '&page_size=' + encodeURIComponent(__volatilityPageSize), noCache).then(r => r.json()),
           fetch('/api/bot-log?lines=2500&mode=' + encodeURIComponent(logMode) + '&_=' + Date.now(), noCache).then(r => r.json()),
         ]);
 
@@ -600,9 +624,35 @@ DASHBOARD_TEMPLATE = """
         const dne = document.getElementById('dash-flag-non-expiry');
         const dm = document.getElementById('dash-flag-mtm');
         const volMode = document.getElementById('volatility-chart-mode');
+        const volPageSize = document.getElementById('volatility-page-size');
+        const volPrev = document.getElementById('volatility-prev');
+        const volNext = document.getElementById('volatility-next');
         if (volMode && !volMode.dataset.bound) {
           volMode.dataset.bound = '1';
           volMode.addEventListener('change', function() { updateVolatilityMonitor(volmon); });
+        }
+        if (volPageSize && !volPageSize.dataset.bound) {
+          volPageSize.dataset.bound = '1';
+          volPageSize.value = String(__volatilityPageSize);
+          volPageSize.addEventListener('change', function() {
+            __volatilityPageSize = Number(volPageSize.value || 120);
+            __volatilityPage = 1;
+            loadDashboard();
+          });
+        }
+        if (volPrev && !volPrev.dataset.bound) {
+          volPrev.dataset.bound = '1';
+          volPrev.addEventListener('click', function() {
+            __volatilityPage = Math.max(1, __volatilityPage - 1);
+            loadDashboard();
+          });
+        }
+        if (volNext && !volNext.dataset.bound) {
+          volNext.dataset.bound = '1';
+          volNext.addEventListener('click', function() {
+            __volatilityPage = __volatilityPage + 1;
+            loadDashboard();
+          });
         }
         if (toggle1 && !toggle1.dataset.bound) {
           toggle1.dataset.bound = '1';
@@ -1339,17 +1389,34 @@ def create_app(username: str, password: str) -> Flask:
     def api_volatility_monitor():
         """Latest 1m spot bars + calm metrics for the bot's active index (NIFTY/SENSEX)."""
         try:
+            from flask import request
+
             snap = get_snapshot()
             idx = snap.get("index") or {}
             name = (idx.get("name") or "NIFTY").strip().upper()
             if name not in ("NIFTY", "SENSEX"):
                 name = "NIFTY"
-            rows = fetch_spot_market_rows(name, 120)
+            try:
+                page = int(request.args.get("page", "1"))
+            except ValueError:
+                page = 1
+            try:
+                page_size = int(request.args.get("page_size", "120"))
+            except ValueError:
+                page_size = 120
+            page = max(1, page)
+            page_size = max(60, min(page_size, 1000))
+            offset = (page - 1) * page_size
+            total_rows = count_spot_market_rows(name)
+            rows = fetch_spot_market_rows(name, limit=page_size, offset=offset)
             return jsonify(
                 {
                     "index": name,
                     "rows": rows,
                     "bar_unix_offset_sec": CALM_ZONE_BAR_UNIX_OFFSET_SEC,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_rows": total_rows,
                 }
             )
         except Exception as e:
@@ -1360,6 +1427,9 @@ def create_app(username: str, password: str) -> Flask:
                         "rows": [],
                         "error": str(e),
                         "bar_unix_offset_sec": CALM_ZONE_BAR_UNIX_OFFSET_SEC,
+                        "page": 1,
+                        "page_size": 120,
+                        "total_rows": 0,
                     }
                 ),
                 500,

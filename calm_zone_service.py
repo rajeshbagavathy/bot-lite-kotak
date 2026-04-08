@@ -30,6 +30,17 @@ FETCH_LOOKBACK_MINUTES = 25
 RECOMPUTE_TAIL = 500
 MAX_RETRIES = 5
 BASE_SLEEP_SEC = 60
+MARKET_OPEN_HHMM = (9, 15)
+MARKET_CLOSE_HHMM = (15, 30)
+
+
+def _is_market_hours_ist(now: Optional[datetime] = None) -> bool:
+    t = (now or get_ist_now()).time()
+    open_h, open_m = MARKET_OPEN_HHMM
+    close_h, close_m = MARKET_CLOSE_HHMM
+    start_ok = (t.hour, t.minute) >= (open_h, open_m)
+    end_ok = (t.hour, t.minute) <= (close_h, close_m)
+    return start_ok and end_ok
 
 
 def _normalize_unix_ts(ts: float) -> int:
@@ -161,9 +172,22 @@ def calm_zone_tick(client: XTSClient) -> None:
 
 def _run_loop(client: XTSClient, stop: threading.Event) -> None:
     logger.info("Calm zone monitor thread started (DB=%s)", DB_PATH)
+    was_open = None
     while not stop.is_set():
         try:
-            calm_zone_tick(client)
+            now = get_ist_now()
+            in_hours = _is_market_hours_ist(now)
+            if in_hours:
+                calm_zone_tick(client)
+            elif was_open is not False:
+                logger.info(
+                    "Calm zone ingestion paused outside market hours (%02d:%02d-%02d:%02d IST).",
+                    MARKET_OPEN_HHMM[0],
+                    MARKET_OPEN_HHMM[1],
+                    MARKET_CLOSE_HHMM[0],
+                    MARKET_CLOSE_HHMM[1],
+                )
+            was_open = in_hours
         except Exception:
             logger.exception("Calm zone tick failed")
         stop.wait(BASE_SLEEP_SEC)

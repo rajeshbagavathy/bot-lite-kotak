@@ -700,8 +700,8 @@ def upsert_spot_bar(
         logger.error("Failed to upsert spot bar %s %s: %s", index_name, bar_time, e)
 
 
-def fetch_spot_market_rows(index_name: str, limit: int = 120) -> List[Dict[str, Any]]:
-    """Latest ``limit`` bars for index, newest first."""
+def fetch_spot_market_rows(index_name: str, limit: int = 120, offset: int = 0) -> List[Dict[str, Any]]:
+    """Latest ``limit`` bars for index, newest first, with pagination offset."""
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -713,9 +713,9 @@ def fetch_spot_market_rows(index_name: str, limit: int = 120) -> List[Dict[str, 
             FROM spot_market_data
             WHERE index_name = ?
             ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC, bar_time DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (index_name, limit),
+            (index_name, limit, max(0, int(offset))),
         )
         rows = [dict(r) for r in cursor.fetchall()]
         conn.close()
@@ -723,6 +723,27 @@ def fetch_spot_market_rows(index_name: str, limit: int = 120) -> List[Dict[str, 
     except Exception as e:
         logger.error("fetch_spot_market_rows failed: %s", e)
         return []
+
+
+def count_spot_market_rows(index_name: str) -> int:
+    """Total count of spot rows for an index."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM spot_market_data
+            WHERE index_name = ?
+            """,
+            (index_name,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        logger.error("count_spot_market_rows failed: %s", e)
+        return 0
 
 
 def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 500) -> List[Dict[str, Any]]:
