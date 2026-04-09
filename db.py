@@ -378,6 +378,7 @@ def cleanup_previous_day_data() -> None:
     This ensures:
     - Each trading day starts fresh with clean database
     - Previous day positions, orders, strategies are removed
+    - 1m spot OHLC (spot_market_data) keeps only today's bars (IST) for all indices
     - But day-trader might restart app multiple times, so today's data persists
     """
     try:
@@ -417,13 +418,25 @@ def cleanup_previous_day_data() -> None:
         deleted_mtm = cursor.execute("""
             DELETE FROM mtm_snapshots WHERE DATE(timestamp) < ?
         """, (ist_today,)).rowcount
+
+        # Step 5: 1m spot OHLC (all indices) — keep only today (IST) so charts are not mixed across sessions.
+        deleted_spot = cursor.execute(
+            """
+            DELETE FROM spot_market_data
+            WHERE bar_time IS NOT NULL AND substr(bar_time, 1, 10) < ?
+            """,
+            (today,),
+        ).rowcount
         
         conn.commit()
         conn.close()
         
         logger.debug(f"🧹 Startup Cleanup: Deleted data from previous days (before {today})")
-        if deleted > 0 or deleted_orders > 0 or deleted_trades > 0 or deleted_mtm > 0:
-            logger.debug(f"   - Strategies: {deleted} | Orders: {deleted_orders} | Closed Trades: {deleted_trades} | MTM: {deleted_mtm}")
+        if deleted > 0 or deleted_orders > 0 or deleted_trades > 0 or deleted_mtm > 0 or deleted_spot > 0:
+            logger.debug(
+                f"   - Strategies: {deleted} | Orders: {deleted_orders} | Closed Trades: {deleted_trades} "
+                f"| MTM: {deleted_mtm} | Spot 1m: {deleted_spot}"
+            )
             logger.debug(f"✅ Previous day data cleaned up. Today starts fresh!")
         else:
             logger.debug(f"✅ No previous day data to cleanup. Today ({today}) starts clean.")
