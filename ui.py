@@ -447,7 +447,28 @@ DASHBOARD_TEMPLATE = """
       return null;
     }
 
+    function inferBarUnixOffsetSec(rows, configuredOffsetSec, pageNum) {
+      const base = Number(configuredOffsetSec) || 0;
+      const page = Number(pageNum) || 1;
+      if (page !== 1 || !rows || !rows.length) return base;
+      const first = rows[0];
+      if (!first || first.bar_unix == null || first.bar_unix === '') return base;
+      const sec = Number(first.bar_unix);
+      if (isNaN(sec)) return base;
+      const nowSec = Math.floor(Date.now() / 1000);
+      const drift = nowSec - (sec + base);
+      if (Math.abs(drift) >= 2 * 3600 && Math.abs(drift) <= 12 * 3600) {
+        return base + Math.round(drift / 60) * 60;
+      }
+      return base;
+    }
+
     function formatVolBarTime(r, offsetSec) {
+      const ms = barUnixMs(r, offsetSec);
+      if (ms != null && !isNaN(ms)) {
+        const d = new Date(ms);
+        return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
+      }
       const raw = String(r.bar_time || '').replace(/\s*IST\s*$/i, '').trim();
       const m = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
       if (m) {
@@ -456,16 +477,15 @@ DASHBOARD_TEMPLATE = """
           return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
         }
       }
-      const ms = barUnixMs(r, offsetSec);
-      if (ms != null && !isNaN(ms)) {
-        const d = new Date(ms);
-        return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
-      }
       if (!raw) return '-';
       return raw + ' IST';
     }
 
     function shortChartTimeLabel(r, offsetSec) {
+      const ms = barUnixMs(r, offsetSec);
+      if (ms != null && !isNaN(ms)) {
+        return new Date(ms).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true });
+      }
       const s = String(r.bar_time || '');
       const pm = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}):\d{2}/);
       if (pm) {
@@ -473,10 +493,6 @@ DASHBOARD_TEMPLATE = """
         if (!isNaN(d.getTime())) {
           return d.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true });
         }
-      }
-      const ms = barUnixMs(r, offsetSec);
-      if (ms != null && !isNaN(ms)) {
-        return new Date(ms).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true });
       }
       const parts = s.split(/[ T]/);
       return parts.length > 1 ? parts[1].slice(0, 8) : s.slice(-8);
@@ -503,7 +519,7 @@ DASHBOARD_TEMPLATE = """
       prevBtn.disabled = page <= 1;
       nextBtn.disabled = page >= totalPages;
       const cfgOff = (vol && vol.bar_unix_offset_sec != null) ? Number(vol.bar_unix_offset_sec) : 0;
-      const off = cfgOff;
+      const off = inferBarUnixOffsetSec(rows, cfgOff, page);
       let html = '';
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i];

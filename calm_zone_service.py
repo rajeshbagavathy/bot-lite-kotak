@@ -256,22 +256,9 @@ def calm_zone_tick(client: XTSClient) -> None:
 
 def _run_loop(client: XTSClient, stop: threading.Event) -> None:
     logger.info("Calm zone monitor thread started (DB=%s)", DB_PATH)
-    was_open = None
     while not stop.is_set():
         try:
-            now = get_ist_now()
-            in_hours = _is_market_hours_ist(now)
-            if in_hours:
-                calm_zone_tick(client)
-            elif was_open is not False:
-                logger.info(
-                    "Calm zone ingestion paused outside market hours (%02d:%02d-%02d:%02d IST).",
-                    MARKET_OPEN_HHMM[0],
-                    MARKET_OPEN_HHMM[1],
-                    MARKET_CLOSE_HHMM[0],
-                    MARKET_CLOSE_HHMM[1],
-                )
-            was_open = in_hours
+            calm_zone_tick(client)
         except Exception:
             logger.exception("Calm zone tick failed")
         stop.wait(BASE_SLEEP_SEC)
