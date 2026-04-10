@@ -25,6 +25,7 @@ from db import (
     fetch_spot_bars_asc_for_recompute,
     fetch_latest_spot_bar_row,
     get_ist_now,
+    normalize_spot_rows_for_offset,
     spot_bar_exists,
     upsert_spot_bar,
     upsert_spot_ohlc_only,
@@ -406,6 +407,7 @@ def backfill_today_calm_once() -> None:
     for all currently-available minutes and lock them.
     """
     for index_name in ("NIFTY", "SENSEX"):
+        normalize_spot_rows_for_offset(index_name, CALM_ZONE_BAR_UNIX_OFFSET_SEC, today_only=True)
         recompute_calm_metrics_for_index(index_name, STARTUP_BACKFILL_LIMIT)
 
 

@@ -96,6 +96,73 @@ def _normalize_spot_legacy_bar_times(cursor: sqlite3.Cursor) -> None:
         )
 
 
+def normalize_spot_rows_for_offset(index_name: str, bar_unix_offset_sec: int, *, today_only: bool = True) -> int:
+    """
+    Re-key spot rows from bar_unix using current offset and merge duplicates.
+
+    This is used when offset defaults/config change (e.g. 0 -> -19800), which can leave
+    two rows per bar_unix with different bar_time keys. Keeps the best row (locked/metrics first)
+    and rewrites bar_time to canonical minute key for the current offset.
+    Returns number of affected rows (deleted + updated).
+    """
+    affected = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        params: List[Any] = [index_name]
+        where = "WHERE index_name = ? AND bar_unix IS NOT NULL"
+        if today_only:
+            where += " AND substr(bar_time, 1, 10) = ?"
+            params.append(get_ist_date())
+        cursor.execute(
+            f"""
+            SELECT rowid, index_name, bar_time, bar_unix, range_5m, calm_locked
+            FROM spot_market_data
+            {where}
+            ORDER BY bar_unix DESC, rowid DESC
+            """,
+            tuple(params),
+        )
+        rows = cursor.fetchall()
+        by_unix: Dict[int, List[sqlite3.Row]] = defaultdict(list)
+        for r in rows:
+            try:
+                by_unix[int(r["bar_unix"])].append(r)
+            except Exception:
+                continue
+
+        for bu, grp in by_unix.items():
+            grp_sorted = sorted(
+                grp,
+                key=lambda r: (
+                    int(r["calm_locked"] or 0),
+                    1 if r["range_5m"] is not None else 0,
+                    int(r["rowid"]),
+                ),
+                reverse=True,
+            )
+            keep = grp_sorted[0]
+            keep_rid = int(keep["rowid"])
+            for r in grp_sorted[1:]:
+                cursor.execute("DELETE FROM spot_market_data WHERE rowid = ?", (int(r["rowid"]),))
+                affected += 1
+
+            can_dt = datetime.fromtimestamp(int(bu) + int(bar_unix_offset_sec), IST).replace(second=0, microsecond=0)
+            can_bt = can_dt.strftime("%Y-%m-%d %H:%M:%S")
+            if str(keep["bar_time"]) != can_bt:
+                cursor.execute(
+                    "UPDATE spot_market_data SET bar_time = ? WHERE rowid = ?",
+                    (can_bt, keep_rid),
+                )
+                affected += 1
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("normalize_spot_rows_for_offset failed for %s: %s", index_name, e)
+    return affected
+
+
 def init_db() -> None:
     """Initialize SQLite database and create schema."""
     try:
