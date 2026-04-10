@@ -1042,26 +1042,32 @@ def count_spot_market_rows(index_name: str) -> int:
         return 0
 
 
-def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """Oldest first, for sliding-window recompute."""
+def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 2500) -> List[Dict[str, Any]]:
+    """Oldest first (today IST only), for sliding-window recompute.
+
+    Uses ascending time from session start — not the last-N-reversed window — so the
+    first rows in the list are the true open bars and the 5-bar window is never built
+    from a truncated tail that omits earlier minutes.
+    """
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
+        today = get_ist_date()
         cursor.execute(
             """
             SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
                    range_5m, net_body, body_range_ratio, is_calmzone, calm_locked
             FROM spot_market_data
             WHERE index_name = ?
-            ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC
+              AND substr(bar_time, 1, 10) = ?
+            ORDER BY (bar_unix IS NULL) ASC, bar_unix ASC, bar_time ASC
             LIMIT ?
             """,
-            (index_name, limit),
+            (index_name, today, limit),
         )
         rows = [dict(r) for r in cursor.fetchall()]
         conn.close()
-        rows.reverse()
         return rows
     except Exception as e:
         logger.error("fetch_spot_bars_asc_for_recompute failed: %s", e)

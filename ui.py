@@ -447,36 +447,8 @@ DASHBOARD_TEMPLATE = """
       return null;
     }
 
-    function inferBarUnixOffsetSec(rows, configuredOffsetSec) {
-      const base = Number(configuredOffsetSec) || 0;
-      if (!rows || !rows.length) return base;
-      let latest = null;
-      for (let i = 0; i < rows.length; i++) {
-        if (rows[i].bar_unix != null && rows[i].bar_unix !== '') {
-          latest = rows[i];
-          break;
-        }
-      }
-      if (!latest) return base;
-      const sec = Number(latest.bar_unix);
-      if (isNaN(sec)) return base;
-      const nowSec = Math.floor(Date.now() / 1000);
-      const drift = nowSec - (sec + base);
-      // If vendor epoch is clearly shifted (few hours), auto-correct for display.
-      if (Math.abs(drift) >= 2 * 3600 && Math.abs(drift) <= 12 * 3600) {
-        return base + Math.round(drift / 60) * 60;
-      }
-      return base;
-    }
-
     function formatVolBarTime(r, offsetSec) {
-      const ms = barUnixMs(r, offsetSec);
-      if (ms != null && !isNaN(ms)) {
-        const d = new Date(ms);
-        return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
-      }
       const raw = String(r.bar_time || '').replace(/\s*IST\s*$/i, '').trim();
-      if (!raw) return '-';
       const m = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
       if (m) {
         const d = new Date(m[1] + 'T' + m[2] + '+05:30');
@@ -484,15 +456,28 @@ DASHBOARD_TEMPLATE = """
           return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
         }
       }
+      const ms = barUnixMs(r, offsetSec);
+      if (ms != null && !isNaN(ms)) {
+        const d = new Date(ms);
+        return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) + ' IST';
+      }
+      if (!raw) return '-';
       return raw + ' IST';
     }
 
     function shortChartTimeLabel(r, offsetSec) {
+      const s = String(r.bar_time || '');
+      const pm = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}):\d{2}/);
+      if (pm) {
+        const d = new Date(pm[1] + 'T' + pm[2] + ':00+05:30');
+        if (!isNaN(d.getTime())) {
+          return d.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true });
+        }
+      }
       const ms = barUnixMs(r, offsetSec);
       if (ms != null && !isNaN(ms)) {
         return new Date(ms).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true });
       }
-      const s = String(r.bar_time || '');
       const parts = s.split(/[ T]/);
       return parts.length > 1 ? parts[1].slice(0, 8) : s.slice(-8);
     }
@@ -518,7 +503,7 @@ DASHBOARD_TEMPLATE = """
       prevBtn.disabled = page <= 1;
       nextBtn.disabled = page >= totalPages;
       const cfgOff = (vol && vol.bar_unix_offset_sec != null) ? Number(vol.bar_unix_offset_sec) : 0;
-      const off = inferBarUnixOffsetSec(rows, cfgOff);
+      const off = cfgOff;
       let html = '';
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
@@ -538,10 +523,13 @@ DASHBOARD_TEMPLATE = """
         return;
       }
       const asc = rows.slice().sort(function(a, b) {
+        const ta = String(a.bar_time || '');
+        const tb = String(b.bar_time || '');
+        if (ta && tb) return ta.localeCompare(tb);
         const ma = barUnixMs(a, off);
         const mb = barUnixMs(b, off);
         if (ma != null && mb != null) return ma - mb;
-        return String(a.bar_time).localeCompare(String(b.bar_time));
+        return ta.localeCompare(tb);
       });
       const cats = asc.map(function(r) { return shortChartTimeLabel(r, off); });
       const candleData = asc.map(function(r) {
