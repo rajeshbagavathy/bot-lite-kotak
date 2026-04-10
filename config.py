@@ -252,8 +252,9 @@ SSM_BASE_PATH = "/trade/config"
 ACC_NAME = os.getenv("ACC_NAME")
 
 # Calm zone / OHLC: optional correction (seconds) added to vendor unix timestamps before IST formatting.
-# Set only if candle times are consistently shifted vs India wall clock (default 0).
-CALM_ZONE_BAR_UNIX_OFFSET_SEC = int(os.getenv("CALM_ZONE_BAR_UNIX_OFFSET_SEC", "0"))
+# Default -19800 aligns feeds that are consistently +5h30 ahead of India wall clock.
+# Override via env if your vendor/account feed differs.
+CALM_ZONE_BAR_UNIX_OFFSET_SEC = int(os.getenv("CALM_ZONE_BAR_UNIX_OFFSET_SEC", "-19800"))
 USE_CALM_ZONE_GATEKEEPER = os.getenv("USE_CALM_ZONE_GATEKEEPER", "True").lower() in ("true", "1", "yes")
 # latest_bar: only the newest 1m row may pass (very strict; flips every minute).
 # recent_calm: pass if any calm bar exists within CALM_ZONE_RECENT_CALM_MINUTES (wall clock).
