@@ -1074,8 +1074,21 @@ def fetch_spot_market_rows(index_name: str, limit: int = 120, offset: int = 0) -
             """
             SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
                    range_5m, net_body, body_range_ratio, is_calmzone, calm_locked
-            FROM spot_market_data
-            WHERE index_name = ?
+            FROM (
+                SELECT
+                    index_name, bar_time, bar_unix, open, high, low, close, volume,
+                    range_5m, net_body, body_range_ratio, is_calmzone, calm_locked,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY index_name, COALESCE(bar_unix, -1)
+                        ORDER BY
+                            calm_locked DESC,
+                            CASE WHEN range_5m IS NOT NULL THEN 1 ELSE 0 END DESC,
+                            bar_time DESC
+                    ) AS rn
+                FROM spot_market_data
+                WHERE index_name = ?
+            ) t
+            WHERE rn = 1
             ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC, bar_time DESC
             LIMIT ? OFFSET ?
             """,
@@ -1090,15 +1103,18 @@ def fetch_spot_market_rows(index_name: str, limit: int = 120, offset: int = 0) -
 
 
 def count_spot_market_rows(index_name: str) -> int:
-    """Total count of spot rows for an index."""
+    """Total deduplicated count of spot rows for an index."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT COUNT(*)
-            FROM spot_market_data
-            WHERE index_name = ?
+            SELECT COUNT(*) FROM (
+                SELECT COALESCE(bar_unix, -1) AS k
+                FROM spot_market_data
+                WHERE index_name = ?
+                GROUP BY k
+            )
             """,
             (index_name,),
         )
