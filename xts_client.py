@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import re
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -148,13 +149,15 @@ class XTSClient:
     @staticmethod
     def parse_ohlc_data_response(data_response: str) -> List[Dict[str, Any]]:
         """
-        Parse ``dataReponse`` payload: lines of ``unix_ts|open|high|low|close|volume|...``.
+        Parse ``dataReponse`` payload: bars of ``unix_ts|open|high|low|close|volume|...``.
+        XTS payload may be newline-separated and/or comma-separated depending on route/version.
         Returns bar dicts with bar_unix (int), open, high, low, close, volume.
         """
         if not data_response or not str(data_response).strip():
             return []
         out: List[Dict[str, Any]] = []
-        for line in str(data_response).strip().split("\n"):
+        chunks = re.split(r"[\r\n,]+", str(data_response).strip())
+        for line in chunks:
             line = line.strip()
             if not line:
                 continue
