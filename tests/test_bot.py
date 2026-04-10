@@ -1988,18 +1988,31 @@ class TestCalmZoneGatekeeper(unittest.TestCase):
 
     @patch("bot.get_ist_now")
     @patch("bot.logger")
+    @patch("bot.upsert_strategy_waiting_for_calm", return_value=1)
     @patch("bot.update_strategy")
     @patch("bot.should_execute_now")
     @patch("bot._get_atm_strike")
     def test_execute_strategy_moves_to_waiting_when_not_calm(
-        self, mock_atm, mock_gate, mock_update, _mock_logger, mock_now
+        self, mock_atm, mock_gate, mock_update, _mock_upsert, _mock_logger, mock_now
     ):
         mock_now.return_value = datetime.datetime(2026, 4, 8, 9, 21, 0)
         mock_gate.return_value = (False, "volatile", {"bar_time": "2026-04-08 09:20:00"})
         mock_atm.return_value = 25000
-        strategy = {"name": "N_W_0921", "status": "PENDING", "time": "09:21:00"}
+        strategy = {
+            "name": "N_W_0921",
+            "status": "PENDING",
+            "time": "09:21:00",
+            "lots": 1,
+            "leg_sl_pct": 20.0,
+            "strategy_sl": 1000.0,
+        }
         bot._execute_strategy(self.client, self.index_config, "10APR2026", strategy, force=False)
-        self.assertEqual(mock_update.call_args.kwargs["status"], "WAITING_FOR_CALM")
+        wait_calls = [
+            c
+            for c in mock_update.call_args_list
+            if c.kwargs.get("status") == "WAITING_FOR_CALM"
+        ]
+        self.assertTrue(wait_calls, "expected update_strategy with WAITING_FOR_CALM")
         mock_atm.assert_not_called()
 
 

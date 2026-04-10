@@ -127,7 +127,9 @@ from db import (
     log_mtm_snapshot,
     cleanup_old_data,
     cleanup_previous_day_data,
+    mark_strategy_skipped_volatility_db,
     restore_todays_strategies,
+    upsert_strategy_waiting_for_calm,
     get_ist_timestamp,
     get_ist_now,
     fetch_latest_spot_bar_row,
@@ -619,6 +621,11 @@ def _process_waiting_for_calm(client: XTSClient, index_config, expiry: str) -> N
                 gatekeeper_started_at=None,
                 next_gatekeeper_check_at=None,
             )
+            db_id = strategy.get("db_id")
+            if db_id:
+                mark_strategy_skipped_volatility_db(
+                    int(db_id), strategy["name"], "NO_CALM_ZONE_TIMEOUT"
+                )
             continue
         next_check_at = strategy.get("next_gatekeeper_check_at") or 0
         try:
@@ -657,10 +664,13 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     can_run, gate_reason, gate_row = should_execute_now(name, index_config.name)
     if not can_run:
         now_ts = get_ist_now().timestamp()
+        gk_started = strategy.get("gatekeeper_started_at") or get_ist_now().isoformat(
+            timespec="seconds"
+        )
         update_strategy(
             name,
             status="WAITING_FOR_CALM",
-            gatekeeper_started_at=strategy.get("gatekeeper_started_at") or get_ist_now().isoformat(timespec="seconds"),
+            gatekeeper_started_at=gk_started,
             next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
             message=(
                 "Strategy "
@@ -673,6 +683,16 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
                 )
             ),
         )
+        sid = upsert_strategy_waiting_for_calm(
+            name,
+            int(strategy.get("lots") or 0),
+            float(strategy.get("leg_sl_pct") or 0.0),
+            float(strategy.get("strategy_sl") or 0.0),
+            gk_started,
+            int(strategy["db_id"]) if strategy.get("db_id") else None,
+        )
+        if sid > 0:
+            update_strategy(name, db_id=sid)
         logger.info("Strategy %s waiting for Calm Zone. Volatility detected.", name)
         return
     if strategy.get("status") == "WAITING_FOR_CALM":
@@ -799,6 +819,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     )
 
     # Log strategy execution to database
+    existing_id = strategy.get("db_id")
     strategy_db_id = log_strategy_execution(
         name,
         atm_strike,
@@ -806,6 +827,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
         effective_lots,
         effective_leg_sl_pct,
         strategy.get("strategy_sl", 0.0),
+        existing_db_id=int(existing_id) if existing_id else None,
     )
     update_strategy(name, db_id=strategy_db_id)
 
@@ -2137,13 +2159,28 @@ def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
                 strategy_name = restored_strategy["strategy_name"]
                 if strategy_name in STRATEGY_STATE:
                     logger.debug(f"Restoring {strategy_name} from database...")
-                    STRATEGY_STATE[strategy_name].update({
+                    st = restored_strategy.get("status", "OPEN")
+                    merge_kw2: Dict[str, Any] = {
                         "db_id": restored_strategy["db_id"],
-                        "status": restored_strategy.get("status", "OPEN"),
+                        "status": st,
                         "strike": restored_strategy["strike"],
                         "entry_time": restored_strategy["entry_time"],
                         "positions": restored_strategy["positions"],
-                    })
+                        "sl_orders": restored_strategy.get("sl_orders") or [],
+                        "sl_tag_map": restored_strategy.get("sl_tag_map") or {},
+                        "gatekeeper_started_at": restored_strategy.get("gatekeeper_started_at"),
+                        "skip_reason": restored_strategy.get("skip_reason"),
+                    }
+                    if st == "WAITING_FOR_CALM":
+                        merge_kw2["next_gatekeeper_check_at"] = time.time() - 1.0
+                    else:
+                        merge_kw2["next_gatekeeper_check_at"] = None
+                    if st == "SKIPPED_VOLATILITY":
+                        sr = restored_strategy.get("skip_reason") or ""
+                        merge_kw2["message"] = (
+                            f"Skipped — calm zone timeout ({sr})" if sr else "Skipped — calm zone timeout"
+                        )
+                    STRATEGY_STATE[strategy_name].update(merge_kw2)
             
             logger.debug("✓ Bot is now operational")
             return  # Success, exit retry loop
@@ -2256,15 +2293,28 @@ def main() -> None:
             strategy_name = restored_strategy["strategy_name"]
             if strategy_name in STRATEGY_STATE:
                 logger.debug(f"Restoring %s from database...", strategy_name)
-                STRATEGY_STATE[strategy_name].update({
+                st = restored_strategy.get("status", "OPEN")
+                merge_kw: Dict[str, Any] = {
                     "db_id": restored_strategy["db_id"],
-                    "status": restored_strategy.get("status", "OPEN"),
+                    "status": st,
                     "strike": restored_strategy["strike"],
                     "entry_time": restored_strategy["entry_time"],
                     "positions": restored_strategy["positions"],
                     "sl_orders": restored_strategy.get("sl_orders") or [],
                     "sl_tag_map": restored_strategy.get("sl_tag_map") or {},
-                })
+                    "gatekeeper_started_at": restored_strategy.get("gatekeeper_started_at"),
+                    "skip_reason": restored_strategy.get("skip_reason"),
+                }
+                if st == "WAITING_FOR_CALM":
+                    merge_kw["next_gatekeeper_check_at"] = time.time() - 1.0
+                else:
+                    merge_kw["next_gatekeeper_check_at"] = None
+                if st == "SKIPPED_VOLATILITY":
+                    sr = restored_strategy.get("skip_reason") or ""
+                    merge_kw["message"] = (
+                        f"Skipped — calm zone timeout ({sr})" if sr else "Skipped — calm zone timeout"
+                    )
+                STRATEGY_STATE[strategy_name].update(merge_kw)
                 if (
                     STRATEGY_STATE[strategy_name].get("status") == "OPEN"
                     and not STRATEGY_STATE[strategy_name].get("sl_orders")

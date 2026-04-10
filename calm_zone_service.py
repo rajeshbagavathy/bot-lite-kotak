@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar
 from zoneinfo import ZoneInfo
 
 from calm_zone_math import compute_calm_metrics
-import time
 
 from config import (
     CALM_ZONE_BAR_UNIX_OFFSET_SEC,
@@ -136,8 +135,21 @@ def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
 
 
 def recompute_calm_metrics_for_index(index_name: str) -> None:
+    """
+    One-time calm metrics per 1m bar (static after first successful write).
+
+    For each minute we need five consecutive bars ending at that minute. Once ``range_5m``
+    has been stored for that row, we never recompute or overwrite Range / Ratio / Calm —
+    OHLC for that minute may still refresh from the API via ``_upsert_ohlc_rows`` until
+    OHLC freeze applies, but calm-zone flags stay fixed for that bar_time.
+    """
     rows = fetch_spot_bars_asc_for_recompute(index_name, RECOMPUTE_TAIL)
     for i, r in enumerate(rows):
+        if i < 4:
+            continue
+        if r.get("range_5m") is not None:
+            continue
+        bt = r["bar_time"]
         o = float(r["open"])
         h = float(r["high"])
         lo = float(r["low"])
@@ -149,22 +161,6 @@ def recompute_calm_metrics_for_index(index_name: str) -> None:
                 bu = int(bu)
             except (TypeError, ValueError):
                 bu = None
-        if i < 4:
-            upsert_spot_bar(
-                index_name,
-                r["bar_time"],
-                o,
-                h,
-                lo,
-                c,
-                vol,
-                None,
-                None,
-                None,
-                False,
-                bar_unix=bu,
-            )
-            continue
         window = rows[i - 4 : i + 1]
         core = [
             {"open": x["open"], "high": x["high"], "low": x["low"], "close": x["close"]}
@@ -175,7 +171,7 @@ def recompute_calm_metrics_for_index(index_name: str) -> None:
             continue
         upsert_spot_bar(
             index_name,
-            r["bar_time"],
+            bt,
             o,
             h,
             lo,

@@ -56,6 +56,15 @@ def init_db() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        cursor.execute("PRAGMA table_info(strategies)")
+        strat_cols = [row[1] for row in cursor.fetchall()]
+        if "gatekeeper_started_at" not in strat_cols:
+            cursor.execute("ALTER TABLE strategies ADD COLUMN gatekeeper_started_at TEXT")
+        if "next_gatekeeper_check_at" not in strat_cols:
+            cursor.execute("ALTER TABLE strategies ADD COLUMN next_gatekeeper_check_at REAL")
+        if "skip_reason" not in strat_cols:
+            cursor.execute("ALTER TABLE strategies ADD COLUMN skip_reason TEXT")
         
         # Positions table - stores entry/exit positions per strategy
         cursor.execute("""
@@ -168,13 +177,43 @@ def log_strategy_execution(
     lots: int,
     leg_sl_pct: float,
     strategy_sl: float,
+    *,
+    existing_db_id: Optional[int] = None,
 ) -> int:
-    """Log strategy execution start. Returns strategy_id."""
+    """Log strategy execution start. Returns strategy_id.
+
+    If ``existing_db_id`` is set (e.g. row was WAITING_FOR_CALM), UPDATE that row to OPEN instead of INSERT.
+    """
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         execution_date = get_ist_date()
-        
+
+        if existing_db_id is not None and int(existing_db_id) > 0:
+            cursor.execute(
+                """
+                UPDATE strategies SET
+                    strike = ?, entry_time = ?, status = 'OPEN',
+                    lots = ?, leg_sl_pct = ?, strategy_sl = ?,
+                    gatekeeper_started_at = NULL, next_gatekeeper_check_at = NULL, skip_reason = NULL
+                WHERE id = ? AND strategy_name = ? AND execution_date = ?
+                """,
+                (
+                    strike,
+                    entry_time,
+                    lots,
+                    leg_sl_pct,
+                    strategy_sl,
+                    int(existing_db_id),
+                    strategy_name,
+                    execution_date,
+                ),
+            )
+            if cursor.rowcount:
+                conn.commit()
+                conn.close()
+                return int(existing_db_id)
+
         cursor.execute("""
             INSERT INTO strategies 
             (strategy_name, execution_date, strike, entry_time, status, lots, leg_sl_pct, strategy_sl)
@@ -188,6 +227,125 @@ def log_strategy_execution(
     except Exception as e:
         logger.error(f"Failed to log strategy execution: {e}")
         return -1
+
+
+def upsert_strategy_waiting_for_calm(
+    strategy_name: str,
+    lots: int,
+    leg_sl_pct: float,
+    strategy_sl: float,
+    gatekeeper_started_at: str,
+    existing_db_id: Optional[int] = None,
+) -> int:
+    """
+    Persist WAITING_FOR_CALM so restart preserves gatekeeper clock and status.
+    Returns strategy row id (always > 0 on success, -1 on failure).
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        today = get_ist_date()
+
+        if existing_db_id is not None and int(existing_db_id) > 0:
+            cursor.execute(
+                """
+                UPDATE strategies SET
+                    status = 'WAITING_FOR_CALM',
+                    gatekeeper_started_at = ?,
+                    next_gatekeeper_check_at = NULL,
+                    strike = NULL,
+                    entry_time = NULL,
+                    lots = ?,
+                    leg_sl_pct = ?,
+                    strategy_sl = ?,
+                    skip_reason = NULL
+                WHERE id = ? AND strategy_name = ? AND execution_date = ?
+                """,
+                (
+                    gatekeeper_started_at,
+                    lots,
+                    leg_sl_pct,
+                    strategy_sl,
+                    int(existing_db_id),
+                    strategy_name,
+                    today,
+                ),
+            )
+            if cursor.rowcount:
+                conn.commit()
+                conn.close()
+                return int(existing_db_id)
+
+        cursor.execute(
+            """
+            SELECT id FROM strategies
+            WHERE strategy_name = ? AND execution_date = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (strategy_name, today),
+        )
+        row = cursor.fetchone()
+        if row:
+            sid = int(row[0])
+            cursor.execute(
+                """
+                UPDATE strategies SET
+                    status = 'WAITING_FOR_CALM',
+                    gatekeeper_started_at = ?,
+                    next_gatekeeper_check_at = NULL,
+                    strike = NULL,
+                    entry_time = NULL,
+                    lots = ?,
+                    leg_sl_pct = ?,
+                    strategy_sl = ?,
+                    skip_reason = NULL
+                WHERE id = ?
+                """,
+                (gatekeeper_started_at, lots, leg_sl_pct, strategy_sl, sid),
+            )
+            conn.commit()
+            conn.close()
+            return sid
+
+        cursor.execute(
+            """
+            INSERT INTO strategies (
+                strategy_name, execution_date, strike, entry_time, status,
+                lots, leg_sl_pct, strategy_sl, gatekeeper_started_at, next_gatekeeper_check_at
+            )
+            VALUES (?, ?, NULL, NULL, 'WAITING_FOR_CALM', ?, ?, ?, ?, NULL)
+            """,
+            (strategy_name, today, lots, leg_sl_pct, strategy_sl, gatekeeper_started_at),
+        )
+        conn.commit()
+        sid = int(cursor.lastrowid)
+        conn.close()
+        return sid
+    except Exception as e:
+        logger.error("upsert_strategy_waiting_for_calm failed: %s", e)
+        return -1
+
+
+def mark_strategy_skipped_volatility_db(strategy_id: int, strategy_name: str, skip_reason: str) -> None:
+    """Persist SKIPPED_VOLATILITY after calm timeout."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE strategies SET
+                status = 'SKIPPED_VOLATILITY',
+                gatekeeper_started_at = NULL,
+                next_gatekeeper_check_at = NULL,
+                skip_reason = ?
+            WHERE id = ? AND strategy_name = ?
+            """,
+            (skip_reason[:512] if skip_reason else None, int(strategy_id), strategy_name),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("mark_strategy_skipped_volatility_db failed: %s", e)
 
 
 def log_position(
@@ -600,12 +758,12 @@ def restore_sl_orders_for_strategy(strategy_name: str) -> Dict[str, Any]:
 
 
 def restore_todays_strategies() -> List[Dict[str, Any]]:
-    """Restore today's strategies (OPEN and CLOSED) from database.
+    """Restore today's strategies from database (OPEN, CLOSED, calm wait, skipped).
     
     Returns list of strategy data with positions for strategies that:
-    - Were executed TODAY (execution_date = today in IST)
+    - Were recorded TODAY (execution_date = today in IST)
     
-    STRICT DATE FILTER: Only today's data is restored.
+    WAITING_FOR_CALM / SKIPPED_VOLATILITY are included so restart keeps gatekeeper timing and UI state.
     """
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -614,10 +772,11 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
         
         today = get_ist_date()
         
-        # STRICT: Only today's strategies (OPEN/CLOSED)
         cursor.execute("""
             SELECT * FROM strategies
-            WHERE execution_date = ? AND status IN ('OPEN', 'CLOSED')
+            WHERE execution_date = ? AND status IN (
+                'OPEN', 'CLOSED', 'WAITING_FOR_CALM', 'SKIPPED_VOLATILITY'
+            )
             ORDER BY id
         """, (today,))
         
@@ -626,19 +785,23 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
         
         restored_strategies = []
         for row in rows:
-            sl_restore = restore_sl_orders_for_strategy(row["strategy_name"])
+            r = {k: row[k] for k in row.keys()}
+            sl_restore = restore_sl_orders_for_strategy(r["strategy_name"])
             strategy_data = {
-                "db_id": row["id"],
-                "strategy_name": row["strategy_name"],
-                "strike": row["strike"],
-                "entry_time": row["entry_time"],
-                "status": row["status"],
-                "lots": row["lots"],
-                "leg_sl_pct": row["leg_sl_pct"],
-                "strategy_sl": row["strategy_sl"],
-                "positions": restore_positions_for_strategy(row["id"]),
+                "db_id": r["id"],
+                "strategy_name": r["strategy_name"],
+                "strike": r["strike"],
+                "entry_time": r["entry_time"],
+                "status": r["status"],
+                "lots": r["lots"],
+                "leg_sl_pct": r["leg_sl_pct"],
+                "strategy_sl": r["strategy_sl"],
+                "positions": restore_positions_for_strategy(r["id"]),
                 "sl_orders": sl_restore["sl_orders"],
                 "sl_tag_map": sl_restore["sl_tag_map"],
+                "gatekeeper_started_at": r.get("gatekeeper_started_at"),
+                "next_gatekeeper_check_at": r.get("next_gatekeeper_check_at"),
+                "skip_reason": r.get("skip_reason"),
             }
             restored_strategies.append(strategy_data)
             logger.debug(f"Restored strategy from DB: {row['strategy_name']} (strike={row['strike']}, {len(strategy_data['positions'])} positions)")
@@ -668,7 +831,11 @@ def upsert_spot_bar(
     is_calmzone: bool,
     bar_unix: Optional[int] = None,
 ) -> None:
-    """Insert or replace one row in spot_market_data (bar_time = IST wall clock; bar_unix = raw API epoch seconds)."""
+    """Insert or replace one row in spot_market_data (bar_time = IST wall clock; bar_unix = raw API epoch seconds).
+
+    When ``range_5m`` is None (OHLC-only refresh), existing calm columns for that bar are left unchanged
+    so each minute's calm verdict stays static after the first computation.
+    """
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -684,10 +851,22 @@ def upsert_spot_bar(
                 low = excluded.low,
                 close = excluded.close,
                 volume = excluded.volume,
-                range_5m = excluded.range_5m,
-                net_body = excluded.net_body,
-                body_range_ratio = excluded.body_range_ratio,
-                is_calmzone = excluded.is_calmzone,
+                range_5m = CASE
+                    WHEN excluded.range_5m IS NOT NULL THEN excluded.range_5m
+                    ELSE spot_market_data.range_5m
+                END,
+                net_body = CASE
+                    WHEN excluded.net_body IS NOT NULL THEN excluded.net_body
+                    ELSE spot_market_data.net_body
+                END,
+                body_range_ratio = CASE
+                    WHEN excluded.body_range_ratio IS NOT NULL THEN excluded.body_range_ratio
+                    ELSE spot_market_data.body_range_ratio
+                END,
+                is_calmzone = CASE
+                    WHEN excluded.range_5m IS NOT NULL THEN excluded.is_calmzone
+                    ELSE spot_market_data.is_calmzone
+                END,
                 updated_at = excluded.updated_at,
                 bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix)
             """,
