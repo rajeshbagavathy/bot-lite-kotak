@@ -973,6 +973,7 @@ def upsert_spot_bar(
                 updated_at = excluded.updated_at,
                 bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix),
                 calm_locked = 1
+            WHERE spot_market_data.calm_locked = 0
             """,
             (
                 index_name,
@@ -1043,12 +1044,7 @@ def count_spot_market_rows(index_name: str) -> int:
 
 
 def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 2500) -> List[Dict[str, Any]]:
-    """Oldest first (today IST only), for sliding-window recompute.
-
-    Uses ascending time from session start — not the last-N-reversed window — so the
-    first rows in the list are the true open bars and the 5-bar window is never built
-    from a truncated tail that omits earlier minutes.
-    """
+    """Latest ``limit`` rows for today, returned oldest->newest for 5-bar windows."""
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -1058,11 +1054,16 @@ def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 2500) -> Lis
             """
             SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
                    range_5m, net_body, body_range_ratio, is_calmzone, calm_locked
-            FROM spot_market_data
-            WHERE index_name = ?
-              AND substr(bar_time, 1, 10) = ?
+            FROM (
+                SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
+                       range_5m, net_body, body_range_ratio, is_calmzone, calm_locked
+                FROM spot_market_data
+                WHERE index_name = ?
+                  AND substr(bar_time, 1, 10) = ?
+                ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC, bar_time DESC
+                LIMIT ?
+            ) t
             ORDER BY (bar_unix IS NULL) ASC, bar_unix ASC, bar_time ASC
-            LIMIT ?
             """,
             (index_name, today, limit),
         )

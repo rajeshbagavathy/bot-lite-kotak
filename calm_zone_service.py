@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 ROLLING_FALLBACK_MINUTES = 25
-RECOMPUTE_TAIL = 2500
+RECOMPUTE_TAIL = 240
+STARTUP_BACKFILL_LIMIT = 5000
 MAX_RETRIES = 5
 BASE_SLEEP_SEC = 60
 MARKET_OPEN_HHMM = (9, 15)
@@ -191,14 +192,14 @@ def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
         )
 
 
-def recompute_calm_metrics_for_index(index_name: str) -> None:
+def recompute_calm_metrics_for_index(index_name: str, limit: int = RECOMPUTE_TAIL) -> None:
     """
     One-time calm metrics per 1m bar (static after first successful write).
 
     Rows are deduped by canonical minute key so the 5-bar window never double-counts a minute.
     ``calm_locked`` / existing ``range_5m`` skip further math for that minute.
     """
-    raw = fetch_spot_bars_asc_for_recompute(index_name, RECOMPUTE_TAIL)
+    raw = fetch_spot_bars_asc_for_recompute(index_name, limit)
     rows = _dedupe_spot_rows_for_recompute(raw)
     for i, r in enumerate(rows):
         if i < 4:
@@ -251,11 +252,25 @@ def calm_zone_tick(client: XTSClient) -> None:
         if not bars:
             continue
         _upsert_ohlc_rows(index_name, bars)
-        recompute_calm_metrics_for_index(index_name)
+        # Incremental pass: compute only recent unlocked minutes; locked rows stay immutable.
+        recompute_calm_metrics_for_index(index_name, RECOMPUTE_TAIL)
+
+
+def backfill_today_calm_once() -> None:
+    """
+    Startup-only backfill: if today's 1m rows already exist, compute calm metrics once
+    for all currently-available minutes and lock them.
+    """
+    for index_name in ("NIFTY", "SENSEX"):
+        recompute_calm_metrics_for_index(index_name, STARTUP_BACKFILL_LIMIT)
 
 
 def _run_loop(client: XTSClient, stop: threading.Event) -> None:
     logger.info("Calm zone monitor thread started (DB=%s)", DB_PATH)
+    try:
+        backfill_today_calm_once()
+    except Exception:
+        logger.exception("Startup calm-zone backfill failed")
     while not stop.is_set():
         try:
             calm_zone_tick(client)
