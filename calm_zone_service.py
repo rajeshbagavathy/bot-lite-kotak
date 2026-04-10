@@ -59,6 +59,8 @@ _HEALTH: Dict[str, Any] = {
             "last_fetch_raw_count": 0,
             "last_fetch_fallback_count": 0,
             "last_fetch_used_fallback": False,
+            "last_fetch_tz_fallback_count": 0,
+            "last_fetch_used_tz_fallback": False,
             "last_first_bar_unix": None,
             "last_last_bar_unix": None,
         },
@@ -70,6 +72,8 @@ _HEALTH: Dict[str, Any] = {
             "last_fetch_raw_count": 0,
             "last_fetch_fallback_count": 0,
             "last_fetch_used_fallback": False,
+            "last_fetch_tz_fallback_count": 0,
+            "last_fetch_used_tz_fallback": False,
             "last_first_bar_unix": None,
             "last_last_bar_unix": None,
         },
@@ -102,6 +106,8 @@ def _health_set_index_fetch_meta(
     raw_count: int,
     fallback_count: int,
     used_fallback: bool,
+    tz_fallback_count: int,
+    used_tz_fallback: bool,
     selected_bars: List[Dict[str, Any]],
 ) -> None:
     idx = str(index_name).upper()
@@ -114,6 +120,8 @@ def _health_set_index_fetch_meta(
         slot["last_fetch_raw_count"] = int(raw_count)
         slot["last_fetch_fallback_count"] = int(fallback_count)
         slot["last_fetch_used_fallback"] = bool(used_fallback)
+        slot["last_fetch_tz_fallback_count"] = int(tz_fallback_count)
+        slot["last_fetch_used_tz_fallback"] = bool(used_tz_fallback)
         if selected_bars:
             slot["last_first_bar_unix"] = int(selected_bars[0].get("bar_unix") or 0)
             slot["last_last_bar_unix"] = int(selected_bars[-1].get("bar_unix") or 0)
@@ -262,6 +270,8 @@ def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any
     selected = raw
     used_fallback = False
     fallback_count = 0
+    tz_fallback_count = 0
+    used_tz_fallback = False
     # Safety: if configured lookback is too narrow (or upstream returns too little),
     # retry with full-session window so calm recompute always has enough context.
     if len(raw) < 5:
@@ -274,6 +284,20 @@ def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any
         if len(wider) >= len(raw):
             selected = wider
             used_fallback = True
+    # Some environments appear to interpret request strings in a different timezone.
+    # Final safeguard: retry once with IST->UTC shifted request window.
+    if len(selected) < 5:
+        shift = timedelta(minutes=330)
+        shifted_start = start - shift
+        shifted_end = end_k - shift
+        shifted = _with_retries(
+            lambda: _call(shifted_start, shifted_end),
+            f"OHLC {index_name} tz-shift-fallback",
+        ) or []
+        tz_fallback_count = len(shifted)
+        if len(shifted) > len(selected):
+            selected = shifted
+            used_tz_fallback = True
     _health_set_index_fetch_meta(
         index_name,
         req_start=start,
@@ -281,6 +305,8 @@ def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any
         raw_count=len(raw),
         fallback_count=fallback_count,
         used_fallback=used_fallback,
+        tz_fallback_count=tz_fallback_count,
+        used_tz_fallback=used_tz_fallback,
         selected_bars=selected,
     )
     return selected
