@@ -51,8 +51,28 @@ _HEALTH: Dict[str, Any] = {
     "last_tick_status": "idle",
     "last_error": None,
     "indices": {
-        "NIFTY": {"last_fetch_count": 0, "last_latest_bar_time": None},
-        "SENSEX": {"last_fetch_count": 0, "last_latest_bar_time": None},
+        "NIFTY": {
+            "last_fetch_count": 0,
+            "last_latest_bar_time": None,
+            "last_request_start_ist": None,
+            "last_request_end_ist": None,
+            "last_fetch_raw_count": 0,
+            "last_fetch_fallback_count": 0,
+            "last_fetch_used_fallback": False,
+            "last_first_bar_unix": None,
+            "last_last_bar_unix": None,
+        },
+        "SENSEX": {
+            "last_fetch_count": 0,
+            "last_latest_bar_time": None,
+            "last_request_start_ist": None,
+            "last_request_end_ist": None,
+            "last_fetch_raw_count": 0,
+            "last_fetch_fallback_count": 0,
+            "last_fetch_used_fallback": False,
+            "last_first_bar_unix": None,
+            "last_last_bar_unix": None,
+        },
     },
 }
 
@@ -72,6 +92,34 @@ def _health_set_index(index_name: str, fetch_count: Optional[int] = None, latest
             slot["last_fetch_count"] = int(fetch_count)
         if latest_bar_time is not None:
             slot["last_latest_bar_time"] = latest_bar_time
+
+
+def _health_set_index_fetch_meta(
+    index_name: str,
+    *,
+    req_start: datetime,
+    req_end: datetime,
+    raw_count: int,
+    fallback_count: int,
+    used_fallback: bool,
+    selected_bars: List[Dict[str, Any]],
+) -> None:
+    idx = str(index_name).upper()
+    with _HEALTH_LOCK:
+        if idx not in _HEALTH["indices"]:
+            _HEALTH["indices"][idx] = {}
+        slot = _HEALTH["indices"][idx]
+        slot["last_request_start_ist"] = req_start.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+        slot["last_request_end_ist"] = req_end.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+        slot["last_fetch_raw_count"] = int(raw_count)
+        slot["last_fetch_fallback_count"] = int(fallback_count)
+        slot["last_fetch_used_fallback"] = bool(used_fallback)
+        if selected_bars:
+            slot["last_first_bar_unix"] = int(selected_bars[0].get("bar_unix") or 0)
+            slot["last_last_bar_unix"] = int(selected_bars[-1].get("bar_unix") or 0)
+        else:
+            slot["last_first_bar_unix"] = None
+            slot["last_last_bar_unix"] = None
 
 
 def get_calm_zone_health_snapshot() -> Dict[str, Any]:
@@ -211,6 +259,9 @@ def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any
         return client.get_spot_ohlc_bars(cfg, s, e)
 
     raw = _with_retries(lambda: _call(start, end_k), f"OHLC {index_name}") or []
+    selected = raw
+    used_fallback = False
+    fallback_count = 0
     # Safety: if configured lookback is too narrow (or upstream returns too little),
     # retry with full-session window so calm recompute always has enough context.
     if len(raw) < 5:
@@ -219,9 +270,20 @@ def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any
             lambda: _call(session_start, end_k),
             f"OHLC {index_name} full-session-fallback",
         ) or []
+        fallback_count = len(wider)
         if len(wider) >= len(raw):
-            return wider
-    return raw
+            selected = wider
+            used_fallback = True
+    _health_set_index_fetch_meta(
+        index_name,
+        req_start=start,
+        req_end=end_k,
+        raw_count=len(raw),
+        fallback_count=fallback_count,
+        used_fallback=used_fallback,
+        selected_bars=selected,
+    )
+    return selected
 
 
 def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
