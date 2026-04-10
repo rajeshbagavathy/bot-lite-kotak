@@ -817,6 +817,56 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
         return []
 
 
+def upsert_spot_ohlc_only(
+    index_name: str,
+    bar_time: str,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: Optional[float],
+    bar_unix: Optional[int] = None,
+) -> None:
+    """
+    Insert/update **only** OHLC (+ volume, bar_unix). Does not reference calm columns on UPDATE,
+    so Range/Ratio/Calm for that minute are never touched by the API refresh path.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO spot_market_data (
+                index_name, bar_time, open, high, low, close, volume,
+                range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?)
+            ON CONFLICT(index_name, bar_time) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume,
+                updated_at = excluded.updated_at,
+                bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix)
+            """,
+            (
+                index_name,
+                bar_time,
+                open_,
+                high,
+                low,
+                close,
+                volume,
+                get_ist_timestamp(),
+                bar_unix,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("Failed to upsert spot OHLC %s %s: %s", index_name, bar_time, e)
+
+
 def upsert_spot_bar(
     index_name: str,
     bar_time: str,
@@ -831,11 +881,7 @@ def upsert_spot_bar(
     is_calmzone: bool,
     bar_unix: Optional[int] = None,
 ) -> None:
-    """Insert or replace one row in spot_market_data (bar_time = IST wall clock; bar_unix = raw API epoch seconds).
-
-    When ``range_5m`` is None (OHLC-only refresh), existing calm columns for that bar are left unchanged
-    so each minute's calm verdict stays static after the first computation.
-    """
+    """Write full row including calm metrics (used after ``compute_calm_metrics`` only)."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -851,22 +897,10 @@ def upsert_spot_bar(
                 low = excluded.low,
                 close = excluded.close,
                 volume = excluded.volume,
-                range_5m = CASE
-                    WHEN excluded.range_5m IS NOT NULL THEN excluded.range_5m
-                    ELSE spot_market_data.range_5m
-                END,
-                net_body = CASE
-                    WHEN excluded.net_body IS NOT NULL THEN excluded.net_body
-                    ELSE spot_market_data.net_body
-                END,
-                body_range_ratio = CASE
-                    WHEN excluded.body_range_ratio IS NOT NULL THEN excluded.body_range_ratio
-                    ELSE spot_market_data.body_range_ratio
-                END,
-                is_calmzone = CASE
-                    WHEN excluded.range_5m IS NOT NULL THEN excluded.is_calmzone
-                    ELSE spot_market_data.is_calmzone
-                END,
+                range_5m = excluded.range_5m,
+                net_body = excluded.net_body,
+                body_range_ratio = excluded.body_range_ratio,
+                is_calmzone = excluded.is_calmzone,
                 updated_at = excluded.updated_at,
                 bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix)
             """,
@@ -950,7 +984,7 @@ def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 500) -> List
                    range_5m, net_body, body_range_ratio, is_calmzone
             FROM spot_market_data
             WHERE index_name = ?
-            ORDER BY bar_time DESC
+            ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC
             LIMIT ?
             """,
             (index_name, limit),

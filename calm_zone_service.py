@@ -26,6 +26,7 @@ from db import (
     get_ist_now,
     spot_bar_exists,
     upsert_spot_bar,
+    upsert_spot_ohlc_only,
 )
 from xts_client import XTSClient
 
@@ -118,7 +119,7 @@ def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
             if age > float(CALM_ZONE_OHLC_FREEZE_AFTER_SEC) and spot_bar_exists(index_name, bar_time):
                 continue
         vol = b.get("volume")
-        upsert_spot_bar(
+        upsert_spot_ohlc_only(
             index_name,
             bar_time,
             float(b["open"]),
@@ -126,10 +127,6 @@ def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
             float(b["low"]),
             float(b["close"]),
             float(vol) if vol is not None else None,
-            None,
-            None,
-            None,
-            False,
             bar_unix=ts,
         )
 

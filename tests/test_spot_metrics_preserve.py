@@ -33,7 +33,7 @@ class TestSpotMetricsPreserve(unittest.TestCase):
                     True,
                     bar_unix=1_700_000_000,
                 )
-                db.upsert_spot_bar(
+                db.upsert_spot_ohlc_only(
                     "NIFTY",
                     "2026-04-10 10:55:00",
                     100.1,
@@ -41,10 +41,6 @@ class TestSpotMetricsPreserve(unittest.TestCase):
                     99.1,
                     100.6,
                     1001.0,
-                    None,
-                    None,
-                    None,
-                    False,
                     bar_unix=1_700_000_000,
                 )
                 conn = sqlite3.connect(path)
