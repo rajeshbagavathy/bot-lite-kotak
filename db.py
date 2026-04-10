@@ -2,6 +2,7 @@
 import json
 import logging
 import sqlite3
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -33,6 +34,66 @@ def get_ist_date() -> str:
 def get_ist_timestamp() -> str:
     """Get current timestamp in IST (ISO format)."""
     return get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_spot_legacy_bar_times(cursor: sqlite3.Cursor) -> None:
+    """
+    One-time migration: legacy rows used second-level bar_time (e.g. ...:59 vs ...:18) for the
+    same minute. Prefer canonical ``...:00`` keys; never delete the only row for a minute.
+    """
+    try:
+        cursor.execute(
+            """
+            DELETE FROM spot_market_data
+            WHERE LENGTH(bar_time) >= 19
+            AND bar_time NOT LIKE '%:00'
+            AND EXISTS (
+                SELECT 1 FROM spot_market_data b
+                WHERE b.index_name = spot_market_data.index_name
+                AND b.rowid != spot_market_data.rowid
+                AND b.bar_time = substr(spot_market_data.bar_time, 1, 16) || ':00'
+            )
+            """
+        )
+        cursor.execute(
+            """
+            SELECT rowid, index_name, bar_time, bar_unix, open, high, low, close, volume,
+                   range_5m, net_body, body_range_ratio, is_calmzone, calm_locked
+            FROM spot_market_data
+            WHERE LENGTH(bar_time) >= 19 AND bar_time NOT LIKE '%:00'
+            """
+        )
+        raw = cursor.fetchall()
+    except Exception as e:
+        logger.warning("spot legacy bar_time normalize skipped: %s", e)
+        return
+
+    groups: Dict[tuple, List[tuple]] = defaultdict(list)
+    for row in raw:
+        bt = str(row[2])
+        if len(bt) >= 16:
+            can = f"{bt[:16]}:00"
+        else:
+            can = bt
+        groups[(str(row[1]), can)].append(row)
+
+    for (_idx, can), rows in groups.items():
+        rows.sort(
+            key=lambda r: (
+                int(r[13] or 0),
+                1 if r[9] is not None else 0,
+                int(r[3] or 0),
+            ),
+            reverse=True,
+        )
+        keep = rows[0]
+        keep_rid = int(keep[0])
+        for r in rows[1:]:
+            cursor.execute("DELETE FROM spot_market_data WHERE rowid = ?", (int(r[0]),))
+        cursor.execute(
+            "UPDATE spot_market_data SET bar_time = ? WHERE rowid = ?",
+            (can, keep_rid),
+        )
 
 
 def init_db() -> None:
@@ -162,6 +223,14 @@ def init_db() -> None:
         spot_cols = [row[1] for row in cursor.fetchall()]
         if "bar_unix" not in spot_cols:
             cursor.execute("ALTER TABLE spot_market_data ADD COLUMN bar_unix INTEGER")
+        if "calm_locked" not in spot_cols:
+            cursor.execute(
+                "ALTER TABLE spot_market_data ADD COLUMN calm_locked INTEGER NOT NULL DEFAULT 0"
+            )
+        cursor.execute(
+            "UPDATE spot_market_data SET calm_locked = 1 WHERE range_5m IS NOT NULL AND calm_locked = 0"
+        )
+        _normalize_spot_legacy_bar_times(cursor)
 
         conn.commit()
         conn.close()
@@ -838,8 +907,8 @@ def upsert_spot_ohlc_only(
             """
             INSERT INTO spot_market_data (
                 index_name, bar_time, open, high, low, close, volume,
-                range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?)
+                range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix, calm_locked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, 0)
             ON CONFLICT(index_name, bar_time) DO UPDATE SET
                 open = excluded.open,
                 high = excluded.high,
@@ -889,8 +958,8 @@ def upsert_spot_bar(
             """
             INSERT INTO spot_market_data (
                 index_name, bar_time, open, high, low, close, volume,
-                range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix, calm_locked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(index_name, bar_time) DO UPDATE SET
                 open = excluded.open,
                 high = excluded.high,
@@ -902,7 +971,8 @@ def upsert_spot_bar(
                 body_range_ratio = excluded.body_range_ratio,
                 is_calmzone = excluded.is_calmzone,
                 updated_at = excluded.updated_at,
-                bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix)
+                bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix),
+                calm_locked = 1
             """,
             (
                 index_name,
@@ -935,7 +1005,7 @@ def fetch_spot_market_rows(index_name: str, limit: int = 120, offset: int = 0) -
         cursor.execute(
             """
             SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
-                   range_5m, net_body, body_range_ratio, is_calmzone
+                   range_5m, net_body, body_range_ratio, is_calmzone, calm_locked
             FROM spot_market_data
             WHERE index_name = ?
             ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC, bar_time DESC
@@ -981,7 +1051,7 @@ def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 500) -> List
         cursor.execute(
             """
             SELECT index_name, bar_time, bar_unix, open, high, low, close, volume,
-                   range_5m, net_body, body_range_ratio, is_calmzone
+                   range_5m, net_body, body_range_ratio, is_calmzone, calm_locked
             FROM spot_market_data
             WHERE index_name = ?
             ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC

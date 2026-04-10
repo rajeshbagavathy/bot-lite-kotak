@@ -65,6 +65,66 @@ def bar_unix_to_ist_str(ts: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def canonical_spot_bar_time_ist(ts: int) -> str:
+    """
+    Single DB key per 1m bar: IST wall time with seconds forced to :00.
+    Prevents duplicate rows for the same minute (e.g. ...:18 vs ...:59 from vendor unix).
+    """
+    ts = int(ts) + CALM_ZONE_BAR_UNIX_OFFSET_SEC
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(ZoneInfo("Asia/Kolkata"))
+    dt = dt.replace(second=0, microsecond=0)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _coarse_minute_key_from_bar_time(bar_time: str) -> str:
+    """Normalize legacy bar_time strings to the same canonical minute key."""
+    raw = str(bar_time).strip().replace("T", " ")
+    if len(raw) >= 16:
+        return raw[:16] + ":00"
+    return raw
+
+
+def _dedupe_spot_rows_for_recompute(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Collapse multiple DB rows that belong to the same calendar minute so the 5-bar
+    sliding window uses exactly one OHLC per minute.
+    """
+    best: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        bu = r.get("bar_unix")
+        if bu is not None:
+            try:
+                key = canonical_spot_bar_time_ist(_normalize_unix_ts(int(bu)))
+            except (TypeError, ValueError):
+                key = _coarse_minute_key_from_bar_time(str(r.get("bar_time") or ""))
+        else:
+            key = _coarse_minute_key_from_bar_time(str(r.get("bar_time") or ""))
+        prev = best.get(key)
+        if prev is None:
+            nr = dict(r)
+            nr["bar_time"] = key
+            best[key] = nr
+            continue
+        take_new = False
+        pl = int(prev.get("calm_locked") or 0)
+        rl = int(r.get("calm_locked") or 0)
+        if rl > pl:
+            take_new = True
+        elif prev.get("range_5m") is None and r.get("range_5m") is not None:
+            take_new = True
+        elif (prev.get("range_5m") is None) == (r.get("range_5m") is None):
+            if int(r.get("bar_unix") or 0) > int(prev.get("bar_unix") or 0):
+                take_new = True
+        if take_new:
+            nr = dict(r)
+            nr["bar_time"] = key
+            best[key] = nr
+    return sorted(
+        best.values(),
+        key=lambda x: int(x["bar_unix"]) if x.get("bar_unix") is not None else 0,
+    )
+
+
 def _with_retries(fn: Callable[[], T], label: str) -> Optional[T]:
     delay = 1.0
     last_err: Optional[BaseException] = None
@@ -113,7 +173,7 @@ def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any
 def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
     for b in bars:
         ts = _normalize_unix_ts(b["bar_unix"])
-        bar_time = bar_unix_to_ist_str(ts)
+        bar_time = canonical_spot_bar_time_ist(ts)
         if CALM_ZONE_OHLC_FREEZE_AFTER_SEC > 0:
             age = time.time() - float(ts)
             if age > float(CALM_ZONE_OHLC_FREEZE_AFTER_SEC) and spot_bar_exists(index_name, bar_time):
@@ -135,29 +195,32 @@ def recompute_calm_metrics_for_index(index_name: str) -> None:
     """
     One-time calm metrics per 1m bar (static after first successful write).
 
-    For each minute we need five consecutive bars ending at that minute. Once ``range_5m``
-    has been stored for that row, we never recompute or overwrite Range / Ratio / Calm —
-    OHLC for that minute may still refresh from the API via ``_upsert_ohlc_rows`` until
-    OHLC freeze applies, but calm-zone flags stay fixed for that bar_time.
+    Rows are deduped by canonical minute key so the 5-bar window never double-counts a minute.
+    ``calm_locked`` / existing ``range_5m`` skip further math for that minute.
     """
-    rows = fetch_spot_bars_asc_for_recompute(index_name, RECOMPUTE_TAIL)
+    raw = fetch_spot_bars_asc_for_recompute(index_name, RECOMPUTE_TAIL)
+    rows = _dedupe_spot_rows_for_recompute(raw)
     for i, r in enumerate(rows):
         if i < 4:
             continue
+        if int(r.get("calm_locked") or 0) == 1:
+            continue
         if r.get("range_5m") is not None:
             continue
-        bt = r["bar_time"]
-        o = float(r["open"])
-        h = float(r["high"])
-        lo = float(r["low"])
-        c = float(r["close"])
-        vol = float(r["volume"]) if r.get("volume") is not None else None
         bu = r.get("bar_unix")
         if bu is not None:
             try:
                 bu = int(bu)
             except (TypeError, ValueError):
                 bu = None
+        bt = canonical_spot_bar_time_ist(bu) if bu is not None else _coarse_minute_key_from_bar_time(
+            str(r.get("bar_time") or "")
+        )
+        o = float(r["open"])
+        h = float(r["high"])
+        lo = float(r["low"])
+        c = float(r["close"])
+        vol = float(r["volume"]) if r.get("volume") is not None else None
         window = rows[i - 4 : i + 1]
         core = [
             {"open": x["open"], "high": x["high"], "low": x["low"], "close": x["close"]}
