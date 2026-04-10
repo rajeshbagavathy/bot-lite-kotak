@@ -207,11 +207,21 @@ def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any
         if end_k < start:
             start = end_k - timedelta(minutes=ROLLING_FALLBACK_MINUTES)
 
-    def _call():
-        return client.get_spot_ohlc_bars(cfg, start, end_k)
+    def _call(s: datetime, e: datetime):
+        return client.get_spot_ohlc_bars(cfg, s, e)
 
-    raw = _with_retries(_call, f"OHLC {index_name}")
-    return raw or []
+    raw = _with_retries(lambda: _call(start, end_k), f"OHLC {index_name}") or []
+    # Safety: if configured lookback is too narrow (or upstream returns too little),
+    # retry with full-session window so calm recompute always has enough context.
+    if len(raw) < 5:
+        session_start = _cash_session_start_ist(end_k)
+        wider = _with_retries(
+            lambda: _call(session_start, end_k),
+            f"OHLC {index_name} full-session-fallback",
+        ) or []
+        if len(wider) >= len(raw):
+            return wider
+    return raw
 
 
 def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
