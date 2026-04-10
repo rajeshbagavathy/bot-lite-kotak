@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 import os
+from typing import Optional
+
 import boto3
 
 
@@ -255,6 +257,10 @@ CALM_ZONE_BAR_UNIX_OFFSET_SEC = int(os.getenv("CALM_ZONE_BAR_UNIX_OFFSET_SEC", "
 USE_CALM_ZONE_GATEKEEPER = os.getenv("USE_CALM_ZONE_GATEKEEPER", "True").lower() in ("true", "1", "yes")
 CALM_ZONE_WAIT_TIMEOUT_MINUTES = int(os.getenv("CALM_ZONE_WAIT_TIMEOUT_MINUTES", "30"))
 CALM_ZONE_POLL_SECONDS = int(os.getenv("CALM_ZONE_POLL_SECONDS", "60"))
+# OHLC pull window for calm zone: unset or empty = from today's cash open (09:15 IST) through now
+# (full session backfill each tick). Set to e.g. 25 for a rolling 25-minute window only.
+_calm_lb = os.getenv("CALM_ZONE_OHLC_LOOKBACK_MINUTES", "").strip()
+CALM_ZONE_OHLC_LOOKBACK_MINUTES: Optional[int] = None if _calm_lb == "" else int(_calm_lb)
 
 # Database configuration
 DB_PATH = os.getenv("DB_PATH", "trades.db")

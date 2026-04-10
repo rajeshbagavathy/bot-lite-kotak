@@ -320,6 +320,7 @@ DASHBOARD_TEMPLATE = """
       <div class="card" style="margin-bottom: 12px;">
         <div class="card-title">Calm zone — <span id="volatility-index-label">—</span></div>
         <p class="meta-label" style="margin-bottom: 8px;">1-minute spot OHLC from the database; Range/Ratio use a 5-minute sliding window. Green rows: calm zone (NIFTY range &lt; 50, non-NIFTY indices &lt; 120, body/range &lt; 0.25). Timezone is IST. Index follows the bot&rsquo;s active index from <code>/state</code>.</p>
+        <p class="meta-label" style="margin-bottom: 8px; color: #94a3b8;">Pagination: <strong>page 1</strong> is the <em>most recent</em> bars (chart right = latest). Use <strong>Earlier</strong> to load older times (toward 9:15). <strong>Later</strong> returns to newer bars. Raising rows/page widens the chart only if those rows exist in the DB.</p>
         <label class="setting-row" style="font-size: 12px; color: #cbd5e1;">
           <span>Chart mode:</span>
           <select id="volatility-chart-mode" style="background: #0f172a; color: #e2e8f0; border: 1px solid #334155; padding: 4px 6px;">
@@ -335,8 +336,8 @@ DASHBOARD_TEMPLATE = """
             <option value="240">240</option>
             <option value="480">480</option>
           </select>
-          <button type="button" class="tab-btn" id="volatility-prev" style="padding: 4px 10px;">Prev</button>
-          <button type="button" class="tab-btn" id="volatility-next" style="padding: 4px 10px;">Next</button>
+          <button type="button" class="tab-btn" id="volatility-next" style="padding: 4px 10px;" title="Older bars (toward session open)">Earlier</button>
+          <button type="button" class="tab-btn" id="volatility-prev" style="padding: 4px 10px;" title="Newer bars (toward now)">Later</button>
           <span id="volatility-page-meta" class="meta-label" style="font-size: 11px;">Page 1</span>
         </label>
       </div>
@@ -513,7 +514,7 @@ DASHBOARD_TEMPLATE = """
       const pageSize = Number((vol && vol.page_size) || __volatilityPageSize || 120);
       const total = Number((vol && vol.total_rows) || 0);
       const totalPages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)));
-      pageMeta.textContent = 'Page ' + page + ' / ' + totalPages + ' · total rows: ' + total;
+      pageMeta.textContent = 'Page ' + page + ' / ' + totalPages + ' (recent→) · total rows in DB: ' + total;
       prevBtn.disabled = page <= 1;
       nextBtn.disabled = page >= totalPages;
       const cfgOff = (vol && vol.bar_unix_offset_sec != null) ? Number(vol.bar_unix_offset_sec) : 0;

@@ -13,7 +13,11 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar
 from zoneinfo import ZoneInfo
 
 from calm_zone_math import compute_calm_metrics
-from config import CALM_ZONE_BAR_UNIX_OFFSET_SEC, INDEX_CONFIGS
+from config import (
+    CALM_ZONE_BAR_UNIX_OFFSET_SEC,
+    CALM_ZONE_OHLC_LOOKBACK_MINUTES,
+    INDEX_CONFIGS,
+)
 from db import (
     DB_PATH,
     fetch_spot_bars_asc_for_recompute,
@@ -26,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-FETCH_LOOKBACK_MINUTES = 25
+ROLLING_FALLBACK_MINUTES = 25
 RECOMPUTE_TAIL = 500
 MAX_RETRIES = 5
 BASE_SLEEP_SEC = 60
@@ -74,13 +78,29 @@ def _with_retries(fn: Callable[[], T], label: str) -> Optional[T]:
     return None
 
 
+def _cash_session_start_ist(end_ist: datetime) -> datetime:
+    """Today's 09:15 Asia/Kolkata (same calendar day as ``end_ist``)."""
+    kolkata = ZoneInfo("Asia/Kolkata")
+    e = end_ist.astimezone(kolkata)
+    open_h, open_m = MARKET_OPEN_HHMM
+    return e.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+
+
 def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any]]:
     cfg = INDEX_CONFIGS[index_name]
     end = get_ist_now()
-    start = end - timedelta(minutes=FETCH_LOOKBACK_MINUTES)
+    kolkata = ZoneInfo("Asia/Kolkata")
+    end_k = end.astimezone(kolkata)
+    lb = CALM_ZONE_OHLC_LOOKBACK_MINUTES
+    if lb is not None and lb > 0:
+        start = end_k - timedelta(minutes=lb)
+    else:
+        start = _cash_session_start_ist(end_k)
+        if end_k < start:
+            start = end_k - timedelta(minutes=ROLLING_FALLBACK_MINUTES)
 
     def _call():
-        return client.get_spot_ohlc_bars(cfg, start, end)
+        return client.get_spot_ohlc_bars(cfg, start, end_k)
 
     raw = _with_retries(_call, f"OHLC {index_name}")
     return raw or []
