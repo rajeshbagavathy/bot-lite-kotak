@@ -108,6 +108,8 @@ from config import (
     DEMO_MODE,
     DB_ENABLE_MTM_SNAPSHOTS,
     USE_CALM_ZONE_GATEKEEPER,
+    CALM_ZONE_GATEKEEPER_MODE,
+    CALM_ZONE_RECENT_CALM_MINUTES,
     CALM_ZONE_WAIT_TIMEOUT_MINUTES,
     CALM_ZONE_POLL_SECONDS,
     get_basic_auth_creds,
@@ -128,7 +130,8 @@ from db import (
     restore_todays_strategies,
     get_ist_timestamp,
     get_ist_now,
-    fetch_latest_spot_calm_row,
+    fetch_latest_spot_bar_row,
+    fetch_recent_calm_spot_row,
 )
 from mtm import calculate_mtm, calculate_strategy_mtm
 from state import (
@@ -558,14 +561,32 @@ def _get_filled_orders(order_book: List[dict], app_order_ids: List[int]) -> List
 
 
 def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Optional[dict]]:
-    """Gatekeeper decision: execute only when latest index row is calm."""
+    """
+    Gatekeeper: when to allow entry.
+
+    - ``latest_bar``: the single newest 1m row must be calm (strict; often fails when the latest minute is choppy).
+    - ``recent_calm`` (default): allow if any calm bar exists within CALM_ZONE_RECENT_CALM_MINUTES.
+    """
     if not USE_CALM_ZONE_GATEKEEPER:
         return True, "gatekeeper_disabled", None
-    row = fetch_latest_spot_calm_row(index_name)
-    if not row:
+    latest = fetch_latest_spot_bar_row(index_name)
+    mode = (CALM_ZONE_GATEKEEPER_MODE or "recent_calm").strip().lower()
+    if mode not in ("latest_bar", "recent_calm"):
+        mode = "recent_calm"
+
+    if mode == "latest_bar":
+        if not latest:
+            return False, "no_data", None
+        is_calm = bool(int(latest.get("is_calmzone") or 0))
+        return (True, "calm", latest) if is_calm else (False, "volatile", latest)
+
+    min_u = int(time.time()) - int(CALM_ZONE_RECENT_CALM_MINUTES) * 60
+    calm_row = fetch_recent_calm_spot_row(index_name, min_u)
+    if calm_row:
+        return True, "calm_recent", calm_row
+    if not latest:
         return False, "no_data", None
-    is_calm = bool(int(row.get("is_calmzone") or 0))
-    return (True, "calm", row) if is_calm else (False, "volatile", row)
+    return False, "volatile", latest
 
 
 def _process_waiting_for_calm(client: XTSClient, index_config, expiry: str) -> None:

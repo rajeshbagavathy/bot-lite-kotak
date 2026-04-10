@@ -785,8 +785,8 @@ def fetch_spot_bars_asc_for_recompute(index_name: str, limit: int = 500) -> List
         return []
 
 
-def fetch_latest_spot_calm_row(index_name: str) -> Optional[Dict[str, Any]]:
-    """Latest spot row for index with calm flag for gatekeeper checks."""
+def fetch_latest_spot_bar_row(index_name: str) -> Optional[Dict[str, Any]]:
+    """Newest 1m spot row for index (by bar_unix / bar_time)."""
     try:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -805,5 +805,53 @@ def fetch_latest_spot_calm_row(index_name: str) -> Optional[Dict[str, Any]]:
         conn.close()
         return dict(row) if row else None
     except Exception as e:
-        logger.error("fetch_latest_spot_calm_row failed: %s", e)
+        logger.error("fetch_latest_spot_bar_row failed: %s", e)
         return None
+
+
+# Backward-compatible name (historical callers).
+fetch_latest_spot_calm_row = fetch_latest_spot_bar_row
+
+
+def fetch_recent_calm_spot_row(index_name: str, min_bar_unix: int) -> Optional[Dict[str, Any]]:
+    """Most recent calm row with bar_unix >= min_bar_unix (epoch seconds, same basis as stored bar_unix)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT index_name, bar_time, bar_unix, is_calmzone
+            FROM spot_market_data
+            WHERE index_name = ?
+              AND is_calmzone = 1
+              AND bar_unix IS NOT NULL
+              AND bar_unix >= ?
+            ORDER BY bar_unix DESC
+            LIMIT 1
+            """,
+            (index_name, int(min_bar_unix)),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error("fetch_recent_calm_spot_row failed: %s", e)
+        return None
+
+
+def spot_bar_exists(index_name: str, bar_time: str) -> bool:
+    """True if a row exists for this index and bar_time (primary key)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM spot_market_data WHERE index_name = ? AND bar_time = ? LIMIT 1",
+            (index_name, bar_time),
+        )
+        ok = cursor.fetchone() is not None
+        conn.close()
+        return ok
+    except Exception as e:
+        logger.error("spot_bar_exists failed: %s", e)
+        return False

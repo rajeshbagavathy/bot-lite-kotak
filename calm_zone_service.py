@@ -13,8 +13,11 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar
 from zoneinfo import ZoneInfo
 
 from calm_zone_math import compute_calm_metrics
+import time
+
 from config import (
     CALM_ZONE_BAR_UNIX_OFFSET_SEC,
+    CALM_ZONE_OHLC_FREEZE_AFTER_SEC,
     CALM_ZONE_OHLC_LOOKBACK_MINUTES,
     INDEX_CONFIGS,
 )
@@ -22,6 +25,7 @@ from db import (
     DB_PATH,
     fetch_spot_bars_asc_for_recompute,
     get_ist_now,
+    spot_bar_exists,
     upsert_spot_bar,
 )
 from xts_client import XTSClient
@@ -110,6 +114,10 @@ def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
     for b in bars:
         ts = _normalize_unix_ts(b["bar_unix"])
         bar_time = bar_unix_to_ist_str(ts)
+        if CALM_ZONE_OHLC_FREEZE_AFTER_SEC > 0:
+            age = time.time() - float(ts)
+            if age > float(CALM_ZONE_OHLC_FREEZE_AFTER_SEC) and spot_bar_exists(index_name, bar_time):
+                continue
         vol = b.get("volume")
         upsert_spot_bar(
             index_name,

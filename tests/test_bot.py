@@ -1913,13 +1913,27 @@ class TestCalmZoneGatekeeper(unittest.TestCase):
         self.assertIsNone(row)
 
     @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
-    @patch("bot.fetch_latest_spot_calm_row")
+    @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "latest_bar")
+    @patch("bot.fetch_latest_spot_bar_row")
     def test_should_execute_now_from_calm_row(self, mock_latest):
         mock_latest.return_value = {"bar_time": "2026-04-08 09:20:00", "is_calmzone": 1}
         ok, reason, row = bot.should_execute_now("S1", "NIFTY")
         self.assertTrue(ok)
         self.assertEqual(reason, "calm")
         self.assertEqual(row["is_calmzone"], 1)
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
+    @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "recent_calm")
+    @patch("bot.CALM_ZONE_RECENT_CALM_MINUTES", 10)
+    @patch("bot.fetch_recent_calm_spot_row")
+    @patch("bot.fetch_latest_spot_bar_row")
+    def test_should_execute_now_recent_calm(self, mock_latest, mock_recent):
+        mock_recent.return_value = {"bar_time": "2026-04-08 09:25:00", "is_calmzone": 1, "bar_unix": 100}
+        mock_latest.return_value = {"bar_time": "2026-04-08 09:31:00", "is_calmzone": 0}
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "calm_recent")
+        self.assertEqual(row["bar_time"], "2026-04-08 09:25:00")
 
     @patch("bot.get_ist_now")
     @patch("bot.logger")

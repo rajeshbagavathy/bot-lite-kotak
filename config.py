@@ -255,8 +255,14 @@ ACC_NAME = os.getenv("ACC_NAME")
 # Set only if candle times are consistently shifted vs India wall clock (default 0).
 CALM_ZONE_BAR_UNIX_OFFSET_SEC = int(os.getenv("CALM_ZONE_BAR_UNIX_OFFSET_SEC", "0"))
 USE_CALM_ZONE_GATEKEEPER = os.getenv("USE_CALM_ZONE_GATEKEEPER", "True").lower() in ("true", "1", "yes")
+# latest_bar: only the newest 1m row may pass (very strict; flips every minute).
+# recent_calm: pass if any calm bar exists within CALM_ZONE_RECENT_CALM_MINUTES (wall clock).
+CALM_ZONE_GATEKEEPER_MODE = os.getenv("CALM_ZONE_GATEKEEPER_MODE", "recent_calm").strip().lower()
+CALM_ZONE_RECENT_CALM_MINUTES = int(os.getenv("CALM_ZONE_RECENT_CALM_MINUTES", "12"))
 CALM_ZONE_WAIT_TIMEOUT_MINUTES = int(os.getenv("CALM_ZONE_WAIT_TIMEOUT_MINUTES", "30"))
 CALM_ZONE_POLL_SECONDS = int(os.getenv("CALM_ZONE_POLL_SECONDS", "60"))
+# Stop revising OHLC for bars older than this many seconds (stops calm flags "moving" on re-fetch). 0 = off.
+CALM_ZONE_OHLC_FREEZE_AFTER_SEC = int(os.getenv("CALM_ZONE_OHLC_FREEZE_AFTER_SEC", "180"))
 # OHLC pull window for calm zone: unset or empty = from today's cash open (09:15 IST) through now
 # (full session backfill each tick). Set to e.g. 25 for a rolling 25-minute window only.
 _calm_lb = os.getenv("CALM_ZONE_OHLC_LOOKBACK_MINUTES", "").strip()
