@@ -15,6 +15,7 @@ from state import (
 
 from bot_log_filter import bot_log_line_is_survivor_event
 from db import count_spot_market_rows, fetch_spot_market_rows
+from calm_zone_service import get_calm_zone_health_snapshot
 
 try:
     from config import CALM_ZONE_BAR_UNIX_OFFSET_SEC, LEG_TARGET_PCT
@@ -1439,6 +1440,15 @@ def create_app(username: str, password: str) -> Flask:
                 ),
                 500,
             )
+
+    @app.route("/api/volatility-health")
+    @basic_auth.required
+    def api_volatility_health():
+        """Runtime health/debug info for calm-zone ingestion worker."""
+        try:
+            return jsonify(get_calm_zone_health_snapshot())
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/bot-log")
     @basic_auth.required

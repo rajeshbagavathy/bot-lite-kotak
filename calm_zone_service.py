@@ -23,6 +23,7 @@ from config import (
 from db import (
     DB_PATH,
     fetch_spot_bars_asc_for_recompute,
+    fetch_latest_spot_bar_row,
     get_ist_now,
     spot_bar_exists,
     upsert_spot_bar,
@@ -41,6 +42,48 @@ MAX_RETRIES = 5
 BASE_SLEEP_SEC = 60
 MARKET_OPEN_HHMM = (9, 15)
 MARKET_CLOSE_HHMM = (15, 30)
+
+_HEALTH_LOCK = threading.Lock()
+_HEALTH: Dict[str, Any] = {
+    "started_at": None,
+    "last_tick_started_at": None,
+    "last_tick_completed_at": None,
+    "last_tick_status": "idle",
+    "last_error": None,
+    "indices": {
+        "NIFTY": {"last_fetch_count": 0, "last_latest_bar_time": None},
+        "SENSEX": {"last_fetch_count": 0, "last_latest_bar_time": None},
+    },
+}
+
+
+def _health_set(**kwargs: Any) -> None:
+    with _HEALTH_LOCK:
+        _HEALTH.update(kwargs)
+
+
+def _health_set_index(index_name: str, fetch_count: Optional[int] = None, latest_bar_time: Optional[str] = None) -> None:
+    idx = str(index_name).upper()
+    with _HEALTH_LOCK:
+        if idx not in _HEALTH["indices"]:
+            _HEALTH["indices"][idx] = {"last_fetch_count": 0, "last_latest_bar_time": None}
+        slot = _HEALTH["indices"][idx]
+        if fetch_count is not None:
+            slot["last_fetch_count"] = int(fetch_count)
+        if latest_bar_time is not None:
+            slot["last_latest_bar_time"] = latest_bar_time
+
+
+def get_calm_zone_health_snapshot() -> Dict[str, Any]:
+    with _HEALTH_LOCK:
+        return {
+            "started_at": _HEALTH.get("started_at"),
+            "last_tick_started_at": _HEALTH.get("last_tick_started_at"),
+            "last_tick_completed_at": _HEALTH.get("last_tick_completed_at"),
+            "last_tick_status": _HEALTH.get("last_tick_status"),
+            "last_error": _HEALTH.get("last_error"),
+            "indices": {k: dict(v) for k, v in (_HEALTH.get("indices") or {}).items()},
+        }
 
 
 def _is_market_hours_ist(now: Optional[datetime] = None) -> bool:
@@ -249,11 +292,14 @@ def recompute_calm_metrics_for_index(index_name: str, limit: int = RECOMPUTE_TAI
 def calm_zone_tick(client: XTSClient) -> None:
     for index_name in ("NIFTY", "SENSEX"):
         bars = _fetch_ohlc_window(client, index_name)
+        _health_set_index(index_name, fetch_count=len(bars))
         if not bars:
             continue
         _upsert_ohlc_rows(index_name, bars)
         # Incremental pass: compute only recent unlocked minutes; locked rows stay immutable.
         recompute_calm_metrics_for_index(index_name, RECOMPUTE_TAIL)
+        latest = fetch_latest_spot_bar_row(index_name) or {}
+        _health_set_index(index_name, latest_bar_time=latest.get("bar_time"))
 
 
 def backfill_today_calm_once() -> None:
@@ -267,15 +313,28 @@ def backfill_today_calm_once() -> None:
 
 def _run_loop(client: XTSClient, stop: threading.Event) -> None:
     logger.info("Calm zone monitor thread started (DB=%s)", DB_PATH)
+    _health_set(started_at=get_ist_now().strftime("%Y-%m-%d %H:%M:%S"), last_tick_status="starting")
     try:
         backfill_today_calm_once()
     except Exception:
         logger.exception("Startup calm-zone backfill failed")
+        _health_set(last_error="startup_backfill_failed", last_tick_status="startup_failed")
     while not stop.is_set():
         try:
+            _health_set(last_tick_started_at=get_ist_now().strftime("%Y-%m-%d %H:%M:%S"), last_tick_status="running")
             calm_zone_tick(client)
+            _health_set(
+                last_tick_completed_at=get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+                last_tick_status="ok",
+                last_error=None,
+            )
         except Exception:
             logger.exception("Calm zone tick failed")
+            _health_set(
+                last_tick_completed_at=get_ist_now().strftime("%Y-%m-%d %H:%M:%S"),
+                last_tick_status="error",
+                last_error="tick_failed",
+            )
         stop.wait(BASE_SLEEP_SEC)
 
 
