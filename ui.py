@@ -179,6 +179,16 @@ DASHBOARD_TEMPLATE = """
     .refresh-time { color: #64748b; font-size: 11px; margin-top: 20px; text-align: center; }
     .log-view { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.45; max-height: 70vh; overflow: auto; background: #0f172a; padding: 14px; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; }
     tr.row-calm td { background: rgba(16, 185, 129, 0.22) !important; }
+    .rule-badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 700; margin-right: 4px; margin-bottom: 2px; }
+    .rule-ok { background: #065f46; color: #d1fae5; }
+    .rule-no { background: #7f1d1d; color: #fecaca; }
+    .rule-na { background: #334155; color: #cbd5e1; }
+    .legend-inline { margin: 6px 0 8px 0; color: #cbd5e1; font-size: 12px; line-height: 1.45; }
+    .legend-item { margin-right: 10px; white-space: nowrap; }
+    .legend-wrap { position: sticky; top: 0; z-index: 6; background: #111827; border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; }
+    .legend-toggle { background: #0f172a; color: #cbd5e1; border: 1px solid #334155; border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
+    .legend-body { margin-top: 8px; }
+    .legend-wrap.collapsed .legend-body { display: none; }
     #volatility-chart { width: 100%; height: 420px; min-height: 280px; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
@@ -344,10 +354,17 @@ DASHBOARD_TEMPLATE = """
       </div>
       <table>
         <thead>
-          <tr><th>Time (IST)</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Range</th><th>Ratio</th><th>Status</th></tr>
+          <tr><th>Time (IST)</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Range</th><th>Ratio</th><th>Status</th><th>Rule Check</th><th>Exec Hint (Strict)</th><th>Why</th></tr>
         </thead>
         <tbody id="volatility-rows">Loading...</tbody>
       </table>
+      <div class="legend-wrap" id="volatility-legend-wrap">
+        <button type="button" class="legend-toggle" id="volatility-legend-toggle" aria-expanded="true">Hide legend</button>
+        <div class="legend-inline legend-body" id="volatility-legend-body">
+          <span class="legend-item"><strong>Rule Check:</strong> <span class="rule-badge rule-ok">Range:OK</span><span class="rule-badge rule-no">Range:NO</span><span class="rule-badge rule-na">Range:NA</span> (same for Ratio)</span>
+          <span class="legend-item"><strong>Exec Hint (Strict):</strong> current calm OR previous calm -> eligible</span>
+        </div>
+      </div>
       <div class="card" style="margin-top: 16px;">
         <div class="card-title">1m candlestick + calm zones</div>
         <div id="volatility-chart"></div>
@@ -374,6 +391,7 @@ DASHBOARD_TEMPLATE = """
   <script>
     let __volatilityPage = 1;
     let __volatilityPageSize = 120;
+    let __volLegendCollapsed = false;
 
     function fmt(num) {
       if (num === null || num === undefined) return "-";
@@ -482,6 +500,28 @@ DASHBOARD_TEMPLATE = """
       return raw + ' IST';
     }
 
+    function boolish(v) {
+      return v === true || v === 1 || v === '1';
+    }
+
+    function ruleBadge(ok, label) {
+      if (ok === null || ok === undefined) {
+        return '<span class="rule-badge rule-na">' + escHtml(label + ':NA') + '</span>';
+      }
+      return '<span class="rule-badge ' + (ok ? 'rule-ok' : 'rule-no') + '">' + escHtml(label + ':' + (ok ? 'OK' : 'NO')) + '</span>';
+    }
+
+    function strictExecHintForRow(rowsNewestFirst, idx) {
+      const cur = rowsNewestFirst[idx];
+      const prior = rowsNewestFirst[idx + 1];
+      const curCalm = !!(cur && boolish(cur.is_calmzone));
+      const priorCalm = !!(prior && boolish(prior.is_calmzone));
+      if (curCalm) return 'Eligible: current calm';
+      if (priorCalm) return 'Eligible: previous calm';
+      if (!prior) return 'Not eligible: no previous bar';
+      return 'Not eligible: current+previous not calm';
+    }
+
     function shortChartTimeLabel(r, offsetSec) {
       const ms = barUnixMs(r, offsetSec);
       if (ms != null && !isNaN(ms)) {
@@ -528,11 +568,15 @@ DASHBOARD_TEMPLATE = """
         const cls = calm ? 'row-calm' : '';
         const ratio = (r.body_range_ratio != null && r.body_range_ratio !== '') ? Number(r.body_range_ratio).toFixed(4) : '-';
         const rng = (r.range_5m != null && r.range_5m !== '') ? Number(r.range_5m).toFixed(2) : '-';
-        const st = calm ? 'Calm' : '—';
-        html += '<tr class="' + cls + '"><td>' + escHtml(formatVolBarTime(r, off)) + '</td><td>' + fmt(r.open) + '</td><td>' + fmt(r.high) + '</td><td>' + fmt(r.low) + '</td><td>' + fmt(r.close) + '</td><td>' + rng + '</td><td>' + ratio + '</td><td>' + st + '</td></tr>';
+        const dataReady = boolish(r.data_ready);
+        const st = dataReady ? (calm ? 'Calm' : 'Not calm') : 'Insufficient bars';
+        const ruleCheck = ruleBadge(r.range_ok, 'Range') + ruleBadge(r.ratio_ok, 'Ratio');
+        const execHint = strictExecHintForRow(rows, i);
+        const whyText = calm ? (r.calm_reason || 'Calm by thresholds') : (r.not_calm_reason || 'Not calm by thresholds');
+        html += '<tr class="' + cls + '"><td>' + escHtml(formatVolBarTime(r, off)) + '</td><td>' + fmt(r.open) + '</td><td>' + fmt(r.high) + '</td><td>' + fmt(r.low) + '</td><td>' + fmt(r.close) + '</td><td>' + rng + '</td><td>' + ratio + '</td><td>' + escHtml(st) + '</td><td>' + ruleCheck + '</td><td>' + escHtml(execHint) + '</td><td>' + escHtml(whyText) + '</td></tr>';
       }
       if (!html) {
-        html = '<tr><td colspan="8">No spot data yet (market hours / worker running).</td></tr>';
+        html = '<tr><td colspan="11">No spot data yet (market hours / worker running).</td></tr>';
       }
       tbody.innerHTML = html;
 
@@ -633,6 +677,34 @@ DASHBOARD_TEMPLATE = """
         const volPageSize = document.getElementById('volatility-page-size');
         const volPrev = document.getElementById('volatility-prev');
         const volNext = document.getElementById('volatility-next');
+        const volLegendWrap = document.getElementById('volatility-legend-wrap');
+        const volLegendToggle = document.getElementById('volatility-legend-toggle');
+        if (volLegendToggle && volLegendWrap && !volLegendToggle.dataset.bound) {
+          volLegendToggle.dataset.bound = '1';
+          volLegendToggle.addEventListener('click', function() {
+            __volLegendCollapsed = !__volLegendCollapsed;
+            if (__volLegendCollapsed) {
+              volLegendWrap.classList.add('collapsed');
+              volLegendToggle.textContent = 'Show legend';
+              volLegendToggle.setAttribute('aria-expanded', 'false');
+            } else {
+              volLegendWrap.classList.remove('collapsed');
+              volLegendToggle.textContent = 'Hide legend';
+              volLegendToggle.setAttribute('aria-expanded', 'true');
+            }
+          });
+        }
+        if (volLegendWrap && volLegendToggle) {
+          if (__volLegendCollapsed) {
+            volLegendWrap.classList.add('collapsed');
+            volLegendToggle.textContent = 'Show legend';
+            volLegendToggle.setAttribute('aria-expanded', 'false');
+          } else {
+            volLegendWrap.classList.remove('collapsed');
+            volLegendToggle.textContent = 'Hide legend';
+            volLegendToggle.setAttribute('aria-expanded', 'true');
+          }
+        }
         if (volMode && !volMode.dataset.bound) {
           volMode.dataset.bound = '1';
           volMode.addEventListener('change', function() { updateVolatilityMonitor(volmon); });
@@ -1415,10 +1487,51 @@ def create_app(username: str, password: str) -> Flask:
             offset = (page - 1) * page_size
             total_rows = count_spot_market_rows(name)
             rows = fetch_spot_market_rows(name, limit=page_size, offset=offset)
+            range_thr = 50.0 if name == "NIFTY" else 120.0
+            ratio_thr = 0.25
+            enriched = []
+            for r in rows:
+                d = dict(r)
+                rg = d.get("range_5m")
+                rt = d.get("body_range_ratio")
+                try:
+                    rg_f = float(rg) if rg is not None else None
+                except (TypeError, ValueError):
+                    rg_f = None
+                try:
+                    rt_f = float(rt) if rt is not None else None
+                except (TypeError, ValueError):
+                    rt_f = None
+                data_ready = rg_f is not None and rt_f is not None
+                range_ok = (rg_f < range_thr) if data_ready else None
+                ratio_ok = (rt_f < ratio_thr) if data_ready else None
+                d["range_threshold"] = range_thr
+                d["ratio_threshold"] = ratio_thr
+                d["data_ready"] = bool(data_ready)
+                d["range_ok"] = range_ok
+                d["ratio_ok"] = ratio_ok
+                if data_ready:
+                    d["calm_reason"] = (
+                        f"Calm: range {rg_f:.2f} < {range_thr:.2f} and ratio {rt_f:.4f} < {ratio_thr:.2f}"
+                    )
+                    reasons = []
+                    if not range_ok:
+                        reasons.append(f"range {rg_f:.2f} >= {range_thr:.2f}")
+                    if not ratio_ok:
+                        reasons.append(f"ratio {rt_f:.4f} >= {ratio_thr:.2f}")
+                    d["not_calm_reason"] = (
+                        "Not calm: " + " and ".join(reasons)
+                        if reasons
+                        else "Not calm: classification mismatch (inspect source row)"
+                    )
+                else:
+                    d["calm_reason"] = "Insufficient bars: 5-minute metrics not ready"
+                    d["not_calm_reason"] = "Insufficient bars: 5-minute metrics not ready"
+                enriched.append(d)
             return jsonify(
                 {
                     "index": name,
-                    "rows": rows,
+                    "rows": enriched,
                     "bar_unix_offset_sec": CALM_ZONE_BAR_UNIX_OFFSET_SEC,
                     "page": page,
                     "page_size": page_size,
