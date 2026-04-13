@@ -1182,6 +1182,30 @@ def fetch_latest_spot_bar_row(index_name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def fetch_last_two_spot_bar_rows(index_name: str) -> List[Dict[str, Any]]:
+    """Newest two 1m spot rows (same ordering as fetch_latest_spot_bar_row), oldest of the two last."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT index_name, bar_time, bar_unix, is_calmzone
+            FROM spot_market_data
+            WHERE index_name = ?
+            ORDER BY (bar_unix IS NULL) ASC, bar_unix DESC, bar_time DESC
+            LIMIT 2
+            """,
+            (index_name,),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error("fetch_last_two_spot_bar_rows failed: %s", e)
+        return []
+
+
 # Backward-compatible name (historical callers).
 fetch_latest_spot_calm_row = fetch_latest_spot_bar_row
 

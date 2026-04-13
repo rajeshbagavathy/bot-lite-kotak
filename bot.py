@@ -133,6 +133,7 @@ from db import (
     get_ist_timestamp,
     get_ist_now,
     fetch_latest_spot_bar_row,
+    fetch_last_two_spot_bar_rows,
     fetch_recent_calm_spot_row,
 )
 from mtm import calculate_mtm, calculate_strategy_mtm
@@ -562,26 +563,54 @@ def _get_filled_orders(order_book: List[dict], app_order_ids: List[int]) -> List
     ]
 
 
+def _calm_gatekeeper_context_blurb(row: Optional[dict]) -> str:
+    """Human-readable latest (and optional prior) bar times for wait/volatile messages."""
+    if not row:
+        return "latest=none"
+    parts = [f"latest={row.get('bar_time')}"]
+    pt = row.get("prior_bar_time")
+    if pt:
+        parts.append(f"prior={pt}")
+    return ", ".join(parts)
+
+
 def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Optional[dict]]:
     """
     Gatekeeper: when to allow entry.
 
-    - ``latest_bar``: the single newest 1m row must be calm (strict; often fails when the latest minute is choppy).
-    - ``recent_calm`` (default): allow if any calm bar exists within CALM_ZONE_RECENT_CALM_MINUTES.
+    - ``current_or_prior_calm`` (default): newest 1m row or the immediately prior row is calm.
+    - ``latest_bar``: only the newest 1m row must be calm.
+    - ``recent_calm``: allow if any calm bar exists within CALM_ZONE_RECENT_CALM_MINUTES.
     """
     if not USE_CALM_ZONE_GATEKEEPER:
         return True, "gatekeeper_disabled", None
-    latest = fetch_latest_spot_bar_row(index_name)
-    mode = (CALM_ZONE_GATEKEEPER_MODE or "recent_calm").strip().lower()
-    if mode not in ("latest_bar", "recent_calm"):
-        mode = "recent_calm"
+    mode = (CALM_ZONE_GATEKEEPER_MODE or "current_or_prior_calm").strip().lower()
+    if mode not in ("latest_bar", "current_or_prior_calm", "recent_calm"):
+        mode = "current_or_prior_calm"
 
     if mode == "latest_bar":
+        latest = fetch_latest_spot_bar_row(index_name)
         if not latest:
             return False, "no_data", None
         is_calm = bool(int(latest.get("is_calmzone") or 0))
         return (True, "calm", latest) if is_calm else (False, "volatile", latest)
 
+    if mode == "current_or_prior_calm":
+        rows = fetch_last_two_spot_bar_rows(index_name)
+        if not rows:
+            return False, "no_data", None
+        latest = rows[0]
+        prior = rows[1] if len(rows) > 1 else None
+        if bool(int(latest.get("is_calmzone") or 0)):
+            return True, "calm_current", latest
+        if prior and bool(int(prior.get("is_calmzone") or 0)):
+            return True, "calm_prior", prior
+        ctx = dict(latest)
+        if prior:
+            ctx["prior_bar_time"] = prior.get("bar_time")
+        return False, "volatile", ctx
+
+    latest = fetch_latest_spot_bar_row(index_name)
     min_u = int(time.time()) - int(CALM_ZONE_RECENT_CALM_MINUTES) * 60
     calm_row = fetch_recent_calm_spot_row(index_name, min_u)
     if calm_row:
@@ -648,8 +677,7 @@ def _process_waiting_for_calm(client: XTSClient, index_config, expiry: str) -> N
                 strategy["name"],
                 next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
                 message=(
-                    f"Waiting for Calm Zone ({reason}; latest="
-                    f"{row.get('bar_time') if row else 'none'})"
+                    f"Waiting for Calm Zone ({reason}; {_calm_gatekeeper_context_blurb(row)})"
                 ),
             )
 
@@ -677,7 +705,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
                 + name
                 + " waiting for Calm Zone. Volatility detected."
                 + (
-                    f" (reason={gate_reason}, latest={gate_row.get('bar_time')})"
+                    f" (reason={gate_reason}, {_calm_gatekeeper_context_blurb(gate_row)})"
                     if gate_row
                     else f" (reason={gate_reason})"
                 )

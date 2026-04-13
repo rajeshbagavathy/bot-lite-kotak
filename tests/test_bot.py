@@ -300,10 +300,15 @@ class TestExecuteStrategy(unittest.TestCase):
         
         mock_get_atm.assert_not_called()
 
+    @patch("bot.fetch_last_two_spot_bar_rows")
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
-    def test_spot_ltp_unavailable(self, mock_get_atm, mock_update):
+    def test_spot_ltp_unavailable(self, mock_get_atm, mock_update, mock_two):
         """Test error handling when spot LTP is unavailable."""
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:20:00", "bar_unix": 1, "is_calmzone": 1},
+            {"bar_time": "2026-04-08 09:19:00", "bar_unix": 0, "is_calmzone": 1},
+        ]
         mock_get_atm.return_value = None
         strategy = {"status": "PENDING", "name": "S0920", "time": "09:20:00"}
         
@@ -311,10 +316,15 @@ class TestExecuteStrategy(unittest.TestCase):
         
         mock_update.assert_called_once_with("S0920", status="ERROR", message="Spot LTP unavailable")
 
+    @patch("bot.fetch_last_two_spot_bar_rows")
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
-    def test_option_instruments_not_found(self, mock_get_atm, mock_update):
+    def test_option_instruments_not_found(self, mock_get_atm, mock_update, mock_two):
         """Test error handling when option instruments not found."""
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:20:00", "bar_unix": 1, "is_calmzone": 1},
+            {"bar_time": "2026-04-08 09:19:00", "bar_unix": 0, "is_calmzone": 1},
+        ]
         mock_get_atm.return_value = 21900
         self.client.get_option_instrument_id.side_effect = [None, 67890]
         strategy = {"status": "PENDING", "name": "S0920", "time": "09:20:00"}
@@ -323,6 +333,7 @@ class TestExecuteStrategy(unittest.TestCase):
         
         mock_update.assert_called_once_with("S0920", status="ERROR", message="Option instruments not found")
 
+    @patch("bot.fetch_last_two_spot_bar_rows")
     @patch("bot._place_leg_sl_orders")
     @patch("bot._get_filled_orders")
     @patch("bot._ensure_margin_or_skip_strategy", return_value=True)
@@ -332,9 +343,13 @@ class TestExecuteStrategy(unittest.TestCase):
     @patch("time.sleep")
     @patch("datetime.datetime")
     def test_successful_strategy_execution(
-        self, mock_dt, mock_sleep, mock_time, mock_get_atm, mock_update, mock_ensure_margin, mock_filled, mock_place_sl
+        self, mock_dt, mock_sleep, mock_time, mock_get_atm, mock_update, mock_ensure_margin, mock_filled, mock_place_sl, mock_two
     ):
         """Test successful strategy execution."""
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:20:00", "bar_unix": 1, "is_calmzone": 1},
+            {"bar_time": "2026-04-08 09:19:00", "bar_unix": 0, "is_calmzone": 1},
+        ]
         mock_dt.now.return_value.strftime.return_value = "09:20:01"
         mock_dt.now.return_value.isoformat.return_value = "2026-02-08T09:20:01"
         mock_get_atm.return_value = 21900
@@ -1934,6 +1949,68 @@ class TestCalmZoneGatekeeper(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reason, "calm_recent")
         self.assertEqual(row["bar_time"], "2026-04-08 09:25:00")
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
+    @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "current_or_prior_calm")
+    @patch("bot.fetch_last_two_spot_bar_rows")
+    def test_should_execute_now_current_or_prior_calm_current_only(self, mock_two):
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:31:00", "bar_unix": 200, "is_calmzone": 1},
+            {"bar_time": "2026-04-08 09:30:00", "bar_unix": 140, "is_calmzone": 0},
+        ]
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "calm_current")
+        self.assertEqual(row["bar_time"], "2026-04-08 09:31:00")
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
+    @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "current_or_prior_calm")
+    @patch("bot.fetch_last_two_spot_bar_rows")
+    def test_should_execute_now_current_or_prior_calm_prior_only(self, mock_two):
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:31:00", "bar_unix": 200, "is_calmzone": 0},
+            {"bar_time": "2026-04-08 09:30:00", "bar_unix": 140, "is_calmzone": 1},
+        ]
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "calm_prior")
+        self.assertEqual(row["bar_time"], "2026-04-08 09:30:00")
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
+    @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "current_or_prior_calm")
+    @patch("bot.fetch_last_two_spot_bar_rows")
+    def test_should_execute_now_current_or_prior_both_volatile(self, mock_two):
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:31:00", "bar_unix": 200, "is_calmzone": 0},
+            {"bar_time": "2026-04-08 09:30:00", "bar_unix": 140, "is_calmzone": 0},
+        ]
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "volatile")
+        self.assertEqual(row["bar_time"], "2026-04-08 09:31:00")
+        self.assertEqual(row.get("prior_bar_time"), "2026-04-08 09:30:00")
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
+    @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "current_or_prior_calm")
+    @patch("bot.fetch_last_two_spot_bar_rows")
+    def test_should_execute_now_current_or_prior_single_row_not_calm(self, mock_two):
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:31:00", "bar_unix": 200, "is_calmzone": 0},
+        ]
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "volatile")
+        self.assertNotIn("prior_bar_time", row)
+
+    @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
+    @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "current_or_prior_calm")
+    @patch("bot.fetch_last_two_spot_bar_rows")
+    def test_should_execute_now_current_or_prior_empty_rows(self, mock_two):
+        mock_two.return_value = []
+        ok, reason, row = bot.should_execute_now("S1", "NIFTY")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "no_data")
+        self.assertIsNone(row)
 
     @patch("bot.get_ist_now")
     @patch("bot.logger")
