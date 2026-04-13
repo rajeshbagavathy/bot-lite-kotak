@@ -574,6 +574,61 @@ def _calm_gatekeeper_context_blurb(row: Optional[dict]) -> str:
     return ", ".join(parts)
 
 
+def _normalize_strategy_time_hhmmss(raw: str) -> Optional[str]:
+    t = (raw or "").strip()
+    if not t:
+        return None
+    c = t.count(":")
+    if c == 1:
+        return f"{t}:00"
+    if c == 2:
+        return t
+    return None
+
+
+def _strategy_slot_ist_datetime(strategy: dict) -> datetime.datetime:
+    """Today's calendar date in IST with the strategy's slotted wall time."""
+    now = get_ist_now()
+    norm = _normalize_strategy_time_hhmmss(str(strategy.get("time") or ""))
+    if not norm:
+        return now
+    try:
+        hh, mm, ss = (int(x) for x in norm.split(":"))
+    except ValueError:
+        return now
+    return now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+
+
+def _gatekeeper_window_start_iso(strategy: dict) -> str:
+    """ISO timestamp for the strategy slot (IST); used to anchor the calm wait timeout."""
+    return _strategy_slot_ist_datetime(strategy).isoformat(timespec="seconds")
+
+
+def _catch_up_missed_scheduled_strategies(client: XTSClient, index_config, expiry: str) -> None:
+    """
+    ``schedule.every().day.at(slot)`` does not run a job if the process starts after that
+    time today. Run eligible PENDING strategies once when the process starts inside
+    ``[slot, slot + CALM_ZONE_WAIT_TIMEOUT_MINUTES]`` so restarts still honor the gatekeeper window.
+    """
+    if _SCHEDULER_MINIMAL_MODE:
+        return
+    now = get_ist_now()
+    for strategy in STRATEGY_STATE.values():
+        if strategy.get("status") != "PENDING":
+            continue
+        slot_dt = _strategy_slot_ist_datetime(strategy)
+        window_end = slot_dt + datetime.timedelta(minutes=int(CALM_ZONE_WAIT_TIMEOUT_MINUTES))
+        if now < slot_dt or now > window_end:
+            continue
+        logger.info(
+            "Catch-up: running %s (slot %s; missed daily schedule, inside %s min window)",
+            strategy["name"],
+            strategy.get("time"),
+            CALM_ZONE_WAIT_TIMEOUT_MINUTES,
+        )
+        _execute_strategy(client, index_config, expiry, strategy, force=False)
+
+
 def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Optional[dict]]:
     """
     Gatekeeper: when to allow entry.
@@ -692,9 +747,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     can_run, gate_reason, gate_row = should_execute_now(name, index_config.name)
     if not can_run:
         now_ts = get_ist_now().timestamp()
-        gk_started = strategy.get("gatekeeper_started_at") or get_ist_now().isoformat(
-            timespec="seconds"
-        )
+        gk_started = strategy.get("gatekeeper_started_at") or _gatekeeper_window_start_iso(strategy)
         update_strategy(
             name,
             status="WAITING_FOR_CALM",
@@ -2180,7 +2233,7 @@ def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
             
             # Schedule jobs now that we have expiry
             _schedule_jobs(client, index_config, expiry)
-            
+
             # Restore today's strategies now that we have expiry
             restored = restore_todays_strategies()
             for restored_strategy in restored:
@@ -2366,6 +2419,7 @@ def main() -> None:
     jobs_scheduled = False
     if not DEMO_MODE and index_config is not None:
         _schedule_jobs(client, index_config, expiry)
+        _catch_up_missed_scheduled_strategies(client, index_config, expiry)
         jobs_scheduled = True
     elif not DEMO_MODE:
         register_scheduler_snapshot_with_state()

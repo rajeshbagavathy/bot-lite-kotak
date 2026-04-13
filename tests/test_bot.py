@@ -2092,6 +2092,72 @@ class TestCalmZoneGatekeeper(unittest.TestCase):
         self.assertTrue(wait_calls, "expected update_strategy with WAITING_FOR_CALM")
         mock_atm.assert_not_called()
 
+    @patch("bot.fetch_last_two_spot_bar_rows")
+    @patch("bot.upsert_strategy_waiting_for_calm", return_value=1)
+    @patch("bot.update_strategy")
+    @patch("bot.should_execute_now")
+    @patch("bot._get_atm_strike")
+    @patch("bot.get_ist_now")
+    def test_gatekeeper_started_at_anchors_to_slot_not_wall_clock(
+        self, mock_now, mock_atm, mock_gate, mock_update, _mock_upsert, mock_two
+    ):
+        """First WAITING_FOR_CALM uses strategy slot as window start (30m from slotted time)."""
+        mock_two.return_value = [
+            {"bar_time": "2026-04-08 09:22:00", "bar_unix": 1, "is_calmzone": 0},
+            {"bar_time": "2026-04-08 09:21:00", "bar_unix": 0, "is_calmzone": 0},
+        ]
+        mock_now.return_value = datetime.datetime(2026, 4, 8, 9, 22, 30)
+        mock_gate.return_value = (False, "volatile", {"bar_time": "2026-04-08 09:22:00"})
+        mock_atm.return_value = 25000
+        strategy = {
+            "name": "N_W_0921",
+            "status": "PENDING",
+            "time": "09:21:00",
+            "lots": 1,
+            "leg_sl_pct": 20.0,
+            "strategy_sl": 1000.0,
+        }
+        bot._execute_strategy(self.client, self.index_config, "10APR2026", strategy, force=False)
+        wait_kw = next(c.kwargs for c in mock_update.call_args_list if c.kwargs.get("status") == "WAITING_FOR_CALM")
+        self.assertTrue(
+            str(wait_kw.get("gatekeeper_started_at", "")).startswith("2026-04-08T09:21:00"),
+            wait_kw,
+        )
+
+    @patch("bot._execute_strategy")
+    @patch("bot.get_ist_now")
+    @patch("bot._SCHEDULER_MINIMAL_MODE", False)
+    def test_catch_up_missed_schedule_inside_window(self, mock_now, mock_exec):
+        mock_now.return_value = datetime.datetime(2026, 4, 8, 11, 47, 0)
+        bot.STRATEGY_STATE = {
+            "S1": {"name": "S1", "status": "PENDING", "time": "11:46:00"},
+        }
+        bot._catch_up_missed_scheduled_strategies(self.client, self.index_config, "10APR2026")
+        mock_exec.assert_called_once()
+        self.assertEqual(mock_exec.call_args[0][3]["name"], "S1")
+
+    @patch("bot._execute_strategy")
+    @patch("bot.get_ist_now")
+    @patch("bot._SCHEDULER_MINIMAL_MODE", False)
+    def test_catch_up_skips_before_slot(self, mock_now, mock_exec):
+        mock_now.return_value = datetime.datetime(2026, 4, 8, 11, 45, 0)
+        bot.STRATEGY_STATE = {
+            "S1": {"name": "S1", "status": "PENDING", "time": "11:46:00"},
+        }
+        bot._catch_up_missed_scheduled_strategies(self.client, self.index_config, "10APR2026")
+        mock_exec.assert_not_called()
+
+    @patch("bot._execute_strategy")
+    @patch("bot.get_ist_now")
+    @patch("bot._SCHEDULER_MINIMAL_MODE", False)
+    def test_catch_up_skips_after_gatekeeper_window(self, mock_now, mock_exec):
+        mock_now.return_value = datetime.datetime(2026, 4, 8, 12, 17, 0)
+        bot.STRATEGY_STATE = {
+            "S1": {"name": "S1", "status": "PENDING", "time": "11:46:00"},
+        }
+        bot._catch_up_missed_scheduled_strategies(self.client, self.index_config, "10APR2026")
+        mock_exec.assert_not_called()
+
 
 if __name__ == "__main__":
     # Run tests with coverage report
