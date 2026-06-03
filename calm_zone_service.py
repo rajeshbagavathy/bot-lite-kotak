@@ -235,6 +235,14 @@ def _with_retries(fn: Callable[[], T], label: str) -> Optional[T]:
             return fn()
         except Exception as e:
             last_err = e
+            try:
+                from kotak_auth import KotakSessionNotReady
+
+                if isinstance(e, KotakSessionNotReady):
+                    logger.debug("%s skipped: %s", label, e)
+                    return None
+            except ImportError:
+                pass
             logger.warning("%s attempt %s/%s failed: %s", label, attempt + 1, MAX_RETRIES, e)
             if attempt < MAX_RETRIES - 1:
                 jitter = random.uniform(0, 0.5)

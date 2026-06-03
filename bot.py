@@ -76,7 +76,6 @@ def _configure_bot_logging() -> None:
 _configure_bot_logging()
 
 from config import (
-    ACC_NAME,
     INDEX_CONFIGS,
     HEDGE_PREMIUM_MAX_EXPIRY,
     HEDGE_PREMIUM_MAX_NON_EXPIRY,
@@ -114,7 +113,7 @@ from config import (
     CALM_ZONE_POLL_SECONDS,
     get_basic_auth_creds,
     get_today_strategies,
-    load_credentials,
+    load_login_credentials,
 )
 from db import (
     init_db,
@@ -2091,6 +2090,7 @@ STRATEGY_STATE: Dict[str, dict] = {}
 _MAIN_LOOP_LAST_TICK: float = 0.0
 _JOBS_SCHEDULED_FLAG: bool = False
 _SCHEDULER_MINIMAL_MODE: bool = False
+_CALM_ZONE_STARTED: bool = False
 
 
 def _callable_name(fn: Any) -> str:
@@ -2231,6 +2231,62 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
     register_scheduler_snapshot_with_state()
 
 
+def _kotak_session_ready(client: Any) -> bool:
+    from config import BROKER_BACKEND
+
+    if BROKER_BACKEND != "kotak":
+        return True
+    try:
+        if hasattr(client, "is_session_active"):
+            return bool(client.is_session_active())
+        import kotak_auth
+
+        return kotak_auth.client_session_active()
+    except Exception:
+        return False
+
+
+def _start_calm_zone_monitor_once(client: Any) -> None:
+    global _CALM_ZONE_STARTED
+    if _CALM_ZONE_STARTED or client is None:
+        return
+    if not _kotak_session_ready(client):
+        logger.debug("Calm zone monitor deferred until Kotak TOTP login completes")
+        return
+    from calm_zone_service import start_calm_zone_monitor_thread
+
+    start_calm_zone_monitor_thread(client)
+    _CALM_ZONE_STARTED = True
+
+
+def _complete_kotak_bootstrap() -> None:
+    """After dashboard TOTP login: pick expiry, schedule jobs, start calm-zone thread."""
+    client = None
+    try:
+        import kotak_auth
+
+        client = kotak_auth.get_client()
+    except Exception:
+        pass
+    if client is None:
+        logger.error("Kotak bootstrap: trading client not registered")
+        return
+    try:
+        index_config, expiry = _pick_index_and_expiry(client)
+        set_index(index_config.name, expiry)
+        if not _JOBS_SCHEDULED_FLAG:
+            _schedule_jobs(client, index_config, expiry)
+            _catch_up_missed_scheduled_strategies(client, index_config, expiry)
+        _start_calm_zone_monitor_once(client)
+        logger.info("Kotak bootstrap complete: %s %s", index_config.name, expiry)
+    except RuntimeError as e:
+        logger.error("Kotak bootstrap failed (expiry/index): %s", e)
+        set_index_error(str(e))
+        from threading import Thread
+
+        Thread(target=lambda: _retry_pick_expiry(client, {}), daemon=True).start()
+
+
 def _retry_pick_expiry(client: Any, auth: dict) -> None:
     """Periodically retry picking expiry if initial attempt failed."""
     global STRATEGY_STATE
@@ -2281,6 +2337,7 @@ def _retry_pick_expiry(client: Any, auth: dict) -> None:
                         )
                     STRATEGY_STATE[strategy_name].update(merge_kw2)
             
+            _start_calm_zone_monitor_once(client)
             logger.debug("✓ Bot is now operational")
             return  # Success, exit retry loop
             
@@ -2297,6 +2354,7 @@ def _retry_pick_expiry(client: Any, auth: dict) -> None:
 
 
 def main() -> None:
+    init_db()
     if DEMO_MODE:
         logger.debug("DEMO MODE - Simulated data")
         client = None
@@ -2304,54 +2362,40 @@ def main() -> None:
         expiry = "08FEB2026"
         auth = {"username": "admin", "password": "admin123"}
     else:
-        from config import BROKER_BACKEND
+        from config import BROKER_BACKEND, load_kotak_credentials
+        import kotak_auth
 
-        if not ACC_NAME:
-            if BROKER_BACKEND == "kotak":
-                required_env = (
-                    "KOTAK_CONSUMER_KEY_S",
-                    "KOTAK_MOBILE_S",
-                    "KOTAK_UCC_S",
-                    "KOTAK_MPIN_S",
-                    "LOGIN_USERNAME_5P",
-                    "LOGIN_PASSWORD_5P",
-                )
-            else:
-                required_env = (
-                    "XTS_API_KEY_5P",
-                    "XTS_API_SECRET_5P",
-                    "XTS_5P_CLIENTID_5P",
-                    "XTS_MARKET_API_KEY_5P",
-                    "XTS_MARKET_API_SECRET_5P",
-                    "LOGIN_USERNAME_5P",
-                    "LOGIN_PASSWORD_5P",
-                )
-            missing = [key for key in required_env if not os.getenv(key)]
-            if missing:
-                raise RuntimeError(
-                    "ACC_NAME is required for SSM lookups; set ACC_NAME or provide all credential env vars. "
-                    f"Missing: {', '.join(missing)}"
-                )
-        if BROKER_BACKEND == "kotak":
-            creds = {
-                "login_username": os.getenv("LOGIN_USERNAME_5P"),
-                "login_password": os.getenv("LOGIN_PASSWORD_5P"),
-            }
-        else:
-            creds = load_credentials()
+        creds = load_login_credentials()
         auth = get_basic_auth_creds(creds)
         client = create_trading_client()
-        client.login()
-        try:
-            index_config, expiry = _pick_index_and_expiry(client)
-        except RuntimeError as e:
-            logger.error(f"Failed to pick index and expiry: {e}")
-            index_config = None
-            expiry = None
-            client_for_retry = client
+        kotak_cfg = load_kotak_credentials() if BROKER_BACKEND == "kotak" else {}
+        kotak_auth.init_kotak_auth_mode(has_auto_totp_secret=bool(kotak_cfg.get("totp_secret")))
+
+        index_config = None
+        expiry = None
+        from db import is_kotak_totp_satisfied_today, mark_kotak_totp_satisfied_today
+
+        defer_kotak_login = (
+            kotak_auth.kotak_ui_totp_enabled() and not kotak_auth.client_session_active()
+        )
+
+        if defer_kotak_login:
+            kotak_auth.register_pending_client(client, _complete_kotak_bootstrap)
+            logger.info(
+                "Kotak: open the dashboard and enter today's TOTP (once per day, IST)."
+            )
+        else:
+            client.login()
+            if BROKER_BACKEND == "kotak":
+                mark_kotak_totp_satisfied_today()
+            try:
+                index_config, expiry = _pick_index_and_expiry(client)
+            except RuntimeError as e:
+                logger.error(f"Failed to pick index and expiry: {e}")
+                index_config = None
+                expiry = None
 
     logger.debug("Index: %s | Expiry: %s", index_config.name if index_config else "NOT SET", expiry if expiry else "NOT SET")
-    init_db()
     # Clean up all previous day data on startup
     cleanup_previous_day_data()
 
@@ -2473,7 +2517,13 @@ def main() -> None:
     def _run_flask_server() -> None:
         try:
             ensure_http_access_not_logged()
-            app.run(host="0.0.0.0", port=ui_port, debug=False, use_reloader=False)
+            app.run(
+                host="0.0.0.0",
+                port=ui_port,
+                debug=False,
+                use_reloader=False,
+                threaded=True,
+            )
         except OSError as e:
             logger.error(
                 "Flask UI failed to bind port %s (Permission denied on ports <1024 without root, "
@@ -2488,10 +2538,8 @@ def main() -> None:
     ui_thread.daemon = True
     ui_thread.start()
 
-    if not DEMO_MODE and client is not None:
-        from calm_zone_service import start_calm_zone_monitor_thread
-
-        start_calm_zone_monitor_thread(client)
+    if not DEMO_MODE and client is not None and _kotak_session_ready(client):
+        _start_calm_zone_monitor_once(client)
 
     logger.info(
         "UI dashboard at http://0.0.0.0:%s (path /dashboard) | basic auth user: %s",

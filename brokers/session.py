@@ -79,8 +79,10 @@ class KotakSessionManager:
                     "not the 6-digit rolling code. "
                     "For a quick test you can set KOTAK_TOTP to the current 6-digit code instead."
                 ) from e
-        # One-shot code from env (local test only; expires quickly; not ideal for long-running bot).
-        manual = (os.getenv("KOTAK_TOTP") or "").strip().replace(" ", "")
+        # One-shot code from env (local test only). Ignored when dashboard TOTP flow is enabled.
+        manual = ""
+        if not self._dashboard_totp_mode():
+            manual = (os.getenv("KOTAK_TOTP") or "").strip().replace(" ", "")
         if manual:
             if not manual.isdigit() or len(manual) != 6:
                 raise RuntimeError(
@@ -95,8 +97,18 @@ class KotakSessionManager:
             "or set KOTAK_TOTP (6-digit code, one-shot) or pass totp_fn"
         )
 
+    def login_with_totp(self, totp: str) -> None:
+        """Establish session using a user-supplied 6-digit TOTP (dashboard / one-shot)."""
+        code = str(totp).strip().replace(" ", "")
+        if not code.isdigit() or len(code) != 6:
+            raise RuntimeError("TOTP must be exactly 6 digits")
+        self._totp_login_validate(code)
+
     def login(self) -> None:
         totp = self._gen_totp()
+        self._totp_login_validate(totp)
+
+    def _totp_login_validate(self, totp: str) -> None:
         r1 = self._api.totp_login(mobile_number=self._mobile, ucc=self._ucc, totp=totp)
         if isinstance(r1, dict) and r1.get("error"):
             hint = ""
@@ -117,11 +129,26 @@ class KotakSessionManager:
         self._last_login_ts = time.time()
         logger.info("Kotak Neo session established (ucc=%s)", self._ucc)
 
+    @staticmethod
+    def _dashboard_totp_mode() -> bool:
+        try:
+            import kotak_auth
+
+            return kotak_auth.kotak_ui_totp_enabled()
+        except Exception:
+            return False
+
     def ensure(self) -> None:
         max_age = int(os.getenv("KOTAK_SESSION_MAX_AGE_SEC", "0") or "0")
         stale = max_age > 0 and (time.time() - self._last_login_ts) > max_age
         cfg = self._api.configuration
         if stale or not cfg.edit_token or not cfg.edit_sid:
+            if self._dashboard_totp_mode():
+                from kotak_auth import KotakSessionNotReady
+
+                raise KotakSessionNotReady(
+                    "Kotak session not ready — enter today's TOTP in the dashboard."
+                )
             self.login()
 
     def current_server_id(self) -> Optional[str]:

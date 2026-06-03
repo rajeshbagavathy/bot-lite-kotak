@@ -383,6 +383,13 @@ class KotakNeoClient:
     def login(self) -> None:
         self._session.login()
 
+    def login_with_totp(self, totp: str) -> None:
+        self._session.login_with_totp(totp)
+
+    def is_session_active(self) -> bool:
+        cfg = self._api.configuration
+        return bool(getattr(cfg, "edit_token", None) and getattr(cfg, "edit_sid", None))
+
     def _ensure(self) -> None:
         self._session.ensure()
 

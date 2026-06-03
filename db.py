@@ -36,6 +36,42 @@ def get_ist_timestamp() -> str:
     return get_ist_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def is_kotak_totp_satisfied_today() -> bool:
+    """True if dashboard TOTP was accepted for the current IST calendar day."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM kotak_daily_auth WHERE ist_date = ? LIMIT 1",
+            (get_ist_date(),),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        logger.error("is_kotak_totp_satisfied_today failed: %s", e)
+        return False
+
+
+def mark_kotak_totp_satisfied_today() -> None:
+    """Record successful Kotak TOTP login for today (IST)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO kotak_daily_auth (ist_date, submitted_at)
+            VALUES (?, ?)
+            ON CONFLICT(ist_date) DO UPDATE SET submitted_at = excluded.submitted_at
+            """,
+            (get_ist_date(), get_ist_timestamp()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("mark_kotak_totp_satisfied_today failed: %s", e)
+
+
 def _normalize_spot_legacy_bar_times(cursor: sqlite3.Cursor) -> None:
     """
     One-time migration: legacy rows used second-level bar_time (e.g. ...:59 vs ...:18) for the
@@ -298,6 +334,13 @@ def init_db() -> None:
             "UPDATE spot_market_data SET calm_locked = 1 WHERE range_5m IS NOT NULL AND calm_locked = 0"
         )
         _normalize_spot_legacy_bar_times(cursor)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS kotak_daily_auth (
+                ist_date TEXT PRIMARY KEY,
+                submitted_at TEXT NOT NULL
+            )
+        """)
 
         conn.commit()
         conn.close()
@@ -721,6 +764,11 @@ def cleanup_previous_day_data() -> None:
             """,
             (today,),
         ).rowcount
+
+        try:
+            cursor.execute("DELETE FROM kotak_daily_auth WHERE ist_date < ?", (today,))
+        except sqlite3.OperationalError:
+            pass
         
         conn.commit()
         conn.close()

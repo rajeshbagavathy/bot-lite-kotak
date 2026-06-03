@@ -131,6 +131,264 @@ def read_bot_log_tail(
         return out
 
 
+KOTAK_TOTP_MODAL_HTML = """
+      <style>
+        @keyframes kotak-totp-spin { to { transform: rotate(360deg); } }
+        #kotak-totp-spinner-icon {
+          width: 22px; height: 22px; flex-shrink: 0;
+          border: 2px solid #334155; border-top-color: #38bdf8;
+          border-radius: 50%; animation: kotak-totp-spin 0.85s linear infinite;
+        }
+      </style>
+      <div id="kotak-totp-modal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 1100; align-items: center; justify-content: center;">
+        <div style="background: #1e293b; padding: 24px; border-radius: 8px; max-width: 380px; width: 90%; border: 1px solid #334155; color: #e2e8f0;">
+          <p id="kotak-totp-title" style="margin: 0 0 8px 0; font-weight: bold;">Kotak login — enter TOTP</p>
+          <p id="kotak-totp-hint" class="meta-label" style="margin: 0 0 12px 0; font-size: 12px; color: #94a3b8;">Enter the 6-digit code from your authenticator app.</p>
+          <div id="kotak-totp-form">
+            <input type="text" id="kotak-totp-input" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" placeholder="6-digit TOTP" style="width: 100%; padding: 10px; margin-bottom: 10px; box-sizing: border-box; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; font-size: 18px; letter-spacing: 0.2em; text-align: center;" />
+            <button type="button" id="kotak-totp-submit" style="width: 100%; padding: 10px 16px; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Connect Kotak</button>
+          </div>
+          <div id="kotak-totp-spinner-row" style="display: none; align-items: center; gap: 10px; margin: 12px 0;">
+            <div id="kotak-totp-spinner-icon"></div>
+            <span id="kotak-totp-spinner-text" style="font-size: 13px; color: #38bdf8; line-height: 1.4;">Connecting to Kotak…</span>
+          </div>
+          <p id="kotak-totp-success" style="display: none; margin: 12px 0 0 0; font-size: 14px; color: #4ade80; font-weight: 600; line-height: 1.4;"></p>
+          <p id="kotak-totp-error" style="display: none; margin: 10px 0 0 0; color: #f87171; font-size: 13px; line-height: 1.4;"></p>
+        </div>
+      </div>
+"""
+
+KOTAK_TOTP_JS = r"""
+    window.__kotakAuthReady = false;
+    window.__kotakConnecting = false;
+
+    function kotakTotpStorageKey(istDate) {
+      return 'kotak_totp_ok_' + (istDate || '');
+    }
+
+    function showKotakTotpModal(show) {
+      const el = document.getElementById('kotak-totp-modal');
+      if (!el) return;
+      el.style.display = show ? 'flex' : 'none';
+    }
+
+    async function fetchKotakAuthStatus() {
+      const noCache = { cache: 'no-store', credentials: 'same-origin' };
+      const res = await fetch('/api/kotak-auth/status', noCache);
+      return res.json();
+    }
+
+    function resetKotakTotpModalForm() {
+      const form = document.getElementById('kotak-totp-form');
+      const input = document.getElementById('kotak-totp-input');
+      const btn = document.getElementById('kotak-totp-submit');
+      if (form) form.style.display = 'block';
+      if (input) { input.style.display = 'block'; input.disabled = false; }
+      if (btn) { btn.style.display = 'block'; btn.disabled = false; }
+      const row = document.getElementById('kotak-totp-spinner-row');
+      const ok = document.getElementById('kotak-totp-success');
+      const err = document.getElementById('kotak-totp-error');
+      if (row) row.style.display = 'none';
+      if (ok) { ok.style.display = 'none'; ok.textContent = ''; }
+      if (err) { err.style.display = 'none'; err.textContent = ''; }
+      const title = document.getElementById('kotak-totp-title');
+      if (title) title.textContent = 'Kotak login — enter TOTP';
+    }
+
+    function setKotakTotpUiState(mode, message) {
+      const form = document.getElementById('kotak-totp-form');
+      const row = document.getElementById('kotak-totp-spinner-row');
+      const spinText = document.getElementById('kotak-totp-spinner-text');
+      const ok = document.getElementById('kotak-totp-success');
+      const err = document.getElementById('kotak-totp-error');
+      const title = document.getElementById('kotak-totp-title');
+      const hint = document.getElementById('kotak-totp-hint');
+      if (err) { err.style.display = 'none'; err.textContent = ''; }
+      if (ok) { ok.style.display = 'none'; ok.textContent = ''; }
+      if (row) row.style.display = 'none';
+      if (mode === 'connecting') {
+        if (form) form.style.display = 'none';
+        if (title) title.textContent = 'Connecting to Kotak';
+        if (hint) hint.style.display = 'none';
+        if (row) row.style.display = 'flex';
+        if (spinText) spinText.textContent = message || 'Verifying TOTP and starting broker session…';
+        return;
+      }
+      if (hint) hint.style.display = 'block';
+      if (mode === 'success') {
+        if (form) form.style.display = 'none';
+        if (title) title.textContent = 'Kotak connected';
+        if (hint) hint.style.display = 'none';
+        if (ok) {
+          ok.textContent = message || 'TOTP accepted. Broker session is active.';
+          ok.style.display = 'block';
+        }
+        return;
+      }
+      if (mode === 'error') {
+        resetKotakTotpModalForm();
+        if (title) title.textContent = 'Kotak login failed';
+        if (hint) hint.style.display = 'none';
+        if (err) {
+          err.textContent = message || 'Login failed. Try a fresh 6-digit code.';
+          err.style.display = 'block';
+        }
+        return;
+      }
+      resetKotakTotpModalForm();
+    }
+
+    function applyKotakAuthReady(st) {
+      if (st && st.ist_date) sessionStorage.setItem(kotakTotpStorageKey(st.ist_date), '1');
+      window.__kotakAuthReady = true;
+      window.__kotakConnecting = false;
+      resetKotakTotpModalForm();
+      showKotakTotpModal(false);
+    }
+
+    async function ensureKotakTotpGate() {
+      if (window.__kotakAuthReady) return true;
+      let st = {};
+      try {
+        st = await fetchKotakAuthStatus();
+      } catch (e) {
+        return false;
+      }
+      if (!st.ui_required) {
+        applyKotakAuthReady(st);
+        return true;
+      }
+      const key = kotakTotpStorageKey(st.ist_date);
+      if (!st.session_active && st.ist_date) {
+        sessionStorage.removeItem(key);
+      }
+      if (st.session_active) {
+        applyKotakAuthReady(st);
+        return true;
+      }
+      if (st.login_in_progress) {
+        window.__kotakConnecting = true;
+        showKotakTotpModal(true);
+        setKotakTotpUiState('connecting', 'Login in progress…');
+        return false;
+      }
+      if (!st.needs_totp_entry) {
+        applyKotakAuthReady(st);
+        return true;
+      }
+      showKotakTotpModal(true);
+      return false;
+    }
+
+    async function pollKotakAuthUntilDone() {
+      for (let i = 0; i < 90; i++) {
+        let st = {};
+        try {
+          st = await fetchKotakAuthStatus();
+        } catch (e) {
+          setKotakTotpUiState('connecting', 'Waiting for Kotak (network retry)…');
+          await new Promise(function(r) { setTimeout(r, 1000); });
+          continue;
+        }
+        if (st.login_error) {
+          window.__kotakConnecting = false;
+          setKotakTotpUiState('error', st.login_error);
+          return false;
+        }
+        if (st.login_in_progress) {
+          setKotakTotpUiState('connecting', i < 3
+            ? 'Verifying TOTP with Kotak…'
+            : 'Loading instruments and schedule (may take up to a minute)…');
+        }
+        if (st.session_active) {
+          const msg = 'TOTP accepted. Kotak session is active.'
+            + (st.satisfied_today ? ' You are set for today (IST).' : '');
+          setKotakTotpUiState('success', msg);
+          await new Promise(function(r) { setTimeout(r, 2200); });
+          applyKotakAuthReady(st);
+          if (typeof window.onKotakAuthReady === 'function') window.onKotakAuthReady();
+          return true;
+        }
+        await new Promise(function(r) { setTimeout(r, 1000); });
+      }
+      window.__kotakConnecting = false;
+      setKotakTotpUiState('error', 'Timed out waiting for Kotak. Check the terminal log and try again with a new code.');
+      return false;
+    }
+
+    async function submitKotakTotp() {
+      const input = document.getElementById('kotak-totp-input');
+      const btn = document.getElementById('kotak-totp-submit');
+      const code = (input && input.value || '').trim().replace(/\s+/g, '');
+      if (!/^\d{6}$/.test(code)) {
+        setKotakTotpUiState('error', 'Enter a valid 6-digit code from your authenticator app.');
+        return;
+      }
+      showKotakTotpModal(true);
+      if (btn) btn.disabled = true;
+      if (input) input.disabled = true;
+      window.__kotakConnecting = true;
+      setKotakTotpUiState('connecting', 'Submitting TOTP…');
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(function() { ctrl.abort(); }, 15000);
+        const res = await fetch('/api/kotak-auth/totp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ totp: code }),
+          signal: ctrl.signal,
+        });
+        clearTimeout(t);
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          window.__kotakConnecting = false;
+          setKotakTotpUiState('error', data.error || 'TOTP rejected. Use a fresh code and try again.');
+          return;
+        }
+        if (data.already) {
+          setKotakTotpUiState('success', 'Already connected to Kotak.');
+          await new Promise(function(r) { setTimeout(r, 1500); });
+          const st = await fetchKotakAuthStatus();
+          applyKotakAuthReady(st);
+          if (typeof window.onKotakAuthReady === 'function') window.onKotakAuthReady();
+          return;
+        }
+        setKotakTotpUiState('connecting', data.message || 'Connecting to Kotak…');
+        await pollKotakAuthUntilDone();
+      } catch (e) {
+        window.__kotakConnecting = false;
+        const msg = (e && e.name === 'AbortError')
+          ? 'Request timed out. The server may still be connecting — check the terminal or wait and refresh.'
+          : String(e);
+        setKotakTotpUiState('error', msg);
+      }
+    }
+
+    (function bindKotakTotpOnce() {
+      const btn = document.getElementById('kotak-totp-submit');
+      const input = document.getElementById('kotak-totp-input');
+      if (btn && !btn.dataset.bound) {
+        btn.dataset.bound = '1';
+        btn.addEventListener('click', submitKotakTotp);
+      }
+      if (input && !input.dataset.bound) {
+        input.dataset.bound = '1';
+        input.addEventListener('keydown', function(ev) {
+          if (ev.key === 'Enter') submitKotakTotp();
+        });
+      }
+      ensureKotakTotpGate();
+    })();
+"""
+
+
+def _render_page(html: str) -> str:
+    return html.replace("<!--KOTAK_TOTP_MODAL-->", KOTAK_TOTP_MODAL_HTML).replace(
+        "<!--KOTAK_TOTP_JS-->", KOTAK_TOTP_JS
+    )
+
+
 DASHBOARD_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -262,6 +520,7 @@ DASHBOARD_TEMPLATE = """
           </div>
         </div>
       </div>
+      <!--KOTAK_TOTP_MODAL-->
       <div class="card" style="margin-bottom: 15px;">
         <div class="card-title">Scheduler health</div>
         <p class="meta-label" style="margin-bottom: 8px;" id="scheduler-notes"></p>
@@ -643,8 +902,16 @@ DASHBOARD_TEMPLATE = """
       setTimeout(function() { try { ch.resize(); } catch (e) {} }, 60);
     }
 
+    <!--KOTAK_TOTP_JS-->
+    window.onKotakAuthReady = function() { loadDashboard(); };
+
     async function loadDashboard() {
       try {
+        if (!window.__kotakAuthReady && !window.__kotakConnecting) {
+          const ok = await ensureKotakTotpGate();
+          if (!ok) return;
+        }
+        if (window.__kotakConnecting) return;
         const showFullLog = document.getElementById('bot-log-show-full')?.checked;
         const logMode = showFullLog ? 'all' : 'survivor';
         const noCache = { cache: 'no-store', credentials: 'same-origin' };
@@ -1133,8 +1400,13 @@ DASHBOARD_TEMPLATE = """
       }
     }
 
-    loadDashboard();
-    setInterval(loadDashboard, 2000);
+    (async function initDash() {
+      const ok = await ensureKotakTotpGate();
+      if (ok) loadDashboard();
+    })();
+    setInterval(function() {
+      if (window.__kotakAuthReady && !window.__kotakConnecting) loadDashboard();
+    }, 2000);
   </script>
 </body>
 </html>
@@ -1221,8 +1493,12 @@ HTML_TEMPLATE = """
       </div>
     </div>
   </div>
+  <!--KOTAK_TOTP_MODAL-->
 
   <script>
+    <!--KOTAK_TOTP_JS-->
+    window.onKotakAuthReady = function() { refresh(); };
+
     function fmt(num) {
       if (num === null || num === undefined) return "-";
       return Number(num).toFixed(2);
@@ -1275,6 +1551,11 @@ HTML_TEMPLATE = """
     });
 
     async function refresh() {
+      if (!window.__kotakAuthReady && !window.__kotakConnecting) {
+        const ok = await ensureKotakTotpGate();
+        if (!ok) return;
+      }
+      if (window.__kotakConnecting) return;
       const res = await fetch('/state', { cache: 'no-store', credentials: 'same-origin' });
       const data = await res.json();
 
@@ -1320,8 +1601,13 @@ HTML_TEMPLATE = """
     }
 
     loadFlags();
-    refresh();
-    setInterval(refresh, 3000);
+    (async function initHome() {
+      const ok = await ensureKotakTotpGate();
+      if (ok) refresh();
+    })();
+    setInterval(function() {
+      if (window.__kotakAuthReady && !window.__kotakConnecting) refresh();
+    }, 3000);
   </script>
 </body>
 </html>
@@ -1346,17 +1632,43 @@ def create_app(username: str, password: str) -> Flask:
     @app.route("/")
     @basic_auth.required
     def index():
-        return render_template_string(HTML_TEMPLATE)
+        return render_template_string(_render_page(HTML_TEMPLATE))
 
     @app.route("/dashboard")
     @basic_auth.required
     def dashboard():
-        return render_template_string(DASHBOARD_TEMPLATE)
+        return render_template_string(_render_page(DASHBOARD_TEMPLATE))
 
     @app.route("/state")
     @basic_auth.required
     def state():
         return jsonify(get_snapshot())
+
+    @app.route("/api/kotak-auth/status")
+    @basic_auth.required
+    def api_kotak_auth_status():
+        try:
+            from kotak_auth import get_status
+
+            return jsonify(get_status())
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/kotak-auth/totp", methods=["POST"])
+    @basic_auth.required
+    def api_kotak_auth_totp():
+        from flask import request
+
+        try:
+            from kotak_auth import submit_totp
+
+            data = request.get_json(force=True, silent=True) or {}
+            result = submit_totp(str(data.get("totp") or ""))
+            if not result.get("ok"):
+                return jsonify(result), 400
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.route("/api/settings", methods=["GET", "POST"])
     @basic_auth.required

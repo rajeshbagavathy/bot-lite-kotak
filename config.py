@@ -256,8 +256,23 @@ HEDGE_PREMIUM_MAX_NON_EXPIRY = float(os.getenv("HEDGE_PREMIUM_MAX_NON_EXPIRY", "
 
 SOURCE = "WEBAPI"
 DEMO_MODE = os.getenv("DEMO_MODE", "False").lower() in ("true", "1", "yes")  # Reads from environment variable
-SSM_BASE_PATH = "/trade/config"
+
+# AWS SSM Parameter Store (EC2: grant ssm:GetParameter on these paths; region ap-south-1 by default).
+SSM_BASE_PATH = os.getenv("SSM_BASE_PATH", "/trade/config").rstrip("/")
+AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+# Legacy XTS layout: /trade/config/<ACC_NAME>/apikey, etc.
 ACC_NAME = os.getenv("ACC_NAME")
+# UI basic auth — /trade/config/5pindra/loginusername|loginpassword
+SSM_LOGIN_USERNAME_PATH = os.getenv(
+    "SSM_LOGIN_USERNAME_PATH",
+    f"{SSM_BASE_PATH}/5pindra/loginusername",
+)
+SSM_LOGIN_PASSWORD_PATH = os.getenv(
+    "SSM_LOGIN_PASSWORD_PATH",
+    f"{SSM_BASE_PATH}/5pindra/loginpassword",
+)
+# Kotak — /trade/config/kotak/<profile>/KOTAK_* (see load_kotak_credentials)
+KOTAK_SSM_PROFILE = os.getenv("KOTAK_SSM_PROFILE", "rajesh")
 
 # Calm zone / OHLC: optional correction (seconds) added to vendor unix timestamps before IST formatting.
 # Default -19800 aligns feeds that are consistently +5h30 ahead of India wall clock.
@@ -285,22 +300,61 @@ DB_ENABLE_MTM_SNAPSHOTS = os.getenv("DB_ENABLE_MTM_SNAPSHOTS", "false").lower() 
 
 
 def _get_ssm_param(param_name: str) -> str:
-    client = boto3.client("ssm", region_name="ap-south-1")
+    client = boto3.client("ssm", region_name=AWS_REGION)
     response = client.get_parameter(Name=param_name, WithDecryption=True)
     return response["Parameter"]["Value"]
 
 
 def _build_ssm_path(param_name: str) -> str:
     if not ACC_NAME:
-        raise RuntimeError("ACC_NAME is required to load SSM parameters")
+        raise RuntimeError("ACC_NAME is required to load XTS SSM parameters")
     return f"{SSM_BASE_PATH}/{ACC_NAME}/{param_name}"
 
 
+def _kotak_ssm_base() -> str:
+    return os.getenv(
+        "SSM_KOTAK_BASE_PATH",
+        f"{SSM_BASE_PATH}/kotak/{KOTAK_SSM_PROFILE}",
+    ).rstrip("/")
+
+
+def _kotak_ssm_path(param_name: str) -> str:
+    """Full path, e.g. /trade/config/kotak/rajesh/KOTAK_CONSUMER_KEY_S."""
+    return f"{_kotak_ssm_base()}/{param_name}"
+
+
+def _get_env_or_ssm_path(env_key: str, ssm_path: str) -> str:
+    """Prefer env var; otherwise read the full SSM parameter path."""
+    value = os.getenv(env_key)
+    if value:
+        return value
+    return _get_ssm_param(ssm_path)
+
+
 def _get_env_or_ssm(env_key: str, ssm_key: str) -> str:
+    """Legacy XTS: env var or /trade/config/<ACC_NAME>/<ssm_key>."""
     value = os.getenv(env_key)
     if value:
         return value
     return _get_ssm_param(_build_ssm_path(ssm_key))
+
+
+def _get_env_or_ssm_optional(env_key: str, ssm_path: str) -> Optional[str]:
+    value = (os.getenv(env_key) or "").strip()
+    if value:
+        return value
+    try:
+        return _get_ssm_param(ssm_path).strip() or None
+    except Exception:
+        return None
+
+
+def load_login_credentials() -> dict:
+    """Dashboard basic-auth credentials (env or SSM under 5pindra paths)."""
+    return {
+        "login_username": _get_env_or_ssm_path("LOGIN_USERNAME_5P", SSM_LOGIN_USERNAME_PATH),
+        "login_password": _get_env_or_ssm_path("LOGIN_PASSWORD_5P", SSM_LOGIN_PASSWORD_PATH),
+    }
 
 
 def load_credentials() -> dict:
@@ -310,8 +364,7 @@ def load_credentials() -> dict:
         "client_id": _get_env_or_ssm("XTS_5P_CLIENTID_5P_S", "clientid"),
         "market_api_key": _get_env_or_ssm("XTS_MARKET_API_KEY_5P_S", "marketdataapikey"),
         "market_api_secret": _get_env_or_ssm("XTS_MARKET_API_SECRET_5P_S", "marketdataapisecret"),
-        "login_username": _get_env_or_ssm("LOGIN_USERNAME_5P", "loginusername"),
-        "login_password": _get_env_or_ssm("LOGIN_PASSWORD_5P", "loginpassword"),
+        **load_login_credentials(),
     }
 
 
@@ -327,13 +380,19 @@ BROKER_BACKEND = os.getenv("BROKER_BACKEND", "xts").strip().lower()
 
 
 def load_kotak_credentials() -> dict:
-    """Credentials for Kotak Neo API (TOTP + MPIN flow)."""
+    """Credentials for Kotak Neo API (TOTP + MPIN flow). Env overrides SSM paths under /trade/config/kotak/<profile>/."""
     return {
-        "consumer_key": _get_env_or_ssm("KOTAK_CONSUMER_KEY_S", "kotakconsumerkey"),
-        "mobile_number": _get_env_or_ssm("KOTAK_MOBILE_S", "kotakmobile"),
-        "ucc": _get_env_or_ssm("KOTAK_UCC_S", "kotakucc"),
-        "mpin": _get_env_or_ssm("KOTAK_MPIN_S", "kotakmpin"),
-        "totp_secret": os.getenv("KOTAK_TOTP_SECRET", "").strip() or None,
+        "consumer_key": _get_env_or_ssm_path(
+            "KOTAK_CONSUMER_KEY_S", _kotak_ssm_path("KOTAK_CONSUMER_KEY_S")
+        ),
+        "mobile_number": _get_env_or_ssm_path(
+            "KOTAK_MOBILE_S", _kotak_ssm_path("KOTAK_MOBILE_S")
+        ),
+        "ucc": _get_env_or_ssm_path("KOTAK_UCC_S", _kotak_ssm_path("KOTAK_UCC_S")),
+        "mpin": _get_env_or_ssm_path("KOTAK_MPIN_S", _kotak_ssm_path("KOTAK_MPIN_S")),
+        "totp_secret": _get_env_or_ssm_optional(
+            "KOTAK_TOTP_SECRET", _kotak_ssm_path("KOTAK_TOTP_SECRET")
+        ),
         "environment": os.getenv("KOTAK_ENVIRONMENT", "prod").strip().lower(),
         "neo_fin_key": os.getenv("KOTAK_NEO_FIN_KEY") or None,
     }
