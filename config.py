@@ -81,97 +81,100 @@ STRATEGIES = []  # Deprecated: use day-based plans below.
 # - Time suffix: 1001 = 10:01, 1146 = 11:46, 1446 = 14:46, etc.
 #
 # Example: N_M_S10_1146 → NIFTY, Monday, slot S10 at 11:46.
+#
+# Slots/times match xts-bot-lite; Kotak uses a fixed 3 lots per strategy (override via STRATEGY_LOTS env).
+STRATEGY_LOTS = int(os.getenv("STRATEGY_LOTS", "3"))
 
-# Monday NIFTY – 72 lots total (sorted by time)
+# Monday NIFTY (sorted by time)
 # S2_9.31am, S4_10.01am, S9_11.16am, S11_11.46am, S13_12.16pm, S16_1.01pm, S18_1.31pm, S21_2.16pm
 MONDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_M_0931", "09:31:00", 6, 20.0, 0.0),   # S2_9.31am
-    StrategyConfig("N_M_1001", "10:01:00", 14, 20.0, 0.0),  # S4_10.01am
-    StrategyConfig("N_M_1116", "11:16:00", 6, 20.0, 0.0),   # S9_11.16am
-    StrategyConfig("N_M_1146", "11:46:00", 15, 20.0, 0.0),  # S11_11.46am
-    StrategyConfig("N_M_1216", "12:16:00", 6, 20.0, 0.0),   # S13_12.16pm
-    StrategyConfig("N_M_1301", "13:01:00", 13, 20.0, 0.0),  # S16_1.01pm
-    StrategyConfig("N_M_1331", "13:31:00", 6, 20.0, 0.0),   # S18_1.31pm
-    StrategyConfig("N_M_1416", "14:16:00", 6, 20.0, 0.0),   # S21_2.16pm
+    StrategyConfig("N_M_0931", "09:31:00", STRATEGY_LOTS, 20.0, 0.0),   # S2_9.31am
+    StrategyConfig("N_M_1001", "10:01:00", STRATEGY_LOTS, 20.0, 0.0),  # S4_10.01am
+    StrategyConfig("N_M_1116", "11:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("N_M_1146", "11:46:00", STRATEGY_LOTS, 20.0, 0.0),  # S11_11.46am
+    StrategyConfig("N_M_1216", "12:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S13_12.16pm
+    StrategyConfig("N_M_1301", "13:01:00", STRATEGY_LOTS, 20.0, 0.0),  # S16_1.01pm
+    StrategyConfig("N_M_1331", "13:31:00", STRATEGY_LOTS, 20.0, 0.0),   # S18_1.31pm
+    StrategyConfig("N_M_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
 ]
 
-# Monday SENSEX – 6 lots total (sorted by time)
+# Monday SENSEX (sorted by time)
 MONDAY_SENSEX_STRATEGIES = [
-    StrategyConfig("X_M_1001", "10:01:00", 3, 20.0, 0.0),
-    StrategyConfig("X_M_1016", "10:16:00", 1, 20.0, 0.0),
-    StrategyConfig("X_M_1146", "11:46:00", 1, 20.0, 0.0),
-    StrategyConfig("X_M_1446", "14:46:00", 1, 20.0, 0.0),
+    StrategyConfig("X_M_1001", "10:01:00", STRATEGY_LOTS, 20.0, 0.0),
+    StrategyConfig("X_M_1016", "10:16:00", STRATEGY_LOTS, 20.0, 0.0),
+    StrategyConfig("X_M_1146", "11:46:00", STRATEGY_LOTS, 20.0, 0.0),
+    StrategyConfig("X_M_1446", "14:46:00", STRATEGY_LOTS, 20.0, 0.0),
 ]
 
-# Tuesday NIFTY – 72 lots total (sorted by time)
+# Tuesday NIFTY (sorted by time)
 # S2_9.31am, S6_10.31am, S8_11.01am, S10_11.31am, S12_12.01pm, S14_12.31pm, S17_1.16pm, S21_2.16pm
 TUESDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_T_0931", "09:31:00", 6, 20.0, 0.0),   # S2_9.31am
-    StrategyConfig("N_T_1031", "10:31:00", 6, 20.0, 0.0),   # S6_10.31am
-    StrategyConfig("N_T_1101", "11:01:00", 6, 20.0, 0.0),   # S8_11.01am
-    StrategyConfig("N_T_1131", "11:31:00", 14, 20.0, 0.0),  # S10_11.31am
-    StrategyConfig("N_T_1201", "12:01:00", 6, 20.0, 0.0),   # S12_12.01pm
-    StrategyConfig("N_T_1231", "12:31:00", 15, 20.0, 0.0),  # S14_12.31pm
-    StrategyConfig("N_T_1316", "13:16:00", 13, 20.0, 0.0),  # S17_1.16pm
-    StrategyConfig("N_T_1416", "14:16:00", 6, 20.0, 0.0),   # S21_2.16pm
+    StrategyConfig("N_T_0931", "09:31:00", STRATEGY_LOTS, 20.0, 0.0),   # S2_9.31am
+    StrategyConfig("N_T_1031", "10:31:00", STRATEGY_LOTS, 20.0, 0.0),   # S6_10.31am
+    StrategyConfig("N_T_1101", "11:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S8_11.01am
+    StrategyConfig("N_T_1131", "11:31:00", STRATEGY_LOTS, 20.0, 0.0),  # S10_11.31am
+    StrategyConfig("N_T_1201", "12:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("N_T_1231", "12:31:00", STRATEGY_LOTS, 20.0, 0.0),  # S14_12.31pm
+    StrategyConfig("N_T_1316", "13:16:00", STRATEGY_LOTS, 20.0, 0.0),  # S17_1.16pm
+    StrategyConfig("N_T_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
 ]
 
-# Wednesday – same slots/lots for NIFTY and SENSEX; lots = floor(table_lots / 2).
+# Wednesday – same slots/times as xts-bot-lite; Kotak uses STRATEGY_LOTS for every slot.
 # Bot picks one index by nearest expiry (SENSEX wins ties), so both lists must exist or the portal shows no rows.
 # S1_9.21am, S3_9.46am, S7_10.46am, S9_11.16am, S12_12.01pm, S16_1.01pm, S19_1.46pm, S21_2.16pm
 WEDNESDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am
-    StrategyConfig("N_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am
-    StrategyConfig("N_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am
-    StrategyConfig("N_W_1116", "11:16:00", 3, 20.0, 0.0),   # S9_11.16am
-    StrategyConfig("N_W_1201", "12:01:00", 3, 20.0, 0.0),   # S12_12.01pm
-    StrategyConfig("N_W_1301", "13:01:00", 3, 20.0, 0.0),   # S16_1.01pm
-    StrategyConfig("N_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm
-    StrategyConfig("N_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm
+    StrategyConfig("N_W_0921", "09:21:00", STRATEGY_LOTS, 20.0, 0.0),   # S1_9.21am
+    StrategyConfig("N_W_0946", "09:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S3_9.46am
+    StrategyConfig("N_W_1046", "10:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S7_10.46am
+    StrategyConfig("N_W_1116", "11:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("N_W_1201", "12:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("N_W_1301", "13:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("N_W_1346", "13:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S19_1.46pm
+    StrategyConfig("N_W_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
 ]
 # WEDNESDAY_SENSEX_STRATEGIES = [
-#     StrategyConfig("X_W_0921", "09:21:00", 7, 20.0, 0.0),   # S1_9.21am
-#     StrategyConfig("X_W_0946", "09:46:00", 7, 20.0, 0.0),   # S3_9.46am
-#     StrategyConfig("X_W_1046", "10:46:00", 6, 20.0, 0.0),   # S7_10.46am
-#     StrategyConfig("X_W_1116", "11:16:00", 3, 20.0, 0.0),   # S9_11.16am
-#     StrategyConfig("X_W_1201", "12:01:00", 3, 20.0, 0.0),   # S12_12.01pm
-#     StrategyConfig("X_W_1301", "13:01:00", 3, 20.0, 0.0),   # S16_1.01pm
-#     StrategyConfig("X_W_1346", "13:46:00", 3, 20.0, 0.0),   # S19_1.46pm
-#     StrategyConfig("X_W_1416", "14:16:00", 3, 20.0, 0.0),   # S21_2.16pm
+#     StrategyConfig("X_W_0921", "09:21:00", STRATEGY_LOTS, 20.0, 0.0),   # S1_9.21am
+#     StrategyConfig("X_W_0946", "09:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S3_9.46am
+#     StrategyConfig("X_W_1046", "10:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S7_10.46am
+#     StrategyConfig("X_W_1116", "11:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S9_11.16am
+#     StrategyConfig("X_W_1201", "12:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S12_12.01pm
+#     StrategyConfig("X_W_1301", "13:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S16_1.01pm
+#     StrategyConfig("X_W_1346", "13:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S19_1.46pm
+#     StrategyConfig("X_W_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
 # ]
 WEDNESDAY_SENSEX_STRATEGIES = [
-    StrategyConfig("X_W_0921", "09:21:00", 1, 20.0, 0.0),   # S1_9.21am
-    StrategyConfig("X_W_0946", "09:46:00", 1, 20.0, 0.0),   # S3_9.46am
-    StrategyConfig("X_W_1046", "10:46:00", 1, 20.0, 0.0),   # S7_10.46am
-    StrategyConfig("X_W_1116", "11:16:00", 1, 20.0, 0.0),   # S9_11.16am
-    StrategyConfig("X_W_1201", "12:01:00", 1, 20.0, 0.0),   # S12_12.01pm
-    StrategyConfig("X_W_1301", "13:04:00", 1, 20.0, 0.0),   # S16_1.01pm
-    StrategyConfig("X_W_1346", "13:46:00", 1, 20.0, 0.0),   # S19_1.46pm
-    StrategyConfig("X_W_1416", "14:16:00", 1, 20.0, 0.0),   # S21_2.16pm
+    StrategyConfig("X_W_0921", "09:21:00", STRATEGY_LOTS, 20.0, 0.0),   # S1_9.21am
+    StrategyConfig("X_W_0946", "09:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S3_9.46am
+    StrategyConfig("X_W_1046", "10:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S7_10.46am
+    StrategyConfig("X_W_1116", "11:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("X_W_1201", "12:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("X_W_1301", "13:04:00", STRATEGY_LOTS, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("X_W_1346", "13:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S19_1.46pm
+    StrategyConfig("X_W_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
 ]
-# Thursday SENSEX – 72 lots total (sorted by time)
+# Thursday SENSEX (sorted by time)
 # Slot / score / note from expectancy backtest (see table in repo history).
 THURSDAY_SENSEX_STRATEGIES = [
-    StrategyConfig("X_H_0946", "09:46:00", 14, 20.0, 0.0),  # S3_9.46am  score 2.876  High expectancy, solid Return/MDD, stable streaks
-    StrategyConfig("X_H_1016", "10:16:00", 15, 20.0, 0.0),  # S5_10.16am score 2.436  High expectancy, solid Return/MDD, stable streaks
-    StrategyConfig("X_H_1101", "11:01:00", 6, 20.0, 0.0),   # S8_11.01am score -0.081 High expectancy, solid Return/MDD
-    StrategyConfig("X_H_1131", "11:31:00", 6, 20.0, 0.0),  # S10_11.31am score -3.693 Diversification / score
-    StrategyConfig("X_H_1231", "12:31:00", 6, 20.0, 0.0),  # S14_12.31pm score -1.267 Diversification / score
-    StrategyConfig("X_H_1301", "13:01:00", 6, 20.0, 0.0),  # S16_1.01pm  score 0.317  High expectancy, stable streaks
-    StrategyConfig("X_H_1331", "13:31:00", 6, 20.0, 0.0),  # S18_1.31pm  score -2.149 Diversification / score
-    StrategyConfig("X_H_1401", "14:01:00", 13, 20.0, 0.0),  # S20_2.01pm  score 1.560  solid Return/MDD, stable streaks
+    StrategyConfig("X_H_0946", "09:46:00", STRATEGY_LOTS, 20.0, 0.0),  # S3_9.46am  score 2.876  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("X_H_1016", "10:16:00", STRATEGY_LOTS, 20.0, 0.0),  # S5_10.16am score 2.436  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("X_H_1101", "11:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S8_11.01am score -0.081 High expectancy, solid Return/MDD
+    StrategyConfig("X_H_1131", "11:31:00", STRATEGY_LOTS, 20.0, 0.0),  # S10_11.31am score -3.693 Diversification / score
+    StrategyConfig("X_H_1231", "12:31:00", STRATEGY_LOTS, 20.0, 0.0),  # S14_12.31pm score -1.267 Diversification / score
+    StrategyConfig("X_H_1301", "13:01:00", STRATEGY_LOTS, 20.0, 0.0),  # S16_1.01pm  score 0.317  High expectancy, stable streaks
+    StrategyConfig("X_H_1331", "13:31:00", STRATEGY_LOTS, 20.0, 0.0),  # S18_1.31pm  score -2.149 Diversification / score
+    StrategyConfig("X_H_1401", "14:01:00", STRATEGY_LOTS, 20.0, 0.0),  # S20_2.01pm  score 1.560  solid Return/MDD, stable streaks
 ]
 
-# Friday NIFTY – 72 lots total (sorted by time)
+# Friday NIFTY (sorted by time)
 FRIDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_F_0931", "09:31:00", 14, 20.0, 0.0),  # S2_9.31am  score 2.912  High expectancy, solid Return/MDD, stable streaks
-    StrategyConfig("N_F_1031", "10:31:00", 13, 20.0, 0.0),  # S6_10.31am score 1.318  High expectancy, solid Return/MDD, stable streaks
-    StrategyConfig("N_F_1101", "11:01:00", 15, 20.0, 0.0),  # S8_11.01am score 1.710  High expectancy, solid Return/MDD, stable streaks
-    StrategyConfig("N_F_1131", "11:31:00", 6, 20.0, 0.0),   # S10_11.31am score -2.037 High expectancy
-    StrategyConfig("N_F_1231", "12:31:00", 6, 20.0, 0.0),   # S14_12.31pm score -0.951 solid Return/MDD, stable streaks
-    StrategyConfig("N_F_1301", "13:01:00", 6, 20.0, 0.0),   # S16_1.01pm  score -2.403 Diversification / score
-    StrategyConfig("N_F_1401", "14:01:00", 6, 20.0, 0.0),   # S20_2.01pm  score -0.548 stable streaks
-    StrategyConfig("N_F_1431", "14:31:00", 6, 20.0, 0.0),   # S22_2.31pm  score -0.000 stable streaks
+    StrategyConfig("N_F_0931", "09:31:00", STRATEGY_LOTS, 20.0, 0.0),  # S2_9.31am  score 2.912  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1031", "10:31:00", STRATEGY_LOTS, 20.0, 0.0),  # S6_10.31am score 1.318  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1101", "11:01:00", STRATEGY_LOTS, 20.0, 0.0),  # S8_11.01am score 1.710  High expectancy, solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1131", "11:31:00", STRATEGY_LOTS, 20.0, 0.0),   # S10_11.31am score -2.037 High expectancy
+    StrategyConfig("N_F_1231", "12:31:00", STRATEGY_LOTS, 20.0, 0.0),   # S14_12.31pm score -0.951 solid Return/MDD, stable streaks
+    StrategyConfig("N_F_1301", "13:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S16_1.01pm  score -2.403 Diversification / score
+    StrategyConfig("N_F_1401", "14:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S20_2.01pm  score -0.548 stable streaks
+    StrategyConfig("N_F_1431", "14:31:00", STRATEGY_LOTS, 20.0, 0.0),   # S22_2.31pm  score -0.000 stable streaks
 ]
 
 
