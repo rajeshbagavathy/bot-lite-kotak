@@ -46,8 +46,9 @@ class TestPickIndexAndExpiry(unittest.TestCase):
             order_exchange_segment="BSEFO",
         )
 
+    @patch("bot.get_today_strategies", return_value=[MagicMock()])
     @patch("bot.INDEX_CONFIGS", {"NIFTY": MagicMock(name="NIFTY"), "SENSEX": MagicMock(name="SENSEX")})
-    def test_no_expiries_found(self):
+    def test_no_expiries_found(self, _mock_today):
         """Test error when no expiries found for any index."""
         self.client.get_expiry_dates.return_value = []
         
@@ -56,8 +57,9 @@ class TestPickIndexAndExpiry(unittest.TestCase):
         
         self.assertIn("No expiries found", str(context.exception))
 
+    @patch("bot.get_today_strategies", return_value=[MagicMock()])
     @patch("bot.INDEX_CONFIGS")
-    def test_single_index_with_expiry(self, mock_configs):
+    def test_single_index_with_expiry(self, mock_configs, _mock_today):
         """Test with single index having expiry."""
         mock_configs.values.return_value = [self.nifty_config]
         mock_configs.__getitem__.return_value = self.nifty_config
@@ -72,8 +74,9 @@ class TestPickIndexAndExpiry(unittest.TestCase):
         self.assertEqual(expiry, "12FEB2026")
         self.client.format_expiry_for_options.assert_called_once_with(expiry_date)
 
+    @patch("bot.get_today_strategies", return_value=[MagicMock()])
     @patch("bot.INDEX_CONFIGS")
-    def test_sensex_preferred_on_tie(self, mock_configs):
+    def test_sensex_preferred_on_tie(self, mock_configs, _mock_today):
         """Test SENSEX is preferred when expiries are on same date."""
         mock_configs.values.return_value = [self.nifty_config, self.sensex_config]
         mock_configs.__getitem__.side_effect = lambda key: self.sensex_config if key == "SENSEX" else self.nifty_config
@@ -89,8 +92,9 @@ class TestPickIndexAndExpiry(unittest.TestCase):
         
         self.assertEqual(config.name, "SENSEX")
 
+    @patch("bot.get_today_strategies", return_value=[MagicMock()])
     @patch("bot.INDEX_CONFIGS")
-    def test_earliest_expiry_selected(self, mock_configs):
+    def test_earliest_expiry_selected(self, mock_configs, _mock_today):
         """Test earliest expiry is selected when dates differ."""
         mock_configs.values.return_value = [self.nifty_config, self.sensex_config]
         mock_configs.__getitem__.side_effect = lambda key: self.nifty_config if key == "NIFTY" else self.sensex_config
@@ -107,6 +111,31 @@ class TestPickIndexAndExpiry(unittest.TestCase):
         config, expiry = bot._pick_index_and_expiry(self.client)
         
         self.assertEqual(config.name, "NIFTY")
+
+    @patch("bot.INDEX_CONFIGS")
+    def test_thursday_picks_sensex_when_only_sensex_scheduled(self, mock_configs):
+        """Thursday: only SENSEX has slots — must not pick NIFTY just because expiry is earlier."""
+
+        def today_strategies(name: str):
+            return [MagicMock()] if name == "SENSEX" else []
+
+        mock_configs.values.return_value = [self.nifty_config, self.sensex_config]
+        mock_configs.__getitem__.side_effect = lambda key: self.sensex_config if key == "SENSEX" else self.nifty_config
+
+        earlier_date = datetime.datetime(2026, 2, 12)
+        later_date = datetime.datetime(2026, 2, 19)
+
+        with patch("bot.get_today_strategies", side_effect=today_strategies):
+            self.client.get_expiry_dates.side_effect = [
+                [earlier_date],
+                [later_date],
+            ]
+            self.client.format_expiry_for_options.return_value = "19FEB2026"
+
+            config, expiry = bot._pick_index_and_expiry(self.client)
+
+        self.assertEqual(config.name, "SENSEX")
+        self.client.get_expiry_dates.assert_called_once()
 
 
 class TestGetATMStrike(unittest.TestCase):

@@ -179,11 +179,12 @@ FRIDAY_NIFTY_STRATEGIES = [
 
 
 def get_today_strategies(index_name: str) -> list[StrategyConfig]:
-    """Return today's strategies for the given index (NIFTY/SENSEX)."""
+    """Return today's strategies for the given index (NIFTY/SENSEX). Uses IST weekday."""
     import datetime
 
-    today = datetime.datetime.now().date()
-    weekday = today.weekday()  # 0=Mon,1=Tue,...,6=Sun
+    import pytz
+
+    weekday = datetime.datetime.now(pytz.timezone("Asia/Kolkata")).weekday()  # 0=Mon … 6=Sun
 
     if weekday == 0:  # Monday
         if index_name.upper() == "NIFTY":

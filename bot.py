@@ -162,13 +162,20 @@ _LAST_MTM_LOG: Dict[str, float] = {}  # strategy_name -> last log timestamp (for
 def _pick_index_and_expiry(client: Any) -> Tuple[dict, str]:
     expiry_map = {}
     for config in INDEX_CONFIGS.values():
+        if not get_today_strategies(config.name):
+            logger.debug("  %s: no strategies scheduled today; skipping for index pick", config.name)
+            continue
         expiries = client.get_expiry_dates(config)
         if expiries:
             expiry_map[config.name] = expiries[0]
             logger.debug(f"  {config.name} expiry: {expiries[0]}")
 
     if not expiry_map:
-        logger.error("No expiries found for any index")
+        scheduled = [c.name for c in INDEX_CONFIGS.values() if get_today_strategies(c.name)]
+        if not scheduled:
+            logger.error("No strategies scheduled for today (weekday/index plan empty)")
+            raise RuntimeError("No strategies scheduled for today")
+        logger.error("No expiries found for indices scheduled today: %s", scheduled)
         raise RuntimeError("No expiries found for NIFTY or SENSEX")
 
     earliest = min(expiry_map.values())
