@@ -54,6 +54,12 @@ def init_state(strategies: Dict[str, dict]) -> None:
         STATE["bot"] = {"survivor_sl_to_cost_enabled": None}
 
 
+def replace_strategies(strategies: Dict[str, dict]) -> None:
+    """Replace live strategy map (e.g. after deferred Kotak TOTP bootstrap). Keeps portfolio/index."""
+    with STATE_LOCK:
+        STATE["strategies"] = strategies
+
+
 def set_bot_runtime_flags(**kwargs) -> None:
     """Runtime flags from bot (e.g. config mirrors for UI)."""
     with STATE_LOCK:

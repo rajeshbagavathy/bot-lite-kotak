@@ -149,6 +149,7 @@ from state import (
     update_portfolio,
     update_portfolio_margin,
     update_strategy,
+    replace_strategies,
 )
 from ui import create_app, ensure_http_access_not_logged
 from brokers.factory import create_trading_client
@@ -157,6 +158,95 @@ from xts_client import marketable_limit_price
 logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
 _LAST_MTM_LOG: Dict[str, float] = {}  # strategy_name -> last log timestamp (for throttling)
+
+
+def _strategy_state_entry(cfg) -> dict:
+    return {
+        "name": cfg.name,
+        "time": cfg.time,
+        "lots": cfg.lots,
+        "leg_sl_pct": cfg.leg_sl_pct,
+        "leg_target_pct": LEG_TARGET_PCT,
+        "strategy_sl": cfg.strategy_sl,
+        "status": "PENDING",
+        "mtm": 0.0,
+        "realized": 0.0,
+        "unrealized": 0.0,
+        "strike": None,
+        "instrument_ids": [],
+        "sl_orders": [],
+        "positions": [],
+        "order_tags": [],
+        "entry_time": None,
+        "message": None,
+        "last_update": None,
+        "sl_tag_map": {},
+        "db_id": None,
+        "survivor_sl_adjusted_to_cost": False,
+        "survivor_sl_to_cost_hint": None,
+        "scheduled_time": cfg.time,
+        "gatekeeper_started_at": None,
+        "next_gatekeeper_check_at": None,
+        "skip_reason": None,
+    }
+
+
+def _merge_restored_strategy(restored_strategy: dict) -> Dict[str, Any]:
+    st = restored_strategy.get("status", "OPEN")
+    merge_kw: Dict[str, Any] = {
+        "db_id": restored_strategy["db_id"],
+        "status": st,
+        "strike": restored_strategy["strike"],
+        "entry_time": restored_strategy["entry_time"],
+        "positions": restored_strategy["positions"],
+        "sl_orders": restored_strategy.get("sl_orders") or [],
+        "sl_tag_map": restored_strategy.get("sl_tag_map") or {},
+        "gatekeeper_started_at": restored_strategy.get("gatekeeper_started_at"),
+        "skip_reason": restored_strategy.get("skip_reason"),
+    }
+    if st == "WAITING_FOR_CALM":
+        merge_kw["next_gatekeeper_check_at"] = time.time() - 1.0
+    else:
+        merge_kw["next_gatekeeper_check_at"] = None
+    if st == "SKIPPED_VOLATILITY":
+        sr = restored_strategy.get("skip_reason") or ""
+        merge_kw["message"] = (
+            f"Skipped — calm zone timeout ({sr})" if sr else "Skipped — calm zone timeout"
+        )
+    return merge_kw
+
+
+def _load_strategy_state(client: Any, index_config) -> None:
+    """Build STRATEGY_STATE for today's index and push to UI snapshot."""
+    global STRATEGY_STATE
+    STRATEGY_STATE = {
+        cfg.name: _strategy_state_entry(cfg) for cfg in get_today_strategies(index_config.name)
+    }
+    restore_order_book: Optional[List[dict]] = None
+    if client is not None:
+        try:
+            restore_order_book = client.get_order_book()
+        except Exception as e:
+            logger.error("Failed to fetch order book for SL restore-link bootstrap: %s", e)
+    for restored_strategy in restore_todays_strategies():
+        strategy_name = restored_strategy["strategy_name"]
+        if strategy_name not in STRATEGY_STATE:
+            continue
+        logger.debug("Restoring %s from database...", strategy_name)
+        STRATEGY_STATE[strategy_name].update(_merge_restored_strategy(restored_strategy))
+        if (
+            STRATEGY_STATE[strategy_name].get("status") == "OPEN"
+            and not STRATEGY_STATE[strategy_name].get("sl_orders")
+        ):
+            _rebuild_sl_links_from_order_book_for_restored_strategy(
+                STRATEGY_STATE[strategy_name], restore_order_book
+            )
+    replace_strategies(STRATEGY_STATE)
+    logger.info(
+        "Strategy state loaded: %d slot(s) for %s",
+        len(STRATEGY_STATE),
+        index_config.name,
+    )
 
 
 def _pick_index_and_expiry(client: Any) -> Tuple[dict, str]:
@@ -2290,6 +2380,7 @@ def _complete_kotak_bootstrap() -> None:
     try:
         index_config, expiry = _pick_index_and_expiry(client)
         set_index(index_config.name, expiry)
+        _load_strategy_state(client, index_config)
         if not _JOBS_SCHEDULED_FLAG:
             _schedule_jobs(client, index_config, expiry)
             _catch_up_missed_scheduled_strategies(client, index_config, expiry)
@@ -2320,38 +2411,10 @@ def _retry_pick_expiry(client: Any, auth: dict) -> None:
             
             logger.debug(f"✓ Expiry found! Index: {index_config.name} | Expiry: {expiry}")
             set_index(index_config.name, expiry)
-            
+            _load_strategy_state(client, index_config)
+
             # Schedule jobs now that we have expiry
             _schedule_jobs(client, index_config, expiry)
-
-            # Restore today's strategies now that we have expiry
-            restored = restore_todays_strategies()
-            for restored_strategy in restored:
-                strategy_name = restored_strategy["strategy_name"]
-                if strategy_name in STRATEGY_STATE:
-                    logger.debug(f"Restoring {strategy_name} from database...")
-                    st = restored_strategy.get("status", "OPEN")
-                    merge_kw2: Dict[str, Any] = {
-                        "db_id": restored_strategy["db_id"],
-                        "status": st,
-                        "strike": restored_strategy["strike"],
-                        "entry_time": restored_strategy["entry_time"],
-                        "positions": restored_strategy["positions"],
-                        "sl_orders": restored_strategy.get("sl_orders") or [],
-                        "sl_tag_map": restored_strategy.get("sl_tag_map") or {},
-                        "gatekeeper_started_at": restored_strategy.get("gatekeeper_started_at"),
-                        "skip_reason": restored_strategy.get("skip_reason"),
-                    }
-                    if st == "WAITING_FOR_CALM":
-                        merge_kw2["next_gatekeeper_check_at"] = time.time() - 1.0
-                    else:
-                        merge_kw2["next_gatekeeper_check_at"] = None
-                    if st == "SKIPPED_VOLATILITY":
-                        sr = restored_strategy.get("skip_reason") or ""
-                        merge_kw2["message"] = (
-                            f"Skipped — calm zone timeout ({sr})" if sr else "Skipped — calm zone timeout"
-                        )
-                    STRATEGY_STATE[strategy_name].update(merge_kw2)
             
             _start_calm_zone_monitor_once(client)
             logger.debug("✓ Bot is now operational")
@@ -2419,79 +2482,7 @@ def main() -> None:
     global STRATEGY_STATE, _MAIN_LOOP_LAST_TICK
     STRATEGY_STATE = {}
     if index_config is not None:
-        todays_cfgs = get_today_strategies(index_config.name)
-        for cfg in todays_cfgs:
-            STRATEGY_STATE[cfg.name] = {
-                "name": cfg.name,
-                "time": cfg.time,
-                "lots": cfg.lots,
-                "leg_sl_pct": cfg.leg_sl_pct,
-                "leg_target_pct": LEG_TARGET_PCT,
-                "strategy_sl": cfg.strategy_sl,
-                "status": "PENDING",
-                "mtm": 0.0,
-                "realized": 0.0,
-                "unrealized": 0.0,
-                "strike": None,
-                "instrument_ids": [],
-                "sl_orders": [],
-                "positions": [],
-                "order_tags": [],
-                "entry_time": None,
-                "message": None,
-                "last_update": None,
-                "sl_tag_map": {},
-                "db_id": None,
-                "survivor_sl_adjusted_to_cost": False,
-                "survivor_sl_to_cost_hint": None,
-                "scheduled_time": cfg.time,
-                "gatekeeper_started_at": None,
-                "next_gatekeeper_check_at": None,
-                "skip_reason": None,
-            }
-
-    # Restore today's strategies from database (before init_state)
-    if not DEMO_MODE and index_config is not None:
-        restored = restore_todays_strategies()
-        restore_order_book: Optional[List[dict]] = None
-        if client is not None:
-            try:
-                restore_order_book = client.get_order_book()
-            except Exception as e:
-                logger.error("Failed to fetch order book for SL restore-link bootstrap: %s", e)
-        for restored_strategy in restored:
-            strategy_name = restored_strategy["strategy_name"]
-            if strategy_name in STRATEGY_STATE:
-                logger.debug(f"Restoring %s from database...", strategy_name)
-                st = restored_strategy.get("status", "OPEN")
-                merge_kw: Dict[str, Any] = {
-                    "db_id": restored_strategy["db_id"],
-                    "status": st,
-                    "strike": restored_strategy["strike"],
-                    "entry_time": restored_strategy["entry_time"],
-                    "positions": restored_strategy["positions"],
-                    "sl_orders": restored_strategy.get("sl_orders") or [],
-                    "sl_tag_map": restored_strategy.get("sl_tag_map") or {},
-                    "gatekeeper_started_at": restored_strategy.get("gatekeeper_started_at"),
-                    "skip_reason": restored_strategy.get("skip_reason"),
-                }
-                if st == "WAITING_FOR_CALM":
-                    merge_kw["next_gatekeeper_check_at"] = time.time() - 1.0
-                else:
-                    merge_kw["next_gatekeeper_check_at"] = None
-                if st == "SKIPPED_VOLATILITY":
-                    sr = restored_strategy.get("skip_reason") or ""
-                    merge_kw["message"] = (
-                        f"Skipped — calm zone timeout ({sr})" if sr else "Skipped — calm zone timeout"
-                    )
-                STRATEGY_STATE[strategy_name].update(merge_kw)
-                if (
-                    STRATEGY_STATE[strategy_name].get("status") == "OPEN"
-                    and not STRATEGY_STATE[strategy_name].get("sl_orders")
-                ):
-                    _rebuild_sl_links_from_order_book_for_restored_strategy(
-                        STRATEGY_STATE[strategy_name], restore_order_book
-                    )
+        _load_strategy_state(client, index_config)
 
     init_state(STRATEGY_STATE)
     init_trading_flags(USE_PREMIUM_BASED_STRIKE, STRATEGY_SL_ENABLED, TRADE_NON_EXPIRY_DAY)
