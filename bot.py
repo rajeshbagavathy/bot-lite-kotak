@@ -2076,12 +2076,18 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
 
 
 def _update_available_margin(client: Any) -> None:
+    if client is None:
+        return
     try:
         available_margin = client.get_available_margin()
-    except Exception:
+    except Exception as e:
+        if e.__class__.__name__ == "KotakSessionNotReady":
+            return
         logger.exception("Failed to fetch available margin")
         return
     update_portfolio_margin(available_margin)
+    if available_margin is not None:
+        logger.debug("Available margin updated: %s", available_margin)
 
 
 STRATEGY_STATE: Dict[str, dict] = {}
@@ -2200,6 +2206,7 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
         schedule.every().day.at("00:00").do(cleanup_old_data)
         _JOBS_SCHEDULED_FLAG = True
         register_scheduler_snapshot_with_state()
+        _update_available_margin(client)
         return
 
     _SCHEDULER_MINIMAL_MODE = False
@@ -2229,6 +2236,7 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
     schedule.every().day.at("00:00").do(cleanup_old_data)
     _JOBS_SCHEDULED_FLAG = True
     register_scheduler_snapshot_with_state()
+    _update_available_margin(client)
 
 
 def _kotak_session_ready(client: Any) -> bool:
@@ -2496,6 +2504,9 @@ def main() -> None:
         jobs_scheduled = True
     elif not DEMO_MODE:
         register_scheduler_snapshot_with_state()
+        if client is not None and _kotak_session_ready(client):
+            schedule.every(60).seconds.do(_update_available_margin, client=client)
+            _update_available_margin(client)
 
     from threading import Thread
 

@@ -354,19 +354,95 @@ class KotakNeoClient:
 
     @staticmethod
     def _limits_get_float(r: Dict[str, Any], *candidate_names: str) -> float:
+        v = KotakNeoClient._limits_get_optional_float(r, *candidate_names)
+        return 0.0 if v is None else v
+
+    @staticmethod
+    def _limits_get_optional_float(r: Dict[str, Any], *candidate_names: str) -> Optional[float]:
         lk = {str(k).lower(): k for k in r}
         for name in candidate_names:
             key = lk.get(name.lower())
             if key is None:
                 continue
-            v = r.get(key)
-            if v is None or v == "":
+            val = r.get(key)
+            if val is None or val == "":
                 continue
             try:
-                return float(v)
+                return float(val)
             except (TypeError, ValueError):
                 continue
-        return 0.0
+        return None
+
+    @classmethod
+    def _limits_blocks(cls, r: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Normalize limits() payloads: flat dict, ``data`` object, or ``data`` list of segments."""
+        blocks: List[Dict[str, Any]] = []
+        data = r.get("data")
+        if isinstance(data, list):
+            blocks.extend(row for row in data if isinstance(row, dict))
+        elif isinstance(data, dict):
+            blocks.append(data)
+        root = cls._unwrap_limits_root(r)
+        if isinstance(root, dict) and root and root not in blocks:
+            blocks.insert(0, root)
+        if not blocks and isinstance(r, dict):
+            blocks.append(r)
+        return blocks
+
+    @classmethod
+    def _parse_available_margin_from_limits(cls, r: Dict[str, Any]) -> Optional[float]:
+        if not isinstance(r, dict):
+            return None
+        if r.get("Error") or r.get("error") or r.get("Error Message"):
+            return None
+        stat = str(r.get("stat") or r.get("Stat") or "").strip().lower()
+        if stat and stat not in ("ok", "success"):
+            return None
+        st_code = r.get("stCode")
+        if st_code is not None:
+            try:
+                if int(st_code) != 200:
+                    return None
+            except (TypeError, ValueError):
+                pass
+
+        net_keys = (
+            "Net",
+            "net",
+            "netMarginAvailable",
+            "NetMarginAvailable",
+            "AvailableMargin",
+            "availableMargin",
+            "MarginAvailable",
+            "AvlMargin",
+        )
+        blocks = cls._limits_blocks(r)
+        preferred: List[Dict[str, Any]] = []
+        other: List[Dict[str, Any]] = []
+        for block in blocks:
+            seg = str(
+                block.get("seg")
+                or block.get("segment")
+                or block.get("Segment")
+                or block.get("exch")
+                or block.get("exchange")
+                or ""
+            ).upper()
+            if seg in ("ALL", ""):
+                preferred.append(block)
+            else:
+                other.append(block)
+        ordered = preferred + other if preferred else blocks
+        best: Optional[float] = None
+        for block in ordered:
+            net = cls._limits_get_optional_float(block, *net_keys)
+            if net is None:
+                continue
+            if preferred and block in preferred:
+                return round(net)
+            if best is None or net > best:
+                best = net
+        return round(best) if best is not None else None
 
     @classmethod
     def from_config(cls, cfg: Dict[str, Any]) -> "KotakNeoClient":
@@ -477,26 +553,27 @@ class KotakNeoClient:
         return [kotak_order_to_normalized(row) for row in data]
 
     def get_available_margin(self) -> Optional[float]:
-        self._ensure()
+        if not self.is_session_active():
+            return None
+        try:
+            self._ensure()
+        except Exception:
+            return None
         r = self._api.limits(segment="ALL", exchange="ALL", product="ALL")
         if not isinstance(r, dict):
             return None
-        if r.get("Error"):
-            logger.warning("Kotak limits error: %s", r.get("Error"))
+        if r.get("Error") or r.get("error"):
+            logger.warning("Kotak limits error: %s", r.get("Error") or r.get("error"))
             return None
-        r = self._unwrap_limits_root(r)
-        net = r.get("Net")
+        net = self._parse_available_margin_from_limits(r)
         if net is None:
-            lk = {str(k).lower(): k for k in r}
-            nk = lk.get("net")
-            if nk is not None:
-                net = r.get(nk)
-        if net is None:
-            return None
-        try:
-            return round(float(net))
-        except (TypeError, ValueError):
-            return None
+            sample = self._unwrap_limits_root(r)
+            keys = sorted(str(k) for k in sample.keys())[:25] if isinstance(sample, dict) else []
+            logger.warning(
+                "Kotak limits: could not read available margin (Net); payload keys sample: %s",
+                keys,
+            )
+        return net
 
     def get_portfolio_mtm_from_limits(self) -> Optional[Tuple[float, float, float]]:
         """
