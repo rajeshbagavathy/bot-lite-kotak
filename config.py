@@ -1,6 +1,14 @@
 from dataclasses import dataclass
 import os
+from pathlib import Path
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
 
 import boto3
 
@@ -311,4 +319,21 @@ def get_basic_auth_creds(creds: dict) -> dict:
     return {
         "username": os.getenv("BASIC_AUTH_USERNAME", creds.get("login_username")),
         "password": os.getenv("BASIC_AUTH_PASSWORD", creds.get("login_password")),
+    }
+
+
+# --- Kotak Neo (optional; used when BROKER_BACKEND=kotak) ---
+BROKER_BACKEND = os.getenv("BROKER_BACKEND", "xts").strip().lower()
+
+
+def load_kotak_credentials() -> dict:
+    """Credentials for Kotak Neo API (TOTP + MPIN flow)."""
+    return {
+        "consumer_key": _get_env_or_ssm("KOTAK_CONSUMER_KEY_S", "kotakconsumerkey"),
+        "mobile_number": _get_env_or_ssm("KOTAK_MOBILE_S", "kotakmobile"),
+        "ucc": _get_env_or_ssm("KOTAK_UCC_S", "kotakucc"),
+        "mpin": _get_env_or_ssm("KOTAK_MPIN_S", "kotakmpin"),
+        "totp_secret": os.getenv("KOTAK_TOTP_SECRET", "").strip() or None,
+        "environment": os.getenv("KOTAK_ENVIRONMENT", "prod").strip().lower(),
+        "neo_fin_key": os.getenv("KOTAK_NEO_FIN_KEY") or None,
     }

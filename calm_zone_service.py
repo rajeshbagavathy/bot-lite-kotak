@@ -5,6 +5,7 @@ Runs in a daemon thread; does not use the main ``schedule`` loop.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 import time
@@ -30,7 +31,6 @@ from db import (
     upsert_spot_bar,
     upsert_spot_ohlc_only,
 )
-from xts_client import XTSClient
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,8 @@ ROLLING_FALLBACK_MINUTES = 25
 RECOMPUTE_TAIL = 240
 STARTUP_BACKFILL_LIMIT = 5000
 MAX_RETRIES = 5
-BASE_SLEEP_SEC = 60
+# Faster polling allows intraminute OHLC aggregation from repeated quote snapshots.
+BASE_SLEEP_SEC = int(os.getenv("CALM_ZONE_POLL_SEC", "15") or "15")
 MARKET_OPEN_HHMM = (9, 15)
 MARKET_CLOSE_HHMM = (15, 30)
 
@@ -251,7 +252,7 @@ def _cash_session_start_ist(end_ist: datetime) -> datetime:
     return e.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
 
 
-def _fetch_ohlc_window(client: XTSClient, index_name: str) -> List[Dict[str, Any]]:
+def _fetch_ohlc_window(client: Any, index_name: str) -> List[Dict[str, Any]]:
     cfg = INDEX_CONFIGS[index_name]
     end = get_ist_now()
     kolkata = ZoneInfo("Asia/Kolkata")
@@ -388,7 +389,7 @@ def recompute_calm_metrics_for_index(index_name: str, limit: int = RECOMPUTE_TAI
         )
 
 
-def calm_zone_tick(client: XTSClient) -> None:
+def calm_zone_tick(client: Any) -> None:
     for index_name in ("NIFTY", "SENSEX"):
         bars = _fetch_ohlc_window(client, index_name)
         _health_set_index(index_name, fetch_count=len(bars))
@@ -411,7 +412,7 @@ def backfill_today_calm_once() -> None:
         recompute_calm_metrics_for_index(index_name, STARTUP_BACKFILL_LIMIT)
 
 
-def _run_loop(client: XTSClient, stop: threading.Event) -> None:
+def _run_loop(client: Any, stop: threading.Event) -> None:
     logger.info("Calm zone monitor thread started (DB=%s)", DB_PATH)
     _health_set(started_at=get_ist_now().strftime("%Y-%m-%d %H:%M:%S"), last_tick_status="starting")
     try:
@@ -438,7 +439,7 @@ def _run_loop(client: XTSClient, stop: threading.Event) -> None:
         stop.wait(BASE_SLEEP_SEC)
 
 
-def start_calm_zone_monitor_thread(client: XTSClient) -> threading.Event:
+def start_calm_zone_monitor_thread(client: Any) -> threading.Event:
     """
     Spawn daemon thread that runs ``calm_zone_tick`` every ~60s.
     Returns a threading.Event; set it to request shutdown (optional).

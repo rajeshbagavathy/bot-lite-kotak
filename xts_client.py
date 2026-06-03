@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import pytz
 
 from Connect import XTSConnect
+from brokers.constants import InteractiveConstants
 from config import IndexConfig, MARKETABLE_LIMIT_SLIPPAGE_PCT
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ def marketable_limit_price(
 ) -> float:
     """BUY: LTP * (1 + s); SELL: LTP * (1 - s). ``slippage_pct`` is fractional (0.01 = 1%)."""
     side = (order_side or "").strip().upper()
-    if side == XTSConnect.TRANSACTION_TYPE_BUY:
+    if side == InteractiveConstants.TRANSACTION_TYPE_BUY:
         raw = ltp * (1 + slippage_pct)
     else:
         raw = ltp * (1 - slippage_pct)

@@ -970,6 +970,11 @@ def upsert_spot_ohlc_only(
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        # Intraminute aggregation for the same bar_time:
+        # - keep first open
+        # - high=max(existing, new)
+        # - low=min(existing, new)
+        # - close=latest tick
         cursor.execute(
             """
             INSERT INTO spot_market_data (
@@ -977,11 +982,19 @@ def upsert_spot_ohlc_only(
                 range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix, calm_locked
             ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, 0)
             ON CONFLICT(index_name, bar_time) DO UPDATE SET
-                open = excluded.open,
-                high = excluded.high,
-                low = excluded.low,
+                open = COALESCE(spot_market_data.open, excluded.open),
+                high = CASE
+                    WHEN spot_market_data.high IS NULL THEN excluded.high
+                    WHEN excluded.high > spot_market_data.high THEN excluded.high
+                    ELSE spot_market_data.high
+                END,
+                low = CASE
+                    WHEN spot_market_data.low IS NULL THEN excluded.low
+                    WHEN excluded.low < spot_market_data.low THEN excluded.low
+                    ELSE spot_market_data.low
+                END,
                 close = excluded.close,
-                volume = excluded.volume,
+                volume = COALESCE(excluded.volume, spot_market_data.volume),
                 updated_at = excluded.updated_at,
                 bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix)
             """,

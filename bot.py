@@ -152,14 +152,15 @@ from state import (
     update_strategy,
 )
 from ui import create_app, ensure_http_access_not_logged
-from xts_client import XTSClient, marketable_limit_price
+from brokers.factory import create_trading_client
+from xts_client import marketable_limit_price
 
 logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
 _LAST_MTM_LOG: Dict[str, float] = {}  # strategy_name -> last log timestamp (for throttling)
 
 
-def _pick_index_and_expiry(client: XTSClient) -> Tuple[dict, str]:
+def _pick_index_and_expiry(client: Any) -> Tuple[dict, str]:
     expiry_map = {}
     for config in INDEX_CONFIGS.values():
         expiries = client.get_expiry_dates(config)
@@ -179,7 +180,7 @@ def _pick_index_and_expiry(client: XTSClient) -> Tuple[dict, str]:
     return INDEX_CONFIGS[chosen_name], expiry
 
 
-def _get_atm_strike(client: XTSClient, index_config) -> Optional[int]:
+def _get_atm_strike(client: Any, index_config) -> Optional[int]:
     spot = client.get_spot_ltp(index_config)
     if spot is None:
         return None
@@ -198,7 +199,7 @@ def _is_expiry_day(expiry: str) -> bool:
 
 
 def _find_hedge_by_target_premium(
-    client: XTSClient,
+    client: Any,
     index_config,
     expiry: str,
     option_type: str,
@@ -261,7 +262,7 @@ def _find_hedge_by_target_premium(
 
 
 def _find_strike_by_premium(
-    client: XTSClient,
+    client: Any,
     index_config,
     expiry: str,
     option_type: str,
@@ -321,7 +322,7 @@ def _find_strike_by_premium(
 
 
 def _ensure_margin_or_skip_strategy(
-    client: XTSClient,
+    client: Any,
     index_config,
     expiry: str,
     strategy: dict,
@@ -496,7 +497,7 @@ _SURVIVOR_PEER_CLOSED_VIA_OK = frozenset({"SL_FILLED", "BROKER_SYNC", "RESTORED"
 
 
 def _place_leg_sl_orders(
-    client: XTSClient,
+    client: Any,
     index_config,
     filled_orders: List[dict],
     leg_sl_pct: float,
@@ -604,7 +605,7 @@ def _gatekeeper_window_start_iso(strategy: dict) -> str:
     return _strategy_slot_ist_datetime(strategy).isoformat(timespec="seconds")
 
 
-def _catch_up_missed_scheduled_strategies(client: XTSClient, index_config, expiry: str) -> None:
+def _catch_up_missed_scheduled_strategies(client: Any, index_config, expiry: str) -> None:
     """
     ``schedule.every().day.at(slot)`` does not run a job if the process starts after that
     time today. Run eligible PENDING strategies once when the process starts inside
@@ -675,7 +676,7 @@ def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Op
     return False, "volatile", latest
 
 
-def _process_waiting_for_calm(client: XTSClient, index_config, expiry: str) -> None:
+def _process_waiting_for_calm(client: Any, index_config, expiry: str) -> None:
     """Non-blocking retry path for strategies waiting on calm zone."""
     now = get_ist_now()
     now_ts = now.timestamp()
@@ -737,7 +738,7 @@ def _process_waiting_for_calm(client: XTSClient, index_config, expiry: str) -> N
             )
 
 
-def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, force: bool = False) -> None:
+def _execute_strategy(client: Any, index_config, expiry: str, strategy, force: bool = False) -> None:
     if strategy["status"] not in ("PENDING", "ERROR", "WAITING_FOR_CALM"):
         return
     if not force and get_ist_now().strftime("%H:%M:%S") < strategy["time"]:
@@ -989,7 +990,7 @@ def _execute_strategy(client: XTSClient, index_config, expiry: str, strategy, fo
     update_strategy(name, sl_orders=sl_orders, positions=positions, sl_tag_map=tag_to_instrument)
 
 
-def _place_close_order(client: XTSClient, index_config, pos: dict, tag_prefix: str) -> None:
+def _place_close_order(client: Any, index_config, pos: dict, tag_prefix: str) -> None:
     """Helper to place close/square-off order."""
     quantity = int(pos["Quantity"])
     if quantity == 0:
@@ -1006,14 +1007,14 @@ def _place_close_order(client: XTSClient, index_config, pos: dict, tag_prefix: s
 
 
 def _close_positions_for_instruments(
-    client: XTSClient, index_config, positions: List[dict], instrument_ids: List[int]
+    client: Any, index_config, positions: List[dict], instrument_ids: List[int]
 ) -> None:
     for pos in positions:
         if int(pos["ExchangeInstrumentId"]) in instrument_ids:
             _place_close_order(client, index_config, pos, "CLOSE")
 
 
-def _cancel_strategy_sl_orders(client: XTSClient, strategy: dict) -> None:
+def _cancel_strategy_sl_orders(client: Any, strategy: dict) -> None:
     for sl_order in strategy.get("sl_orders", []) or []:
         try:
             client.cancel_order(sl_order["app_order_id"], sl_order["tag"])
@@ -1021,7 +1022,7 @@ def _cancel_strategy_sl_orders(client: XTSClient, strategy: dict) -> None:
             logger.exception("Failed to cancel SL order %s", sl_order)
 
 
-def _close_strategy_via_open_sl_orders(client: XTSClient, index_config, strategy: dict) -> None:
+def _close_strategy_via_open_sl_orders(client: Any, index_config, strategy: dict) -> None:
     """
     Close strategy by converting open SL orders to marketable LIMIT execution.
 
@@ -1148,7 +1149,7 @@ def _close_strategy_via_open_sl_orders(client: XTSClient, index_config, strategy
             )
 
 
-def _close_strategy(client: XTSClient, index_config, strategy: dict, positions: List[dict], reason: str) -> None:
+def _close_strategy(client: Any, index_config, strategy: dict, positions: List[dict], reason: str) -> None:
     if strategy["status"] in ("CLOSED", "CLOSING"):
         return
     update_strategy(strategy["name"], status="CLOSING", message=reason)
@@ -1173,14 +1174,14 @@ def _close_strategy(client: XTSClient, index_config, strategy: dict, positions: 
     update_strategy(strategy["name"], status="CLOSED", sl_orders=[], sl_tag_map={})
 
 
-def _square_off_all(client: XTSClient, index_config, positions: List[dict], reason: str) -> None:
+def _square_off_all(client: Any, index_config, positions: List[dict], reason: str) -> None:
     logger.warning("Square-off all positions: %s", reason)
     for pos in positions:
         _place_close_order(client, index_config, pos, "SQUAREOFF")
 
 
 def _sync_sl_order_status_and_capture_exits(
-    client: XTSClient,
+    client: Any,
     strategy: dict,
     order_book: Optional[List[dict]] = None,
 ) -> None:
@@ -1359,9 +1360,9 @@ def _survivor_sl_to_cost_warn_throttled(
     logger.warning("[%s] Survivor SL-to-cost: %s", strategy_name, msg)
 
 
-def _xts_modify_order_ok(resp: Any) -> bool:
+def _broker_modify_order_ok(resp: Any) -> bool:
     """
-    True if modify_order returned a successful XTS payload.
+    True if modify_order returned a successful broker payload (XTS or Kotak).
     None/unknown is treated as OK for backward compatibility (e.g. mocks).
     """
     if resp is None:
@@ -1369,7 +1370,15 @@ def _xts_modify_order_ok(resp: Any) -> bool:
     if isinstance(resp, str):
         return False
     if isinstance(resp, dict):
-        return resp.get("result") is not None
+        if resp.get("result") is not None:
+            return True
+        if str(resp.get("stat", "")).strip().lower() == "ok":
+            return True
+        if resp.get("stCode") == 200:
+            return True
+        if resp.get("Error") or resp.get("Message"):
+            return False
+        return False
     return True
 
 
@@ -1387,7 +1396,7 @@ def _extract_first_float(order: dict, *keys: str) -> Optional[float]:
 
 
 def _adjust_survivor_sl_to_cost_after_peer_sl(
-    client: XTSClient,
+    client: Any,
     index_config,
     strategy: dict,
     order_book: Optional[List[dict]] = None,
@@ -1566,7 +1575,7 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             strategy["name"],
             resp_str,
         )
-        if not _xts_modify_order_ok(resp):
+        if not _broker_modify_order_ok(resp):
             logger.error(
                 "[%s] Survivor SL-to-cost: broker rejected modify (empty/missing result). "
                 "SL not marked tightened; will retry on next MTM.",
@@ -1722,7 +1731,7 @@ def _rebuild_sl_links_from_order_book_for_restored_strategy(
 
 
 def _check_leg_target_and_close(
-    client: XTSClient, index_config, strategy: dict, ltp_map: Dict[int, float]
+    client: Any, index_config, strategy: dict, ltp_map: Dict[int, float]
 ) -> None:
     """
     If any leg's profit from collected premium reaches LEG_TARGET_PCT (e.g. 65%),
@@ -1847,7 +1856,7 @@ def _check_all_positions_closed(strategy: dict) -> bool:
 
 
 def _sync_strategy_positions_from_broker(
-    client: XTSClient,
+    client: Any,
     strategy: dict,
     broker_positions: List[dict],
     ltp_map: dict,
@@ -1970,7 +1979,7 @@ def _sync_strategy_positions_from_broker(
         )
 
 
-def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
+def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
     positions = client.get_positions()
     try:
         order_book = client.get_order_book()
@@ -1982,7 +1991,16 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
         if int(pos["ExchangeInstrumentId"]) != 0
     ]
     ltp_map = client.get_ltp_map(instruments)
-    realized, unrealized, overall = calculate_mtm(positions, ltp_map)
+    limits_mtm = None
+    if hasattr(client, "get_portfolio_mtm_from_limits"):
+        try:
+            limits_mtm = client.get_portfolio_mtm_from_limits()
+        except Exception:
+            logger.debug("Broker limits MTM unavailable", exc_info=True)
+    if limits_mtm is not None:
+        realized, unrealized, overall = limits_mtm
+    else:
+        realized, unrealized, overall = calculate_mtm(positions, ltp_map)
     update_portfolio(overall, realized, unrealized, portfolio_sl)
 
     for strategy in STRATEGY_STATE.values():
@@ -2058,7 +2076,7 @@ def _monitor_mtm(client: XTSClient, index_config, portfolio_sl: float) -> None:
             )
 
 
-def _update_available_margin(client: XTSClient) -> None:
+def _update_available_margin(client: Any) -> None:
     try:
         available_margin = client.get_available_margin()
     except Exception:
@@ -2170,7 +2188,7 @@ def register_scheduler_snapshot_with_state() -> None:
     set_scheduler_snapshot_fn(get_scheduler_diagnostics)
 
 
-def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
+def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
     global _SCHEDULER_MINIMAL_MODE, _JOBS_SCHEDULED_FLAG
 
     if not _is_expiry_day(expiry) and not get_trading_flag_or("trade_non_expiry_day", TRADE_NON_EXPIRY_DAY):
@@ -2213,7 +2231,7 @@ def _schedule_jobs(client: XTSClient, index_config, expiry: str) -> None:
     register_scheduler_snapshot_with_state()
 
 
-def _retry_pick_expiry(client: XTSClient, auth: dict) -> None:
+def _retry_pick_expiry(client: Any, auth: dict) -> None:
     """Periodically retry picking expiry if initial attempt failed."""
     global STRATEGY_STATE
     retry_interval = 10  # Start with 10 seconds
@@ -2286,32 +2304,43 @@ def main() -> None:
         expiry = "08FEB2026"
         auth = {"username": "admin", "password": "admin123"}
     else:
+        from config import BROKER_BACKEND
+
         if not ACC_NAME:
-            required_env = (
-                "XTS_API_KEY_5P",
-                "XTS_API_SECRET_5P",
-                "XTS_5P_CLIENTID_5P",
-                "XTS_MARKET_API_KEY_5P",
-                "XTS_MARKET_API_SECRET_5P",
-                "LOGIN_USERNAME_5P",
-                "LOGIN_PASSWORD_5P",
-            )
+            if BROKER_BACKEND == "kotak":
+                required_env = (
+                    "KOTAK_CONSUMER_KEY_S",
+                    "KOTAK_MOBILE_S",
+                    "KOTAK_UCC_S",
+                    "KOTAK_MPIN_S",
+                    "LOGIN_USERNAME_5P",
+                    "LOGIN_PASSWORD_5P",
+                )
+            else:
+                required_env = (
+                    "XTS_API_KEY_5P",
+                    "XTS_API_SECRET_5P",
+                    "XTS_5P_CLIENTID_5P",
+                    "XTS_MARKET_API_KEY_5P",
+                    "XTS_MARKET_API_SECRET_5P",
+                    "LOGIN_USERNAME_5P",
+                    "LOGIN_PASSWORD_5P",
+                )
             missing = [key for key in required_env if not os.getenv(key)]
             if missing:
                 raise RuntimeError(
                     "ACC_NAME is required for SSM lookups; set ACC_NAME or provide all credential env vars. "
                     f"Missing: {', '.join(missing)}"
                 )
-        creds = load_credentials()
+        if BROKER_BACKEND == "kotak":
+            creds = {
+                "login_username": os.getenv("LOGIN_USERNAME_5P"),
+                "login_password": os.getenv("LOGIN_PASSWORD_5P"),
+            }
+        else:
+            creds = load_credentials()
         auth = get_basic_auth_creds(creds)
-        client = XTSClient(
-            api_key=creds["api_key"],
-            api_secret=creds["api_secret"],
-            market_api_key=creds["market_api_key"],
-            market_api_secret=creds["market_api_secret"],
-            source=SOURCE,
-            client_id=creds["client_id"],
-        )
+        client = create_trading_client()
         client.login()
         try:
             index_config, expiry = _pick_index_and_expiry(client)

@@ -952,7 +952,7 @@ class TestMain(unittest.TestCase):
     @patch("bot._schedule_jobs")
     @patch("bot.create_app")
     @patch("bot._pick_index_and_expiry")
-    @patch("bot.XTSClient")
+    @patch("bot.create_trading_client")
     @patch("bot.load_credentials")
     @patch("bot.get_basic_auth_creds")
     @patch("bot.init_state")
@@ -968,7 +968,7 @@ class TestMain(unittest.TestCase):
         mock_init_state,
         mock_get_auth,
         mock_load_creds,
-        mock_xts_client,
+        mock_create_client,
         mock_pick_index,
         mock_create_app,
         mock_schedule_jobs,
@@ -987,9 +987,9 @@ class TestMain(unittest.TestCase):
         mock_load_creds.return_value = mock_creds
         mock_get_auth.return_value = {"username": "user", "password": "pass"}
         
-        # Mock XTS client
+        # Mock trading client (XTS or Kotak)
         mock_client = MagicMock()
-        mock_xts_client.return_value = mock_client
+        mock_create_client.return_value = mock_client
         
         # Mock index selection
         mock_index_config = MagicMock()
