@@ -30,6 +30,8 @@ from brokers.session import KotakSessionManager
 
 logger = logging.getLogger("xts-bot-lite")
 
+_IST = pytz.timezone("Asia/Kolkata")
+
 _KOTAK_ROOT = Path(__file__).resolve().parent.parent / "Kotak-neo-api-v2"
 if _KOTAK_ROOT.is_dir() and str(_KOTAK_ROOT) not in sys.path:
     sys.path.insert(0, str(_KOTAK_ROOT))
@@ -502,7 +504,9 @@ class KotakNeoClient:
             except ValueError:
                 continue
         out.sort()
-        return out
+        today = datetime.datetime.now(_IST).date()
+        # Scrip master still lists expired series; keep only today/future for index pick + trading.
+        return [e for e in out if e.date() >= today]
 
     def get_option_instrument_id(
         self, index_config: IndexConfig, expiry: str, option_type: str, strike: int

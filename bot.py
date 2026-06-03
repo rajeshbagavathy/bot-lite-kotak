@@ -167,8 +167,9 @@ def _pick_index_and_expiry(client: Any) -> Tuple[dict, str]:
             continue
         expiries = client.get_expiry_dates(config)
         if expiries:
-            expiry_map[config.name] = expiries[0]
-            logger.debug(f"  {config.name} expiry: {expiries[0]}")
+            nearest = min(expiries)
+            expiry_map[config.name] = nearest
+            logger.debug("  %s nearest active expiry: %s", config.name, nearest)
 
     if not expiry_map:
         scheduled = [c.name for c in INDEX_CONFIGS.values() if get_today_strategies(c.name)]
