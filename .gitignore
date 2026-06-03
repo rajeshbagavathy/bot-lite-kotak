@@ -40,9 +40,6 @@ bot.log
 bot_test.log
 nohup.out
 
-# Vendored Kotak SDK (clone separately; see README)
-Kotak-neo-api-v2/
-
 # Local broker / deploy overrides (committed template: config.ini)
 config.local.ini
 config.ini.local
