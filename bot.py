@@ -556,14 +556,12 @@ def _ensure_margin_or_skip_strategy(
             return True
 
     # Still insufficient after both rounds: keep hedges open and skip strategy.
-    update_strategy(
-        name,
-        status="ERROR",
-        message=(
-            "MARGIN_NOT_AVAILABLE: margin not available even after two hedge rounds "
-            f"(required {required_margin:.0f}, available {last_available})"
-        ),
+    msg = (
+        "MARGIN_NOT_AVAILABLE: margin not available even after two hedge rounds "
+        f"(required {required_margin:.0f}, available {last_available})"
     )
+    logger.warning("Strategy %s: %s", name, msg)
+    update_strategy(name, status="ERROR", message=msg)
     return False
 
 
@@ -958,11 +956,33 @@ def _execute_strategy(client: Any, index_config, expiry: str, strategy, force: b
         ce_id = client.get_option_instrument_id(index_config, expiry, "CE", ce_strike)
         pe_id = client.get_option_instrument_id(index_config, expiry, "PE", pe_strike)
         if not ce_id or not pe_id:
+            logger.warning(
+                "Strategy %s: option instruments not found (CE %s / PE %s, expiry %s)",
+                name,
+                ce_strike,
+                pe_strike,
+                expiry,
+            )
             update_strategy(name, status="ERROR", message="Option instruments not found")
             return
+        logger.info(
+            "Strategy %s: expiry ITM strikes CE=%s (id %s) PE=%s (id %s) ATM=%s",
+            name,
+            ce_strike,
+            ce_id,
+            pe_strike,
+            pe_id,
+            atm_strike,
+        )
 
     # Pre-check margin; if low, buy far-OTM hedges first and refresh.
     if not _ensure_margin_or_skip_strategy(client, index_config, expiry, strategy, atm_strike):
+        st = STRATEGY_STATE.get(name, {})
+        logger.warning(
+            "Strategy %s: margin gate blocked entry — %s",
+            name,
+            st.get("message") or "margin check failed",
+        )
         return
 
     effective_lots = int(strategy["lots"])
@@ -1010,6 +1030,12 @@ def _execute_strategy(client: Any, index_config, expiry: str, strategy, force: b
             except Exception:
                 logger.exception("Failed to rollback partial straddle for %s", name)
 
+            logger.warning(
+                "Strategy %s: entry order placement failed (CE id %s / PE id %s); check Kotak place_order logs",
+                name,
+                ce_id,
+                pe_id,
+            )
             update_strategy(name, status="ERROR", message="Entry order placement failed (margin/blocked)")
             return
 

@@ -645,7 +645,7 @@ class KotakNeoClient:
         self._ensure()
         if not instruments:
             return {}
-        batch: List[dict] = []
+        specs: List[Tuple[int, str, str]] = []
         for ins in instruments:
             xs = ins.get("exchangeSegment")
             iid = ins.get("exchangeInstrumentID")
@@ -654,13 +654,42 @@ class KotakNeoClient:
             seg = self._kotak_segment_from_xts(int(xs))
             if not seg:
                 continue
-            batch.append({"instrument_token": str(int(iid)), "exchange_segment": seg})
-        if not batch:
+            specs.append((int(iid), str(int(iid)), seg))
+        if not specs:
             return {}
+        batch = [{"instrument_token": tok, "exchange_segment": seg} for _, tok, seg in specs]
         r = self._quotes_get(batch, "ltp")
-        return self._parse_ltp_response(r, [int(b["instrument_token"]) for b in batch])
+        out = self._parse_ltp_response(r, [iid for iid, _, _ in specs])
+        missing = [s for s in specs if s[0] not in out]
+        if missing:
+            sym_batch: List[dict] = []
+            sym_map: Dict[str, int] = {}
+            for iid, _, seg in missing:
+                tm = self._token_meta.get(iid)
+                if not tm or not tm.get("trdSym"):
+                    continue
+                sym = str(tm["trdSym"]).strip()
+                fo_seg = str(tm.get("segment") or seg).strip()
+                sym_batch.append({"instrument_token": sym, "exchange_segment": fo_seg})
+                sym_map[sym] = iid
+                sym_map[sym.upper()] = iid
+            if sym_batch:
+                r2 = self._quotes_get(sym_batch, "ltp")
+                out.update(self._parse_ltp_response(r2, list(sym_map.values()), symbol_to_id=sym_map))
+                still = [iid for iid, _, _ in missing if iid not in out]
+                if still:
+                    logger.warning(
+                        "Kotak: option LTP missing for token(s) %s (tried pSymbol + trdSym)",
+                        still,
+                    )
+        return out
 
-    def _parse_ltp_response(self, r: Any, tokens: List[int]) -> Dict[int, float]:
+    def _parse_ltp_response(
+        self,
+        r: Any,
+        tokens: List[int],
+        symbol_to_id: Optional[Dict[str, int]] = None,
+    ) -> Dict[int, float]:
         out: Dict[int, float] = {}
         if r is None:
             return out
@@ -670,6 +699,17 @@ class KotakNeoClient:
                 return out
             if r.get("fault"):
                 return out
+
+        def resolve_tid(tk: Any) -> Optional[int]:
+            if tk is None:
+                return tokens[0] if len(tokens) == 1 else None
+            try:
+                return int(tk)
+            except (TypeError, ValueError):
+                if not symbol_to_id:
+                    return None
+                s = str(tk).strip()
+                return symbol_to_id.get(s) or symbol_to_id.get(s.upper())
 
         def try_row(row: dict) -> None:
             tk = row.get("tk") or row.get("instrument_token") or row.get("instrumentToken")
@@ -681,14 +721,7 @@ class KotakNeoClient:
             )
             if ltp is None:
                 return
-            tid = None
-            if tk is not None:
-                try:
-                    tid = int(tk)
-                except (TypeError, ValueError):
-                    return
-            elif len(tokens) == 1:
-                tid = tokens[0]
+            tid = resolve_tid(tk)
             if tid is None:
                 return
             try:
@@ -703,10 +736,12 @@ class KotakNeoClient:
         if not out:
             self._walk_json_for_ltp(r, out)
 
-        # Ensure requested tokens present
-        for t in tokens:
-            if t not in out and str(t) not in str(r):
-                continue
+        # Single-row quote with no tk: assign to the sole requested id
+        if not out and len(tokens) == 1:
+            prices: List[float] = []
+            self._collect_first_quote_price(r, prices, ("ltp", "last_traded_price", "iv", "Ltp"))
+            if prices:
+                out[tokens[0]] = prices[0]
         return out
 
     def _walk_json_for_ltp(self, obj: Any, acc: Dict[int, float]) -> None:
@@ -1190,6 +1225,15 @@ class KotakNeoClient:
             scrip_token=str(int(instrument_id)),
         )
         oid = parse_kotak_place_order_n_ord_no(r)
+        if oid is None:
+            logger.warning(
+                "Kotak place_order failed tag=%s %s %s qty=%s: %s",
+                tag,
+                tm.get("trdSym"),
+                tt,
+                quantity,
+                r,
+            )
         return oid
 
     def place_sl_order(
