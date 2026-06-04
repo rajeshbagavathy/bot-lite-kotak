@@ -884,7 +884,10 @@ def _execute_strategy(client: Any, index_config, expiry: str, strategy, force: b
         return
 
     strike_diff = int(index_config.strike_diff)
-    if get_trading_flag_or("use_premium_based_strike", USE_PREMIUM_BASED_STRIKE):
+    use_premium_strike = get_trading_flag_or(
+        "use_premium_based_strike", USE_PREMIUM_BASED_STRIKE
+    ) and not is_expiry
+    if use_premium_strike:
         # Premium-based: find CE and PE strikes whose LTP is in target±buffer, closest to target.
         if index_config.name == "NIFTY":
             target, buffer = STRIKE_PREMIUM_TARGET_NIFTY, STRIKE_PREMIUM_BUFFER_NIFTY
@@ -900,15 +903,51 @@ def _execute_strategy(client: Any, index_config, expiry: str, strategy, force: b
             client, index_config, expiry, "PE", atm_strike, target, min_p, max_p
         )
         if ce_result is None or pe_result is None:
+            now_dt = get_ist_now()
+            now_ts = now_dt.timestamp()
+            gk_started = strategy.get("gatekeeper_started_at") or _gatekeeper_window_start_iso(
+                strategy
+            )
+            logger.warning(
+                "Strategy %s: no CE/PE in premium band ₹%.0f–₹%.0f (target ₹%.0f, ATM %s); "
+                "retrying within calm-zone window",
+                name,
+                min_p,
+                max_p,
+                target,
+                atm_strike,
+            )
             update_strategy(
                 name,
-                status="ERROR",
-                message=f"Strike not in premium range (CE in range: {ce_result is not None}, PE in range: {pe_result is not None})",
+                status="WAITING_FOR_CALM",
+                gatekeeper_started_at=gk_started,
+                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
+                message=(
+                    "Strike not in premium range at "
+                    + now_dt.strftime("%Y-%m-%d %H:%M:%S IST")
+                    + f" (CE in range: {ce_result is not None}, PE in range: {pe_result is not None}); "
+                    + f"retrying within {CALM_ZONE_WAIT_TIMEOUT_MINUTES}-minute Calm Zone window."
+                ),
             )
+            sid = upsert_strategy_waiting_for_calm(
+                name,
+                int(strategy.get("lots") or 0),
+                float(strategy.get("leg_sl_pct") or 0.0),
+                float(strategy.get("strategy_sl") or 0.0),
+                gk_started,
+                int(strategy["db_id"]) if strategy.get("db_id") else None,
+            )
+            if sid > 0:
+                update_strategy(name, db_id=sid)
             return
         ce_strike, ce_id = ce_result
         pe_strike, pe_id = pe_result
     else:
+        if is_expiry and get_trading_flag_or("use_premium_based_strike", USE_PREMIUM_BASED_STRIKE):
+            logger.info(
+                "Strategy %s: expiry day — using ITM/ATM strikes (premium band skipped on expiry)",
+                name,
+            )
         # ATM/ITM-based (legacy).
         if is_expiry:
             n = int(ITM_STRIKES_SENSEX) if index_config.name == "SENSEX" else int(ITM_STRIKES_NIFTY)

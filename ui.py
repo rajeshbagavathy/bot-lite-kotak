@@ -1067,9 +1067,18 @@ DASHBOARD_TEMPLATE = """
         } else {
           dashBanner.innerHTML = '';
         }
-        const marginWarning = stratVals.find(s => String(s.message || '').includes('MARGIN_NOT_AVAILABLE') || String(s.status || '') === 'ERROR');
-        if (marginWarning && dashBanner && !portfolioSlHalt) {
-          dashBanner.innerHTML = '<div class="warn-box">Margin gate warning: ' + (marginWarning.message || marginWarning.status || 'Check strategy status') + '</div>';
+        const stratWarning = stratVals.find(s =>
+          String(s.message || '').includes('MARGIN_NOT_AVAILABLE')
+          || s.status === 'ERROR'
+          || s.status === 'WAITING_FOR_CALM'
+          || s.status === 'SKIPPED_VOLATILITY'
+        );
+        if (stratWarning && dashBanner && !portfolioSlHalt) {
+          const msg = stratWarning.message || stratWarning.status || 'Check strategy status';
+          const label = String(msg).includes('MARGIN_NOT_AVAILABLE')
+            ? 'Margin gate warning'
+            : (stratWarning.status === 'WAITING_FOR_CALM' ? 'Calm zone / strike selection' : 'Strategy warning');
+          dashBanner.innerHTML = '<div class="warn-box">' + label + ': ' + msg + '</div>';
         }
         
         // Show error if expiry not available
@@ -1570,9 +1579,18 @@ HTML_TEMPLATE = """
       } else {
         bannerEl.innerHTML = '';
       }
-        const marginWarning = Object.values(strategies).find(s => String(s.message || '').includes('MARGIN_NOT_AVAILABLE') || String(s.status || '') === 'ERROR');
-        if (marginWarning && bannerEl) {
-          bannerEl.innerHTML = '<div class="warn-box">Margin gate warning: ' + (marginWarning.message || marginWarning.status || 'Check strategy status') + '</div>';
+        const stratWarning = Object.values(strategies).find(s =>
+          String(s.message || '').includes('MARGIN_NOT_AVAILABLE')
+          || s.status === 'ERROR'
+          || s.status === 'WAITING_FOR_CALM'
+          || s.status === 'SKIPPED_VOLATILITY'
+        );
+        if (stratWarning && bannerEl) {
+          const msg = stratWarning.message || stratWarning.status || 'Check strategy status';
+          const label = String(msg).includes('MARGIN_NOT_AVAILABLE')
+            ? 'Margin gate warning'
+            : (stratWarning.status === 'WAITING_FOR_CALM' ? 'Calm zone / strike selection' : 'Strategy warning');
+          bannerEl.innerHTML = '<div class="warn-box">' + label + ': ' + msg + '</div>';
         }
 
       const mtmClass = portfolio.mtm < 0 ? 'negative' : 'positive';
