@@ -2549,11 +2549,17 @@ def _complete_kotak_bootstrap() -> None:
         index_config, expiry = _pick_index_and_expiry(client)
         set_index(index_config.name, expiry)
         _load_strategy_state(client, index_config)
+        _wait_for_kotak_trading_session(client)
         if not _JOBS_SCHEDULED_FLAG:
-            _wait_for_kotak_trading_session(client)
-            # Catch-up before registering slot jobs — avoids schedule firing the same slot immediately.
-            _catch_up_missed_scheduled_strategies(client, index_config, expiry)
             _schedule_jobs(client, index_config, expiry)
+
+        def _run_catch_up() -> None:
+            try:
+                _catch_up_missed_scheduled_strategies(client, index_config, expiry)
+            except Exception:
+                logger.exception("Catch-up thread failed")
+
+        threading.Thread(target=_run_catch_up, daemon=True, name="kotak-catch-up").start()
         _start_calm_zone_monitor_once(client)
         logger.info("Kotak bootstrap complete: %s %s", index_config.name, expiry)
     except RuntimeError as e:
@@ -2584,8 +2590,16 @@ def _retry_pick_expiry(client: Any, auth: dict) -> None:
             _load_strategy_state(client, index_config)
 
             _wait_for_kotak_trading_session(client)
-            _catch_up_missed_scheduled_strategies(client, index_config, expiry)
-            _schedule_jobs(client, index_config, expiry)
+            if not _JOBS_SCHEDULED_FLAG:
+                _schedule_jobs(client, index_config, expiry)
+
+            def _run_catch_up() -> None:
+                try:
+                    _catch_up_missed_scheduled_strategies(client, index_config, expiry)
+                except Exception:
+                    logger.exception("Catch-up thread failed")
+
+            threading.Thread(target=_run_catch_up, daemon=True, name="kotak-catch-up").start()
 
             _start_calm_zone_monitor_once(client)
             logger.debug("✓ Bot is now operational")
@@ -2670,8 +2684,15 @@ def main() -> None:
     jobs_scheduled = False
     if not DEMO_MODE and index_config is not None:
         _wait_for_kotak_trading_session(client)
-        _catch_up_missed_scheduled_strategies(client, index_config, expiry)
         _schedule_jobs(client, index_config, expiry)
+
+        def _run_catch_up() -> None:
+            try:
+                _catch_up_missed_scheduled_strategies(client, index_config, expiry)
+            except Exception:
+                logger.exception("Catch-up thread failed")
+
+        threading.Thread(target=_run_catch_up, daemon=True, name="kotak-catch-up").start()
         jobs_scheduled = True
     elif not DEMO_MODE:
         register_scheduler_snapshot_with_state()

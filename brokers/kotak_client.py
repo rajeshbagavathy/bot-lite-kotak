@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -37,7 +38,14 @@ if _KOTAK_ROOT.is_dir() and str(_KOTAK_ROOT) not in sys.path:
     sys.path.insert(0, str(_KOTAK_ROOT))
 
 from neo_api_client import ModifyOrder, NeoAPI  # noqa: E402
-from neo_api_client.settings import PROD_URL, UAT_URL  # noqa: E402
+from neo_api_client.settings import (  # noqa: E402
+    ORDER_SOURCE,
+    PROD_URL,
+    UAT_URL,
+    exchange_segment as _kotak_exchange_segment_map,
+    order_type as _kotak_order_type_map,
+    product as _kotak_product_map,
+)
 
 # XTS numeric segment (config.IndexConfig) -> Kotak ``exchange_segment`` for quotes/orders
 XTS_EXCHANGE_SEGMENT_TO_KOTAK: Dict[int, str] = {
@@ -195,15 +203,138 @@ class KotakNeoClient:
         return found
 
     def _quotes_headers(self) -> Dict[str, str]:
+        return self._trading_headers(full=True)
+
+    def _trading_headers(self, *, full: bool = True) -> Dict[str, str]:
+        """Session headers for order/trade REST (quotes use the same on many gateways)."""
         cfg = self._api.configuration
         h: Dict[str, str] = {
-            "Authorization": str(self._consumer_key or cfg.consumer_key or ""),
             "Sid": str(cfg.edit_sid or ""),
             "Auth": str(cfg.edit_token or ""),
-            "neo-fin-key": str(cfg.get_neo_fin_key()),
             "Content-Type": "application/x-www-form-urlencoded",
         }
+        if full:
+            h["Authorization"] = str(self._consumer_key or cfg.consumer_key or "")
+            h["neo-fin-key"] = str(cfg.get_neo_fin_key())
         return h
+
+    @staticmethod
+    def _kotak_sanitize_order_tag(tag: Optional[str]) -> Optional[str]:
+        if not tag:
+            return None
+        clean = re.sub(r"[^A-Za-z0-9]", "", str(tag))[:20]
+        return clean or None
+
+    def _order_url_templates(self) -> List[str]:
+        """Order place URLs: session ``baseUrl`` plus NAPI path (SDK only uses legacy path)."""
+        cfg = self._api.configuration
+        host = (cfg.host or "prod").lower().strip()
+        url_dict = PROD_URL if host == "prod" else UAT_URL
+        rel_paths: List[str] = []
+        for key in ("place_order_napi", "place_order"):
+            p = (url_dict.get(key) or "").strip().lstrip("/")
+            if p and p not in rel_paths:
+                rel_paths.append(p)
+        bases: List[str] = []
+        for raw in (
+            cfg.base_url,
+            cfg.get_domain(session_init=True) if hasattr(cfg, "get_domain") else None,
+            "https://gw-napi.kotaksecurities.com",
+            "https://napi.kotaksecurities.com",
+        ):
+            if raw and str(raw).strip():
+                bases.append(str(raw).rstrip("/"))
+        out: List[str] = []
+        seen: set = set()
+        for base in bases:
+            for rel in rel_paths:
+                u = f"{base}/{rel}"
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+        return out
+
+    def _place_order_rest(
+        self,
+        *,
+        exchange_segment: str,
+        product: str,
+        price: str,
+        order_type: str,
+        quantity: str,
+        validity: str,
+        trading_symbol: str,
+        transaction_type: str,
+        amo: str = "NO",
+        disclosed_quantity: str = "0",
+        market_protection: str = "0",
+        pf: str = "N",
+        trigger_price: str = "0",
+        tag: Optional[str] = None,
+        scrip_token: Optional[str] = None,
+    ) -> Any:
+        """
+        Place order via REST with consumer ``Authorization`` (fixes stCode 100008 on NAPI hosts).
+        Falls back to SDK ``place_order`` (Sid/Auth only) if REST paths fail.
+        """
+        self._ensure()
+        cfg = self._api.configuration
+        es = _kotak_exchange_segment_map.get(exchange_segment, exchange_segment)
+        pr = _kotak_product_map.get(product, product)
+        ot = _kotak_order_type_map.get(order_type, order_type)
+        body_params = {
+            "am": amo,
+            "dq": disclosed_quantity,
+            "es": es,
+            "mp": market_protection,
+            "pc": pr,
+            "pf": pf,
+            "pr": price,
+            "pt": ot,
+            "qt": quantity,
+            "rt": validity,
+            "tp": trigger_price,
+            "ts": trading_symbol,
+            "tt": transaction_type,
+            "ig": self._kotak_sanitize_order_tag(tag),
+            "tk": scrip_token,
+            "os": ORDER_SOURCE,
+        }
+        last_payload: Any = None
+        for url in self._order_url_templates():
+            for full_headers in (True, False):
+                headers = self._trading_headers(full=full_headers)
+                for use_sid in (True, False):
+                    qp = {"sId": str(cfg.serverId)} if use_sid and cfg.serverId else None
+                    try:
+                        resp = self._api.api_client.rest_client.request(
+                            url=url,
+                            method="POST",
+                            query_params=qp,
+                            headers=headers,
+                            body=body_params,
+                        )
+                        payload = resp.json()
+                        last_payload = payload
+                        if parse_kotak_place_order_n_ord_no(payload):
+                            logger.info(
+                                "Kotak place_order OK via %s (full_headers=%s, sId=%s)",
+                                url,
+                                full_headers,
+                                bool(qp),
+                            )
+                            return payload
+                        em = str((payload or {}).get("errMsg") or "")
+                        try:
+                            sc = int((payload or {}).get("stCode"))
+                        except (TypeError, ValueError):
+                            sc = None
+                        if sc != 100008 and "unauthorized" not in em.lower():
+                            return payload
+                    except Exception as e:
+                        last_payload = {"error": str(e)}
+                        logger.debug("Kotak place_order REST %s failed: %s", url, e)
+        return last_payload
 
     def _quote_url_templates(self) -> List[str]:
         host = (self._api.configuration.host or "prod").lower().strip()
@@ -1234,6 +1365,9 @@ class KotakNeoClient:
         )
 
         def _submit() -> Any:
+            r = self._place_order_rest(**order_kwargs)
+            if parse_kotak_place_order_n_ord_no(r):
+                return r
             self._ensure()
             return self._api.place_order(**order_kwargs)
 
@@ -1251,8 +1385,12 @@ class KotakNeoClient:
                     tag,
                 )
                 time.sleep(2.5)
-                r = _submit()
+                self._ensure()
+                r = self._place_order_rest(**order_kwargs)
                 oid = parse_kotak_place_order_n_ord_no(r)
+                if oid is None:
+                    r = self._api.place_order(**order_kwargs)
+                    oid = parse_kotak_place_order_n_ord_no(r)
         if oid is None:
             logger.warning(
                 "Kotak place_order failed tag=%s %s %s qty=%s: %s",
