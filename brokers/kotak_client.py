@@ -658,8 +658,12 @@ class KotakNeoClient:
         if not specs:
             return {}
         batch = [{"instrument_token": tok, "exchange_segment": seg} for _, tok, seg in specs]
-        r = self._quotes_get(batch, "ltp")
-        out = self._parse_ltp_response(r, [iid for iid, _, _ in specs])
+        out: Dict[int, float] = {}
+        for qt in ("ltp", "all"):
+            r = self._quotes_get(batch, qt)
+            out = self._parse_ltp_response(r, [iid for iid, _, _ in specs])
+            if len(out) >= len(specs):
+                break
         missing = [s for s in specs if s[0] not in out]
         if missing:
             sym_batch: List[dict] = []
@@ -674,8 +678,12 @@ class KotakNeoClient:
                 sym_map[sym] = iid
                 sym_map[sym.upper()] = iid
             if sym_batch:
-                r2 = self._quotes_get(sym_batch, "ltp")
-                out.update(self._parse_ltp_response(r2, list(sym_map.values()), symbol_to_id=sym_map))
+                sym_ids = list(sym_map.values())
+                for qt in ("ltp", "all"):
+                    r2 = self._quotes_get(sym_batch, qt)
+                    out.update(self._parse_ltp_response(r2, sym_ids, symbol_to_id=sym_map))
+                    if all(iid in out for iid in sym_ids):
+                        break
                 still = [iid for iid, _, _ in missing if iid not in out]
                 if still:
                     logger.warning(
@@ -1210,7 +1218,7 @@ class KotakNeoClient:
             float(index_config.tick_size),
         )
         tt = "B" if (order_side or "").strip().upper() == "BUY" else "S"
-        r = self._api.place_order(
+        order_kwargs = dict(
             exchange_segment=meta["fo_seg"],
             product=product_type,
             price=str(round(float(limit_price), 2)),
@@ -1224,7 +1232,27 @@ class KotakNeoClient:
             tag=(tag or None),
             scrip_token=str(int(instrument_id)),
         )
+
+        def _submit() -> Any:
+            self._ensure()
+            return self._api.place_order(**order_kwargs)
+
+        r = _submit()
         oid = parse_kotak_place_order_n_ord_no(r)
+        if oid is None and isinstance(r, dict):
+            err_msg = str(r.get("errMsg") or r.get("Error") or "")
+            try:
+                st_code = int(r.get("stCode"))
+            except (TypeError, ValueError):
+                st_code = None
+            if st_code == 100008 or "unauthorized" in err_msg.lower():
+                logger.warning(
+                    "Kotak place_order unauthorized — retrying after session settle tag=%s",
+                    tag,
+                )
+                time.sleep(2.5)
+                r = _submit()
+                oid = parse_kotak_place_order_n_ord_no(r)
         if oid is None:
             logger.warning(
                 "Kotak place_order failed tag=%s %s %s qty=%s: %s",

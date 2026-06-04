@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -241,6 +242,7 @@ def _load_strategy_state(client: Any, index_config) -> None:
             _rebuild_sl_links_from_order_book_for_restored_strategy(
                 STRATEGY_STATE[strategy_name], restore_order_book
             )
+    _reconcile_restored_strategies_for_restart()
     replace_strategies(STRATEGY_STATE)
     logger.info(
         "Strategy state loaded: %d slot(s) for %s",
@@ -700,26 +702,116 @@ def _gatekeeper_window_start_iso(strategy: dict) -> str:
     return _strategy_slot_ist_datetime(strategy).isoformat(timespec="seconds")
 
 
+_STRATEGY_EXEC_LOCK = threading.RLock()
+
+# Restart / catch-up may retry these within the slot + calm window (not OPEN/CLOSED).
+_CATCH_UP_ENTRY_STATUSES = frozenset({"PENDING", "ERROR", "WAITING_FOR_CALM", "SKIPPED_VOLATILITY"})
+
+
+def _strategy_entry_window(strategy: dict, now: Optional[datetime.datetime] = None) -> Tuple[datetime.datetime, datetime.datetime]:
+    """Return (slot_start, window_end) in IST for the strategy's scheduled entry."""
+    now = now or get_ist_now()
+    slot_dt = _strategy_slot_ist_datetime(strategy)
+    window_end = slot_dt + datetime.timedelta(minutes=int(CALM_ZONE_WAIT_TIMEOUT_MINUTES))
+    return slot_dt, window_end
+
+
+def _strategy_within_entry_window(strategy: dict, now: Optional[datetime.datetime] = None) -> bool:
+    now = now or get_ist_now()
+    slot_dt, window_end = _strategy_entry_window(strategy, now)
+    return slot_dt <= now <= window_end
+
+
+def _reconcile_restored_strategies_for_restart() -> None:
+    """
+    After DB restore on restart: if we are still inside the slot's 30-minute entry window,
+    allow another attempt (clear SKIPPED/ERROR from earlier crash or unauthorized order).
+    """
+    now = get_ist_now()
+    for name, strategy in list(STRATEGY_STATE.items()):
+        if not _strategy_within_entry_window(strategy, now):
+            continue
+        st = strategy.get("status")
+        if st in ("OPEN", "CLOSED", "DISABLED"):
+            continue
+        slot_iso = _gatekeeper_window_start_iso(strategy)
+        if st == "SKIPPED_VOLATILITY":
+            logger.info(
+                "Strategy %s: restart inside entry window — clearing SKIPPED, will retry",
+                name,
+            )
+            strategy.update(
+                status="PENDING",
+                message="Restart retry (was skipped for calm timeout)",
+                gatekeeper_started_at=None,
+                next_gatekeeper_check_at=None,
+                skip_reason=None,
+            )
+        elif st == "ERROR":
+            logger.info(
+                "Strategy %s: restart inside entry window — clearing ERROR (%s)",
+                name,
+                (strategy.get("message") or "")[:120],
+            )
+            strategy.update(
+                status="PENDING",
+                message="Restart retry after previous error",
+                gatekeeper_started_at=None,
+                next_gatekeeper_check_at=None,
+                skip_reason=None,
+            )
+        elif st == "WAITING_FOR_CALM":
+            strategy["gatekeeper_started_at"] = slot_iso
+            strategy["next_gatekeeper_check_at"] = time.time() - 1.0
+            strategy["message"] = "Restart: resuming calm-zone wait from slot time"
+            logger.info("Strategy %s: restart — reset calm gatekeeper to slot %s", name, slot_iso)
+
+
+def _wait_for_kotak_trading_session(client: Any, timeout_sec: float = 20.0) -> bool:
+    """Confirm Kotak session can read limits/order book before placing orders (avoids 100008 unauthorized)."""
+    from config import BROKER_BACKEND
+
+    if BROKER_BACKEND != "kotak":
+        return True
+    deadline = time.time() + timeout_sec
+    ok_streak = 0
+    while time.time() < deadline:
+        try:
+            client._ensure()
+            net = client.get_available_margin()
+            client.get_order_book()
+            if net is not None:
+                ok_streak += 1
+                if ok_streak >= 2:
+                    logger.info("Kotak trading session ready (margin=%s)", net)
+                    return True
+        except Exception as e:
+            logger.debug("Kotak session wait: %s", e)
+        time.sleep(1.0)
+    logger.warning("Kotak trading session not confirmed within %.0fs — orders may fail", timeout_sec)
+    return False
+
+
 def _catch_up_missed_scheduled_strategies(client: Any, index_config, expiry: str) -> None:
     """
     ``schedule.every().day.at(slot)`` does not run a job if the process starts after that
-    time today. Run eligible PENDING strategies once when the process starts inside
+    time today. Run eligible strategies once when the process starts inside
     ``[slot, slot + CALM_ZONE_WAIT_TIMEOUT_MINUTES]`` so restarts still honor the gatekeeper window.
     """
     if _SCHEDULER_MINIMAL_MODE:
         return
     now = get_ist_now()
     for strategy in STRATEGY_STATE.values():
-        if strategy.get("status") != "PENDING":
+        if strategy.get("status") not in _CATCH_UP_ENTRY_STATUSES:
             continue
-        slot_dt = _strategy_slot_ist_datetime(strategy)
-        window_end = slot_dt + datetime.timedelta(minutes=int(CALM_ZONE_WAIT_TIMEOUT_MINUTES))
+        slot_dt, window_end = _strategy_entry_window(strategy, now)
         if now < slot_dt or now > window_end:
             continue
         logger.info(
-            "Catch-up: running %s (slot %s; missed daily schedule, inside %s min window)",
+            "Catch-up: running %s (slot %s, status %s; inside %s min window)",
             strategy["name"],
             strategy.get("time"),
+            strategy.get("status"),
             CALM_ZONE_WAIT_TIMEOUT_MINUTES,
         )
         _execute_strategy(client, index_config, expiry, strategy, force=False)
@@ -839,6 +931,17 @@ def _execute_strategy(client: Any, index_config, expiry: str, strategy, force: b
     if not force and get_ist_now().strftime("%H:%M:%S") < strategy["time"]:
         return
 
+    name = strategy["name"]
+    if not _STRATEGY_EXEC_LOCK.acquire(blocking=False):
+        logger.info("Strategy %s: another entry is in progress — skipping duplicate run", name)
+        return
+    try:
+        _execute_strategy_locked(client, index_config, expiry, strategy, force=force)
+    finally:
+        _STRATEGY_EXEC_LOCK.release()
+
+
+def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, force: bool = False) -> None:
     name = strategy["name"]
     can_run, gate_reason, gate_row = should_execute_now(name, index_config.name)
     if not can_run:
@@ -2447,8 +2550,10 @@ def _complete_kotak_bootstrap() -> None:
         set_index(index_config.name, expiry)
         _load_strategy_state(client, index_config)
         if not _JOBS_SCHEDULED_FLAG:
-            _schedule_jobs(client, index_config, expiry)
+            _wait_for_kotak_trading_session(client)
+            # Catch-up before registering slot jobs — avoids schedule firing the same slot immediately.
             _catch_up_missed_scheduled_strategies(client, index_config, expiry)
+            _schedule_jobs(client, index_config, expiry)
         _start_calm_zone_monitor_once(client)
         logger.info("Kotak bootstrap complete: %s %s", index_config.name, expiry)
     except RuntimeError as e:
@@ -2478,9 +2583,10 @@ def _retry_pick_expiry(client: Any, auth: dict) -> None:
             set_index(index_config.name, expiry)
             _load_strategy_state(client, index_config)
 
-            # Schedule jobs now that we have expiry
+            _wait_for_kotak_trading_session(client)
+            _catch_up_missed_scheduled_strategies(client, index_config, expiry)
             _schedule_jobs(client, index_config, expiry)
-            
+
             _start_calm_zone_monitor_once(client)
             logger.debug("✓ Bot is now operational")
             return  # Success, exit retry loop
@@ -2563,8 +2669,9 @@ def main() -> None:
     # Only schedule jobs if we have valid index and expiry
     jobs_scheduled = False
     if not DEMO_MODE and index_config is not None:
-        _schedule_jobs(client, index_config, expiry)
+        _wait_for_kotak_trading_session(client)
         _catch_up_missed_scheduled_strategies(client, index_config, expiry)
+        _schedule_jobs(client, index_config, expiry)
         jobs_scheduled = True
     elif not DEMO_MODE:
         register_scheduler_snapshot_with_state()

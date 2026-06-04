@@ -2187,6 +2187,22 @@ class TestCalmZoneGatekeeper(unittest.TestCase):
         bot._catch_up_missed_scheduled_strategies(self.client, self.index_config, "10APR2026")
         mock_exec.assert_not_called()
 
+    @patch("bot._execute_strategy")
+    @patch("bot.get_ist_now")
+    @patch("bot._SCHEDULER_MINIMAL_MODE", False)
+    def test_catch_up_retries_error_inside_window(self, mock_now, mock_exec):
+        mock_now.return_value = datetime.datetime(2026, 4, 8, 11, 47, 0)
+        bot.STRATEGY_STATE = {
+            "S1": {
+                "name": "S1",
+                "status": "ERROR",
+                "time": "11:46:00",
+                "message": "Entry order placement failed",
+            },
+        }
+        bot._catch_up_missed_scheduled_strategies(self.client, self.index_config, "10APR2026")
+        mock_exec.assert_called_once()
+
 
 if __name__ == "__main__":
     # Run tests with coverage report

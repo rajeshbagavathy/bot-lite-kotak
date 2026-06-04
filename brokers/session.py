@@ -128,6 +128,8 @@ class KotakSessionManager:
             raise RuntimeError("Kotak session missing edit_token/edit_sid after totp_validate")
         self._last_login_ts = time.time()
         logger.info("Kotak Neo session established (ucc=%s)", self._ucc)
+        # Order API can return stCode 100008 unauthorized for a few seconds right after login.
+        time.sleep(2.0)
 
     @staticmethod
     def _dashboard_totp_mode() -> bool:
