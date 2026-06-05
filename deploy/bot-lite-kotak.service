@@ -1,0 +1,40 @@
+[Unit]
+Description=Bot Lite Kotak — straddle trading bot + dashboard
+Documentation=https://github.com/rajeshbagavathy/bot-lite-kotak
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Match your clone path on EC2 (ec2-user home is common on Amazon Linux)
+WorkingDirectory=/home/ec2-user/bot-lite-kotak
+
+# Use the project venv (run scripts/setup_local.sh once after clone)
+ExecStart=/home/ec2-user/bot-lite-kotak/.venv/bin/python bot.py
+
+# Non-secret runtime flags only (see deploy/bot.env.example)
+EnvironmentFile=-/home/ec2-user/bot-lite-kotak/deploy/bot.env
+
+# Kotak broker + dashboard TOTP (credentials come from SSM via instance IAM role)
+Environment=BROKER_BACKEND=kotak
+Environment=AWS_REGION=ap-south-1
+Environment=KOTAK_TOTP_UI=true
+Environment=WEB_UI_PORT=8002
+Environment=BOT_LOG_PATH=/home/ec2-user/bot-lite-kotak/bot.log
+
+# Optional: only if your SSM paths differ from defaults in config.py
+# Environment=SSM_LOGIN_USERNAME_PATH=/trade/config/5pindra/loginusername
+# Environment=SSM_LOGIN_PASSWORD_PATH=/trade/config/5pindra/loginpassword
+# Environment=SSM_KOTAK_BASE_PATH=/trade/config/kotak/rajesh
+# Environment=KOTAK_SSM_PROFILE=rajesh
+
+Restart=on-failure
+RestartSec=10
+# Allow Kotak login + scrip bootstrap to finish without systemd killing the unit
+TimeoutStartSec=300
+
+User=ec2-user
+Group=ec2-user
+
+[Install]
+WantedBy=multi-user.target

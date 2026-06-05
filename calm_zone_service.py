@@ -343,23 +343,34 @@ def _upsert_ohlc_rows(index_name: str, bars: List[Dict[str, Any]]) -> None:
         )
 
 
+def _spot_bar_age_seconds(bar_unix: Optional[int]) -> Optional[float]:
+    """Seconds since the 1m bar ended (POSIX), for OHLC freeze / calm lock."""
+    if bar_unix is None:
+        return None
+    try:
+        bu = _normalize_unix_ts(int(bar_unix))
+    except (TypeError, ValueError):
+        return None
+    return time.time() - float(bu)
+
+
 def recompute_calm_metrics_for_index(index_name: str, limit: int = RECOMPUTE_TAIL) -> None:
     """
-    One-time calm metrics per 1m bar (static after first successful write).
+    Recompute 5m range/ratio/calm for recent 1m bars.
 
-    Rows are deduped by canonical minute key so the 5-bar window never double-counts a minute.
-    ``calm_locked`` / existing ``range_5m`` skip further math for that minute.
+    OHLC is refreshed every tick via ``upsert_spot_ohlc_only``; metrics stay mutable until
+    ``CALM_ZONE_OHLC_FREEZE_AFTER_SEC`` after the bar, then ``calm_locked`` prevents changes.
     """
     raw = fetch_spot_bars_asc_for_recompute(index_name, limit)
     rows = _dedupe_spot_rows_for_recompute(raw)
     for i, r in enumerate(rows):
         if i < 4:
             continue
-        if int(r.get("calm_locked") or 0) == 1:
-            continue
-        if r.get("range_5m") is not None:
-            continue
         bu = r.get("bar_unix")
+        age = _spot_bar_age_seconds(int(bu) if bu is not None else None)
+        frozen = age is not None and age > float(CALM_ZONE_OHLC_FREEZE_AFTER_SEC)
+        if int(r.get("calm_locked") or 0) == 1 and frozen:
+            continue
         if bu is not None:
             try:
                 bu = int(bu)
@@ -394,6 +405,7 @@ def recompute_calm_metrics_for_index(index_name: str, limit: int = RECOMPUTE_TAI
             m["body_range_ratio"],
             bool(m["is_calmzone"]),
             bar_unix=bu,
+            calm_locked=frozen,
         )
 
 

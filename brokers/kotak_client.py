@@ -662,8 +662,38 @@ class KotakNeoClient:
         if tok is None:
             return None
         tid = int(tok)
-        self._token_meta[tid] = {"trdSym": sym, "segment": meta["fo_seg"]}
+        ltp_hint = self._ltp_from_scrip_row(row)
+        self._token_meta[tid] = {
+            "trdSym": sym,
+            "segment": meta["fo_seg"],
+            "ltp_hint": ltp_hint,
+        }
         return tid
+
+    @staticmethod
+    def _ltp_from_scrip_row(row: dict) -> Optional[float]:
+        """Best-effort LTP from ``search_scrip`` row when REST quotes return empty."""
+        for k in (
+            "lLtp",
+            "lLastTradedPrice",
+            "lastTradedPrice",
+            "LastTradedPrice",
+            "ltp",
+            "Ltp",
+            "last_price",
+            "pLastTradedPrice",
+            "close",
+        ):
+            v = row.get(k)
+            if v is None or str(v).strip() in ("", "0"):
+                continue
+            try:
+                f = float(v)
+                if f > 0:
+                    return f
+            except (TypeError, ValueError):
+                continue
+        return None
 
     def get_positions(self) -> List[dict]:
         self._ensure()
@@ -817,10 +847,65 @@ class KotakNeoClient:
                         break
                 still = [iid for iid, _, _ in missing if iid not in out]
                 if still:
-                    logger.warning(
-                        "Kotak: option LTP missing for token(s) %s (tried pSymbol + trdSym)",
-                        still,
-                    )
+                    out.update(self._ltp_map_fallbacks(still))
+        return out
+
+    def _ltp_map_fallbacks(self, instrument_ids: List[int]) -> Dict[int, float]:
+        """Scrip hints, per-leg SDK consumer quotes, then single-leg session quotes."""
+        out: Dict[int, float] = {}
+        pending = list(instrument_ids)
+        for iid in pending:
+            tm = self._token_meta.get(iid)
+            if not tm:
+                continue
+            hint = tm.get("ltp_hint")
+            if hint is not None:
+                try:
+                    out[iid] = float(hint)
+                except (TypeError, ValueError):
+                    pass
+        pending = [i for i in pending if i not in out]
+        for iid in pending:
+            tm = self._token_meta.get(iid) or {}
+            seg = str(tm.get("segment") or "bse_fo")
+            tok = str(iid)
+            sym = str(tm.get("trdSym") or "").strip()
+            for leg in (
+                {"instrument_token": tok, "exchange_segment": seg},
+                {"instrument_token": sym, "exchange_segment": seg},
+            ):
+                if not leg.get("instrument_token"):
+                    continue
+                try:
+                    raw = self._api.quotes(instrument_tokens=[leg], quote_type="ltp")
+                    out.update(self._parse_ltp_response(raw, [iid]))
+                except Exception as e:
+                    logger.debug("Kotak SDK quotes %s: %s", leg, e)
+                if iid in out:
+                    break
+        pending = [i for i in pending if i not in out]
+        for iid in pending:
+            tm = self._token_meta.get(iid) or {}
+            seg = str(tm.get("segment") or "bse_fo")
+            for leg in (
+                {"instrument_token": str(iid), "exchange_segment": seg},
+                {"instrument_token": str(tm.get("trdSym") or ""), "exchange_segment": seg},
+            ):
+                if not leg.get("instrument_token"):
+                    continue
+                for qt in ("ltp", "all"):
+                    raw = self._quotes_get([leg], qt)
+                    out.update(self._parse_ltp_response(raw, [iid]))
+                    if iid in out:
+                        break
+                if iid in out:
+                    break
+        still = [i for i in pending if i not in out]
+        if still:
+            logger.warning(
+                "Kotak: option LTP missing for token(s) %s (quotes + scrip hint exhausted)",
+                still,
+            )
         return out
 
     def _parse_ltp_response(
@@ -1340,20 +1425,36 @@ class KotakNeoClient:
         s = MARKETABLE_LIMIT_SLIPPAGE_PCT if slippage_pct is None else slippage_pct
         ltp_val = ltp if ltp is not None else self.get_option_ltp(index_config, instrument_id)
         if ltp_val is None:
-            logger.warning("Kotak: no LTP for %s", instrument_id)
-            return None
-        limit_price = marketable_limit_price(
-            float(ltp_val),
-            order_side,
-            s,
-            float(index_config.tick_size),
-        )
+            hint = tm.get("ltp_hint")
+            if hint is not None:
+                try:
+                    ltp_val = float(hint)
+                except (TypeError, ValueError):
+                    ltp_val = None
+        use_market = False
+        if ltp_val is None:
+            logger.warning(
+                "Kotak: no quote LTP for %s (%s) — placing MARKET order",
+                instrument_id,
+                tm.get("trdSym"),
+            )
+            use_market = True
+            limit_price = 0.0
+            kotak_order_type = "MKT"
+        else:
+            limit_price = marketable_limit_price(
+                float(ltp_val),
+                order_side,
+                s,
+                float(index_config.tick_size),
+            )
+            kotak_order_type = "L"
         tt = "B" if (order_side or "").strip().upper() == "BUY" else "S"
         order_kwargs = dict(
             exchange_segment=meta["fo_seg"],
             product=product_type,
-            price=str(round(float(limit_price), 2)),
-            order_type="L",
+            price=str(round(float(limit_price), 2)) if not use_market else "0",
+            order_type=kotak_order_type,
             quantity=str(int(quantity)),
             validity="DAY",
             trading_symbol=tm["trdSym"],

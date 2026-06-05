@@ -1077,8 +1077,11 @@ def upsert_spot_bar(
     body_range_ratio: Optional[float],
     is_calmzone: bool,
     bar_unix: Optional[int] = None,
+    *,
+    calm_locked: Optional[bool] = None,
 ) -> None:
     """Write full row including calm metrics (used after ``compute_calm_metrics`` only)."""
+    lock_val = 1 if calm_locked is None else (1 if calm_locked else 0)
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -1087,7 +1090,7 @@ def upsert_spot_bar(
             INSERT INTO spot_market_data (
                 index_name, bar_time, open, high, low, close, volume,
                 range_5m, net_body, body_range_ratio, is_calmzone, updated_at, bar_unix, calm_locked
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(index_name, bar_time) DO UPDATE SET
                 open = excluded.open,
                 high = excluded.high,
@@ -1100,8 +1103,10 @@ def upsert_spot_bar(
                 is_calmzone = excluded.is_calmzone,
                 updated_at = excluded.updated_at,
                 bar_unix = COALESCE(excluded.bar_unix, spot_market_data.bar_unix),
-                calm_locked = 1
-            WHERE spot_market_data.calm_locked = 0
+                calm_locked = CASE
+                    WHEN spot_market_data.calm_locked = 1 THEN 1
+                    ELSE excluded.calm_locked
+                END
             """,
             (
                 index_name,
@@ -1117,6 +1122,7 @@ def upsert_spot_bar(
                 1 if is_calmzone else 0,
                 get_ist_timestamp(),
                 bar_unix,
+                lock_val,
             ),
         )
         conn.commit()

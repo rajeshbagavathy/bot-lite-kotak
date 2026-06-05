@@ -91,8 +91,11 @@ from config import (
     MARKETABLE_LIMIT_SLIPPAGE_PCT,
     MARGIN_BUFFER_EXPIRY,
     MARGIN_BUFFER_NON_EXPIRY,
-    MARGIN_REQUIRED_PER_LOT_EXPIRY,
     MARGIN_REQUIRED_PER_LOT_NON_EXPIRY,
+    MARGIN_TIGHT_BUFFER_MIN,
+    MIN_MARGIN_TO_TRADE,
+    HEDGE_ON_EVERY_STRATEGY,
+    margin_required_per_lot_expiry,
     PORTFOLIO_SL_LIMIT,
     SOURCE,
     STRATEGY_SL_ENABLED,
@@ -101,8 +104,6 @@ from config import (
     STRIKE_PREMIUM_BUFFER_SENSEX,
     STRIKE_PREMIUM_TARGET_NIFTY,
     STRIKE_PREMIUM_TARGET_SENSEX,
-    HEDGE_QTY_MULTIPLIER_EXPIRY,
-    HEDGE_QTY_MULTIPLIER_NON_EXPIRY,
     TRADE_NON_EXPIRY_DAY,
     USE_PREMIUM_BASED_STRIKE,
     DEMO_MODE,
@@ -112,6 +113,7 @@ from config import (
     CALM_ZONE_RECENT_CALM_MINUTES,
     CALM_ZONE_WAIT_TIMEOUT_MINUTES,
     CALM_ZONE_POLL_SECONDS,
+    CALM_ZONE_GATEKEEPER_POLL_SECONDS,
     get_basic_auth_creds,
     get_today_strategies,
     load_login_credentials,
@@ -420,6 +422,104 @@ def _find_strike_by_premium(
     return (strike, instrument_id)
 
 
+def _bot_tracked_open_short_qty_by_side() -> Tuple[int, int]:
+    """Return bot-tracked open short quantity as (ce_short_qty, pe_short_qty)."""
+    ce_short_qty = 0
+    pe_short_qty = 0
+    for strategy in STRATEGY_STATE.values():
+        for pos in strategy.get("positions") or []:
+            if pos.get("exit_price") is not None:
+                continue
+            try:
+                qty = int(pos.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty >= 0:
+                continue
+            symbol = str(pos.get("symbol") or "").upper()
+            if "CE" in symbol:
+                ce_short_qty += abs(qty)
+            elif "PE" in symbol:
+                pe_short_qty += abs(qty)
+    return ce_short_qty, pe_short_qty
+
+
+def _bot_tracked_hedge_buy_qty_by_side() -> Tuple[int, int]:
+    """Return cumulative far-OTM hedge buy qty already placed (PE hedges CE shorts, CE hedges PE shorts)."""
+    pe_hedge_qty = 0
+    ce_hedge_qty = 0
+    for strategy in STRATEGY_STATE.values():
+        side_qty = strategy.get("hedge_side_qty")
+        if isinstance(side_qty, dict):
+            try:
+                pe_hedge_qty += int(side_qty.get("PE") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                ce_hedge_qty += int(side_qty.get("CE") or 0)
+            except (TypeError, ValueError):
+                pass
+            continue
+        for order in strategy.get("hedge_orders") or []:
+            side = str(order.get("side") or "").upper()
+            try:
+                qty = int(order.get("quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if qty <= 0:
+                continue
+            if side == "PE":
+                pe_hedge_qty += qty
+            elif side == "CE":
+                ce_hedge_qty += qty
+    return pe_hedge_qty, ce_hedge_qty
+
+
+def _compute_effective_lots_from_margin(
+    planned_lots: int,
+    available_margin: Optional[float],
+    per_lot_margin: float,
+    buffer: float,
+    tight_buffer: float,
+) -> Tuple[int, Optional[str]]:
+    """
+    Compute executable lots with conservative margin policy:
+    - gap > tight_buffer: use planned
+    - 0 <= gap <= tight_buffer: reduce by 1
+    - gap < 0: recompute affordable then reduce by 1
+    """
+    planned = max(int(planned_lots or 0), 0)
+    if planned <= 0 or available_margin is None:
+        return planned, None
+
+    required = planned * float(per_lot_margin) + float(buffer)
+    gap = float(available_margin) - required
+    if gap > float(tight_buffer):
+        return planned, None
+    if gap >= 0:
+        eff = max(planned - 1, 0)
+        return eff, (
+            f"Margin tight: available {available_margin:.0f}, required {required:.0f}, "
+            f"cushion {gap:.0f} <= {tight_buffer:.0f}; reducing planned lots {planned} -> {eff}."
+        )
+
+    affordable = int(max((float(available_margin) - float(buffer)) / float(per_lot_margin), 0))
+    affordable = min(affordable, planned)
+    eff = max(affordable - 1, 0)
+    if eff <= 0:
+        # User intent: if at least ~₹2L is available, still try to execute 1 lot (if 1 lot is affordable).
+        one_lot_required = float(per_lot_margin) + float(buffer)
+        if float(available_margin) >= float(MIN_MARGIN_TO_TRADE) and float(available_margin) >= one_lot_required:
+            return 1, (
+                f"Margin low: available {available_margin:.0f}, required {required:.0f} for planned {planned}; "
+                f"forcing minimum 1 lot (min_margin {MIN_MARGIN_TO_TRADE:.0f}, 1-lot required {one_lot_required:.0f})."
+            )
+    return eff, (
+        f"Insufficient margin: available {available_margin:.0f}, required {required:.0f} for planned {planned}; "
+        f"affordable {affordable}, conservative reduce by 1 -> execute {eff}."
+    )
+
+
 def _ensure_margin_or_skip_strategy(
     client: Any,
     index_config,
@@ -429,142 +529,195 @@ def _ensure_margin_or_skip_strategy(
 ) -> bool:
     """
     Ensure required margin is available before placing the straddle.
-    If margin is low, buys far-OTM hedges (CE above ATM, PE below ATM), refreshes margin,
-    and only proceeds if margin becomes sufficient.
-    If still insufficient, closes hedges and marks strategy as ERROR.
+
+    When ``HEDGE_ON_EVERY_STRATEGY`` is enabled (default), each entry buys incremental
+    far-OTM PE+CE hedges for planned short qty (LTP band up to ₹13 on non-expiry).
+    Otherwise hedges only when margin is below the planned requirement, using open shorts.
+
+    After hedges, conservatively resize lots from refreshed margin instead of hard-failing
+    at the first shortfall.
     """
     name = strategy["name"]
 
     is_expiry = _is_expiry_day(expiry)
     available = client.get_available_margin()
     update_portfolio_margin(available)
-    strategy_lots = int(strategy.get("lots") or 0)
-    required_margin = (
-        (float(MARGIN_REQUIRED_PER_LOT_EXPIRY) if is_expiry else float(MARGIN_REQUIRED_PER_LOT_NON_EXPIRY)) * strategy_lots
-        + (float(MARGIN_BUFFER_EXPIRY) if is_expiry else float(MARGIN_BUFFER_NON_EXPIRY))
+    planned_lots = int(strategy.get("lots") or 0)
+    per_lot = (
+        margin_required_per_lot_expiry(getattr(index_config, "name", None))
+        if is_expiry
+        else float(MARGIN_REQUIRED_PER_LOT_NON_EXPIRY)
     )
-    if available is not None and float(available) >= required_margin:
-        return True
+    base_buf = float(MARGIN_BUFFER_EXPIRY) if is_expiry else float(MARGIN_BUFFER_NON_EXPIRY)
+    required_for_planned = per_lot * planned_lots + base_buf
+    lot_size = int(index_config.lot_size)
+    entry_qty = planned_lots * lot_size
 
-    target_premium = float(HEDGE_TARGET_PREMIUM_EXPIRY) if is_expiry else float(HEDGE_TARGET_PREMIUM_NON_EXPIRY)
-    min_premium = float(HEDGE_PREMIUM_MIN_EXPIRY) if is_expiry else float(HEDGE_PREMIUM_MIN_NON_EXPIRY)
-    max_premium = float(HEDGE_PREMIUM_MAX_EXPIRY) if is_expiry else float(HEDGE_PREMIUM_MAX_NON_EXPIRY)
-
-    update_strategy(
-        name,
-        message=(
-            f"Low margin ({available}); required {required_margin:.0f}, "
-            f"buying hedges targeting ~₹{target_premium} (LTP in ₹{min_premium}-₹{max_premium})"
-        ),
+    need_hedge = bool(HEDGE_ON_EVERY_STRATEGY) or (
+        available is not None and float(available) < required_for_planned
     )
+    if need_hedge:
+        ce_short_qty, pe_short_qty = _bot_tracked_open_short_qty_by_side()
+        pe_hedged_qty, ce_hedged_qty = _bot_tracked_hedge_buy_qty_by_side()
+        planned_entry_qty = entry_qty if HEDGE_ON_EVERY_STRATEGY else 0
+        pe_hedge_qty = max(0, int(ce_short_qty) + int(planned_entry_qty) - int(pe_hedged_qty))
+        ce_hedge_qty = max(0, int(pe_short_qty) + int(planned_entry_qty) - int(ce_hedged_qty))
 
-    hedge_multiplier = float(HEDGE_QTY_MULTIPLIER_EXPIRY) if is_expiry else float(HEDGE_QTY_MULTIPLIER_NON_EXPIRY)
-    hedge_qty = int(math.ceil(strategy_lots * hedge_multiplier)) * int(index_config.lot_size)
-    all_hedge_orders: List[dict] = []
-    last_available = available
-    max_rounds = 2
+        target_premium = float(HEDGE_TARGET_PREMIUM_EXPIRY) if is_expiry else float(HEDGE_TARGET_PREMIUM_NON_EXPIRY)
+        min_premium = float(HEDGE_PREMIUM_MIN_EXPIRY) if is_expiry else float(HEDGE_PREMIUM_MIN_NON_EXPIRY)
+        max_premium = float(HEDGE_PREMIUM_MAX_EXPIRY) if is_expiry else float(HEDGE_PREMIUM_MAX_NON_EXPIRY)
 
-    for round_idx in range(1, max_rounds + 1):
-        pe_hedge = _find_hedge_by_target_premium(
-            client=client,
-            index_config=index_config,
-            expiry=expiry,
-            option_type="PE",
-            atm_strike=atm_strike,
-            target_premium=target_premium,
-            min_premium=min_premium,
-            max_premium=max_premium,
-        )
-        ce_hedge = _find_hedge_by_target_premium(
-            client=client,
-            index_config=index_config,
-            expiry=expiry,
-            option_type="CE",
-            atm_strike=atm_strike,
-            target_premium=target_premium,
-            min_premium=min_premium,
-            max_premium=max_premium,
-        )
-
-        if not pe_hedge or not ce_hedge:
-            update_strategy(name, status="ERROR", message="Margin low; unable to find hedge options")
-            return False
-
-        hedge_ltps = client.get_ltp_map(
-            [
-                {
-                    "exchangeSegment": index_config.option_ltp_segment,
-                    "exchangeInstrumentID": int(pe_hedge["instrument_id"]),
-                },
-                {
-                    "exchangeSegment": index_config.option_ltp_segment,
-                    "exchangeInstrumentID": int(ce_hedge["instrument_id"]),
-                },
-            ]
-        )
-        round_orders: List[dict] = []
-        for hedge, side in ((pe_hedge, "PE"), (ce_hedge, "CE")):
-            tag = f"{name}_HEDGE_R{round_idx}_{side}_BUY_{int(time.time())}"
-            iid = int(hedge["instrument_id"])
-            oid = client.place_market_order(
-                index_config=index_config,
-                instrument_id=iid,
-                order_side=client.interactive.TRANSACTION_TYPE_BUY,
-                quantity=hedge_qty,
-                tag=tag,
-                product_type=client.interactive.PRODUCT_MIS,
-                ltp=hedge_ltps.get(iid),
+        if pe_hedge_qty > 0 or ce_hedge_qty > 0:
+            update_strategy(
+                name,
+                message=(
+                    f"Buying far-OTM hedges (target ~₹{target_premium}, LTP ₹{min_premium}-₹{max_premium}); "
+                    f"PE buy qty={pe_hedge_qty}, CE buy qty={ce_hedge_qty} "
+                    f"(short CE={ce_short_qty}, short PE={pe_short_qty}, planned entry qty={planned_entry_qty})"
+                ),
             )
-            if oid:
-                order_rec = {"app_order_id": oid, "tag": tag, "instrument_id": int(hedge["instrument_id"])}
-                round_orders.append(order_rec)
-                all_hedge_orders.append(order_rec)
-            else:
-                # Rollback orders from this round only.
-                for placed in round_orders:
-                    try:
-                        client.cancel_order(placed["app_order_id"], placed["tag"])
-                    except Exception:
-                        logger.exception("Failed to cancel hedge order %s", placed)
-                # If anything got filled, close using broker positions.
-                try:
-                    positions = client.get_positions()
-                    _close_positions_for_instruments(
-                        client,
-                        index_config,
-                        positions,
-                        [p["instrument_id"] for p in round_orders],
-                    )
-                except Exception:
-                    logger.exception("Failed to rollback hedge positions for %s", name)
 
-                update_strategy(name, status="ERROR", message="Margin low; hedge order placement failed")
+            all_hedge_orders: List[dict] = list(strategy.get("hedge_orders") or [])
+            hedge_strikes: Dict[str, Optional[int]] = dict(strategy.get("hedge_strikes") or {"PE": None, "CE": None})
+            hedge_side_qty: Dict[str, int] = {"PE": pe_hedged_qty, "CE": ce_hedged_qty}
+
+            pe_hedge = (
+                _find_hedge_by_target_premium(
+                    client=client,
+                    index_config=index_config,
+                    expiry=expiry,
+                    option_type="PE",
+                    atm_strike=atm_strike,
+                    target_premium=target_premium,
+                    min_premium=min_premium,
+                    max_premium=max_premium,
+                )
+                if pe_hedge_qty > 0
+                else None
+            )
+            ce_hedge = (
+                _find_hedge_by_target_premium(
+                    client=client,
+                    index_config=index_config,
+                    expiry=expiry,
+                    option_type="CE",
+                    atm_strike=atm_strike,
+                    target_premium=target_premium,
+                    min_premium=min_premium,
+                    max_premium=max_premium,
+                )
+                if ce_hedge_qty > 0
+                else None
+            )
+
+            if (pe_hedge_qty > 0 and not pe_hedge) or (ce_hedge_qty > 0 and not ce_hedge):
+                update_strategy(name, status="ERROR", message="Unable to find hedge options")
                 return False
 
+            instruments = []
+            if pe_hedge and pe_hedge_qty > 0:
+                instruments.append(
+                    {
+                        "exchangeSegment": index_config.option_ltp_segment,
+                        "exchangeInstrumentID": int(pe_hedge["instrument_id"]),
+                    }
+                )
+                hedge_strikes["PE"] = int(pe_hedge.get("strike"))
+            if ce_hedge and ce_hedge_qty > 0:
+                instruments.append(
+                    {
+                        "exchangeSegment": index_config.option_ltp_segment,
+                        "exchangeInstrumentID": int(ce_hedge["instrument_id"]),
+                    }
+                )
+                hedge_strikes["CE"] = int(ce_hedge.get("strike"))
+            hedge_ltps = client.get_ltp_map(instruments) if instruments else {}
+
+            placed_now: List[dict] = []
+            for hedge, side, qty in ((pe_hedge, "PE", pe_hedge_qty), (ce_hedge, "CE", ce_hedge_qty)):
+                if not hedge or qty <= 0:
+                    continue
+                tag = f"{name}_HEDGE_{side}_BUY_{int(time.time())}"
+                iid = int(hedge["instrument_id"])
+                oid = client.place_market_order(
+                    index_config=index_config,
+                    instrument_id=iid,
+                    order_side=client.interactive.TRANSACTION_TYPE_BUY,
+                    quantity=qty,
+                    tag=tag,
+                    product_type=client.interactive.PRODUCT_MIS,
+                    ltp=hedge_ltps.get(iid),
+                )
+                if oid:
+                    order_rec = {
+                        "app_order_id": oid,
+                        "tag": tag,
+                        "instrument_id": iid,
+                        "quantity": qty,
+                        "side": side,
+                    }
+                    placed_now.append(order_rec)
+                    all_hedge_orders.append(order_rec)
+                    hedge_side_qty[side] = int(hedge_side_qty.get(side) or 0) + int(qty)
+                else:
+                    for placed in placed_now:
+                        try:
+                            client.cancel_order(placed["app_order_id"], placed["tag"])
+                        except Exception:
+                            logger.exception("Failed to cancel hedge order %s", placed)
+                    try:
+                        positions = client.get_positions()
+                        _close_positions_for_instruments(
+                            client,
+                            index_config,
+                            positions,
+                            [p["instrument_id"] for p in placed_now],
+                        )
+                    except Exception:
+                        logger.exception("Failed to rollback hedge positions for %s", name)
+                    update_strategy(name, status="ERROR", message="Hedge order placement failed")
+                    return False
+
+            if placed_now:
+                update_strategy(
+                    name,
+                    hedge_orders=all_hedge_orders,
+                    hedge_target_premium=target_premium,
+                    hedge_qty=sum(int(o.get("quantity") or 0) for o in all_hedge_orders),
+                    hedge_side_qty=hedge_side_qty,
+                    hedge_strikes=hedge_strikes,
+                    message="Far-OTM hedge orders placed; rechecking margin",
+                )
+                time.sleep(3)
+                available = client.get_available_margin()
+                update_portfolio_margin(available)
+
+    effective_lots, sizing_reason = _compute_effective_lots_from_margin(
+        planned_lots=planned_lots,
+        available_margin=available,
+        per_lot_margin=per_lot,
+        buffer=base_buf,
+        tight_buffer=float(MARGIN_TIGHT_BUFFER_MIN),
+    )
+    if effective_lots <= 0:
         update_strategy(
             name,
-            hedge_orders=all_hedge_orders,
-            hedge_target_premium=target_premium,
-            hedge_qty=hedge_qty,
-            hedge_strikes={"PE": pe_hedge.get("strike"), "CE": ce_hedge.get("strike")},
-            message=f"Hedge round {round_idx}/{max_rounds} placed; rechecking margin",
+            status="ERROR",
+            message=(
+                f"MARGIN_NOT_AVAILABLE: no safe lots after hedge/margin check "
+                f"(planned {planned_lots}, available {available}, per_lot {per_lot:.0f}, buffer {base_buf:.0f})"
+            ),
         )
-
-        time.sleep(3)
-        last_available = client.get_available_margin()
-        update_portfolio_margin(last_available)
-        if last_available is not None and float(last_available) >= required_margin:
-            update_strategy(name, message=f"Margin improved ({last_available}); proceeding with straddle")
-            return True
-
-    # Still insufficient after both rounds: keep hedges open and skip strategy.
-    msg = (
-        "MARGIN_NOT_AVAILABLE: margin not available even after two hedge rounds "
-        f"(required {required_margin:.0f}, available {last_available})"
-    )
-    logger.warning("Strategy %s: %s", name, msg)
-    update_strategy(name, status="ERROR", message=msg)
-    return False
+        return False
+    if effective_lots != planned_lots:
+        update_strategy(
+            name,
+            lots=effective_lots,
+            planned_entry_lots=planned_lots,
+            message=sizing_reason,
+        )
+        strategy["lots"] = effective_lots
+    return True
 
 
 def _round_to_tick(price: float, tick_size: float = 0.05) -> float:
@@ -817,6 +970,21 @@ def _catch_up_missed_scheduled_strategies(client: Any, index_config, expiry: str
         _execute_strategy(client, index_config, expiry, strategy, force=False)
 
 
+def _spot_row_is_calm(row: Optional[dict], index_name: str) -> bool:
+    """Match volatility monitor: use stored 5m metrics when present, else is_calmzone flag."""
+    if not row:
+        return False
+    try:
+        rg = row.get("range_5m")
+        rt = row.get("body_range_ratio")
+        if rg is not None and rt is not None:
+            thr = 50.0 if str(index_name or "").upper() == "NIFTY" else 120.0
+            return float(rg) < thr and float(rt) < 0.25
+    except (TypeError, ValueError):
+        pass
+    return bool(int(row.get("is_calmzone") or 0))
+
+
 def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Optional[dict]]:
     """
     Gatekeeper: when to allow entry.
@@ -835,7 +1003,7 @@ def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Op
         latest = fetch_latest_spot_bar_row(index_name)
         if not latest:
             return False, "no_data", None
-        is_calm = bool(int(latest.get("is_calmzone") or 0))
+        is_calm = _spot_row_is_calm(latest, index_name)
         return (True, "calm", latest) if is_calm else (False, "volatile", latest)
 
     if mode == "current_or_prior_calm":
@@ -844,9 +1012,9 @@ def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Op
             return False, "no_data", None
         latest = rows[0]
         prior = rows[1] if len(rows) > 1 else None
-        if bool(int(latest.get("is_calmzone") or 0)):
+        if _spot_row_is_calm(latest, index_name):
             return True, "calm_current", latest
-        if prior and bool(int(prior.get("is_calmzone") or 0)):
+        if prior and _spot_row_is_calm(prior, index_name):
             return True, "calm_prior", prior
         ctx = dict(latest)
         if prior:
@@ -918,7 +1086,7 @@ def _process_waiting_for_calm(client: Any, index_config, expiry: str) -> None:
         else:
             update_strategy(
                 strategy["name"],
-                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
+                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_GATEKEEPER_POLL_SECONDS),
                 message=(
                     f"Waiting for Calm Zone ({reason}; {_calm_gatekeeper_context_blurb(row)})"
                 ),
@@ -951,7 +1119,7 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
             name,
             status="WAITING_FOR_CALM",
             gatekeeper_started_at=gk_started,
-            next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
+            next_gatekeeper_check_at=now_ts + float(CALM_ZONE_GATEKEEPER_POLL_SECONDS),
             message=(
                 "Strategy "
                 + name
@@ -1022,7 +1190,7 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
                 name,
                 status="WAITING_FOR_CALM",
                 gatekeeper_started_at=gk_started,
-                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_POLL_SECONDS),
+                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_GATEKEEPER_POLL_SECONDS),
                 message=(
                     "Strike not in premium range at "
                     + now_dt.strftime("%Y-%m-%d %H:%M:%S IST")
@@ -2495,7 +2663,7 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
             )
 
     schedule.every(3).seconds.do(_monitor_mtm, client=client, index_config=index_config, portfolio_sl=PORTFOLIO_SL_LIMIT)
-    schedule.every(max(1, int(CALM_ZONE_POLL_SECONDS))).seconds.do(
+    schedule.every(max(1, int(CALM_ZONE_GATEKEEPER_POLL_SECONDS))).seconds.do(
         _process_waiting_for_calm, client=client, index_config=index_config, expiry=expiry
     )
     schedule.every(60).seconds.do(_update_available_margin, client=client)

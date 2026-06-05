@@ -213,14 +213,30 @@ PORTFOLIO_SL_LIMIT = -80000.0
 TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "True").lower() in ("true", "1", "yes")
 
 # Margin + hedging configuration
-# Day-based margin requirement per straddle lot pair (CE+PE), plus a safety buffer.
-MARGIN_REQUIRED_PER_LOT_EXPIRY = float(os.getenv("MARGIN_REQUIRED_PER_LOT_EXPIRY", "315000"))
-MARGIN_REQUIRED_PER_LOT_NON_EXPIRY = float(os.getenv("MARGIN_REQUIRED_PER_LOT_NON_EXPIRY", "250000"))
-MARGIN_BUFFER_EXPIRY = float(os.getenv("MARGIN_BUFFER_EXPIRY", "300000"))
-MARGIN_BUFFER_NON_EXPIRY = float(os.getenv("MARGIN_BUFFER_NON_EXPIRY", "300000"))
-# Hedge quantity multipliers by day type.
+# User baseline: one lot ATM short straddle + hedges ~= ₹1.5L.
+MARGIN_REQUIRED_PER_LOT_EXPIRY = float(os.getenv("MARGIN_REQUIRED_PER_LOT_EXPIRY", "150000"))
+MARGIN_REQUIRED_PER_LOT_EXPIRY_SENSEX = float(os.getenv("MARGIN_REQUIRED_PER_LOT_EXPIRY_SENSEX", "150000"))
+MARGIN_REQUIRED_PER_LOT_NON_EXPIRY = float(os.getenv("MARGIN_REQUIRED_PER_LOT_NON_EXPIRY", "150000"))
+MARGIN_BUFFER_EXPIRY = float(os.getenv("MARGIN_BUFFER_EXPIRY", "0"))
+MARGIN_BUFFER_NON_EXPIRY = float(os.getenv("MARGIN_BUFFER_NON_EXPIRY", "0"))
+MARGIN_TIGHT_BUFFER_MIN = float(os.getenv("MARGIN_TIGHT_BUFFER_MIN", "200000"))
+# If margin is at least this (and >= 1-lot requirement), place at least 1 lot instead of skipping.
+MIN_MARGIN_TO_TRADE = float(os.getenv("MIN_MARGIN_TO_TRADE", "2000000"))
+
+
+def margin_required_per_lot_expiry(index_name: Optional[str]) -> float:
+    """Margin per straddle lot (CE+PE) on expiry day; NIFTY vs SENSEX."""
+    name = str(index_name or "").strip().upper()
+    if name == "SENSEX":
+        return float(MARGIN_REQUIRED_PER_LOT_EXPIRY_SENSEX)
+    return float(MARGIN_REQUIRED_PER_LOT_EXPIRY)
+
+
+# Hedge quantity multipliers (legacy; incremental hedges use open-short + planned entry qty).
 HEDGE_QTY_MULTIPLIER_EXPIRY = float(os.getenv("HEDGE_QTY_MULTIPLIER_EXPIRY", "2.0"))
 HEDGE_QTY_MULTIPLIER_NON_EXPIRY = float(os.getenv("HEDGE_QTY_MULTIPLIER_NON_EXPIRY", "1.5"))
+# Before each straddle, buy far-OTM PE+CE hedges for this entry (incremental vs existing hedges).
+HEDGE_ON_EVERY_STRATEGY = os.getenv("HEDGE_ON_EVERY_STRATEGY", "True").lower() in ("true", "1", "yes")
 # ITM strikes away from ATM for expiry days (NIFTY: 2 → 25100 CE / 25300 PE @ spot 25200; SENSEX: 3). Non-expiry uses ATM.
 ITM_STRIKES_NIFTY = int(os.getenv("ITM_STRIKES_NIFTY", "1"))
 ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "2"))
@@ -290,6 +306,10 @@ CALM_ZONE_GATEKEEPER_MODE = os.getenv("CALM_ZONE_GATEKEEPER_MODE", "current_or_p
 CALM_ZONE_RECENT_CALM_MINUTES = int(os.getenv("CALM_ZONE_RECENT_CALM_MINUTES", "12"))
 CALM_ZONE_WAIT_TIMEOUT_MINUTES = int(os.getenv("CALM_ZONE_WAIT_TIMEOUT_MINUTES", "30"))
 CALM_ZONE_POLL_SECONDS = int(os.getenv("CALM_ZONE_POLL_SECONDS", "60"))
+# How often WAITING_FOR_CALM strategies re-check (match xts-bot-lite default 15s).
+CALM_ZONE_GATEKEEPER_POLL_SECONDS = int(
+    os.getenv("CALM_ZONE_GATEKEEPER_POLL_SECONDS", "15")
+)
 # Stop revising OHLC for bars older than this many seconds (vendor bar_unix vs wall clock). 0 = off.
 CALM_ZONE_OHLC_FREEZE_AFTER_SEC = int(os.getenv("CALM_ZONE_OHLC_FREEZE_AFTER_SEC", "300"))
 # OHLC pull window for calm zone: unset or empty = from today's cash open (09:15 IST) through now
