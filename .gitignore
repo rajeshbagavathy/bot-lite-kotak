@@ -37,6 +37,7 @@ trades.db
 # Logs
 *.log
 bot.log
+trade_journal.jsonl
 bot_test.log
 nohup.out
 

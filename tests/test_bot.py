@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import bot
 from config import IndexConfig, StrategyConfig
+from trading.context import STRATEGY_STATE
 
 
 class TestPickIndexAndExpiry(unittest.TestCase):
@@ -329,10 +330,11 @@ class TestExecuteStrategy(unittest.TestCase):
         
         mock_get_atm.assert_not_called()
 
+    @patch("bot.should_execute_now", return_value=(True, "calm", {}))
     @patch("bot.fetch_last_two_spot_bar_rows")
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
-    def test_spot_ltp_unavailable(self, mock_get_atm, mock_update, mock_two):
+    def test_spot_ltp_unavailable(self, mock_get_atm, mock_update, mock_two, _mock_gate):
         """Test error handling when spot LTP is unavailable."""
         mock_two.return_value = [
             {"bar_time": "2026-04-08 09:20:00", "bar_unix": 1, "is_calmzone": 1},
@@ -345,10 +347,11 @@ class TestExecuteStrategy(unittest.TestCase):
         
         mock_update.assert_called_once_with("S0920", status="ERROR", message="Spot LTP unavailable")
 
+    @patch("bot.should_execute_now", return_value=(True, "calm", {}))
     @patch("bot.fetch_last_two_spot_bar_rows")
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
-    def test_option_instruments_not_found(self, mock_get_atm, mock_update, mock_two):
+    def test_option_instruments_not_found(self, mock_get_atm, mock_update, mock_two, _mock_gate):
         """Test error handling when option instruments not found."""
         mock_two.return_value = [
             {"bar_time": "2026-04-08 09:20:00", "bar_unix": 1, "is_calmzone": 1},
@@ -362,9 +365,11 @@ class TestExecuteStrategy(unittest.TestCase):
         
         mock_update.assert_called_once_with("S0920", status="ERROR", message="Option instruments not found")
 
-    @patch("bot.fetch_last_two_spot_bar_rows")
+    @patch("bot.should_execute_now", return_value=(True, "calm", {}))
+    @patch("trading.strategy.executor.get_trading_flag_or", return_value=False)
     @patch("bot._place_leg_sl_orders")
     @patch("bot._get_filled_orders")
+    @patch("bot._verify_sl_orders_live", return_value=(True, "sl_verified_in_order_book"))
     @patch("bot._ensure_margin_or_skip_strategy", return_value=True)
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
@@ -372,13 +377,9 @@ class TestExecuteStrategy(unittest.TestCase):
     @patch("time.sleep")
     @patch("datetime.datetime")
     def test_successful_strategy_execution(
-        self, mock_dt, mock_sleep, mock_time, mock_get_atm, mock_update, mock_ensure_margin, mock_filled, mock_place_sl, mock_two
+        self, mock_dt, mock_sleep, mock_time, mock_get_atm, mock_update, mock_ensure_margin, mock_verify, mock_filled, mock_place_sl, _mock_flag, _mock_gate
     ):
         """Test successful strategy execution."""
-        mock_two.return_value = [
-            {"bar_time": "2026-04-08 09:20:00", "bar_unix": 1, "is_calmzone": 1},
-            {"bar_time": "2026-04-08 09:19:00", "bar_unix": 0, "is_calmzone": 1},
-        ]
         mock_dt.now.return_value.strftime.return_value = "09:20:01"
         mock_dt.now.return_value.isoformat.return_value = "2026-02-08T09:20:01"
         mock_get_atm.return_value = 21900
@@ -409,7 +410,7 @@ class TestExecuteStrategy(unittest.TestCase):
                 "ProductType": "MIS",
             },
         ]
-        mock_place_sl.return_value = ([], {})  # Return tuple: (sl_orders, tag_map)
+        mock_place_sl.return_value = ([{"app_order_id": 2001, "tag": "t"}], {"t": 12345})
         
         strategy = {
             "status": "PENDING",
@@ -568,7 +569,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
         self, mock_is_expiry, mock_update_port_margin, mock_update_strategy
     ):
         strat = {"name": "S_BIG", "lots": 15}
-        self.client.get_available_margin.return_value = 5_100_000.0
+        self.client.get_available_margin.return_value = 2_350_000.0
         result = bot._ensure_margin_or_skip_strategy(
             self.client,
             self.index_config,
@@ -2129,52 +2130,50 @@ class TestCalmZoneGatekeeper(unittest.TestCase):
         self.assertEqual(reason, "no_data")
         self.assertIsNone(row)
 
-    @patch("bot.get_ist_now")
+    @patch("trading.strategy.gatekeeper.get_ist_now")
     @patch("bot.logger")
     @patch("bot.update_strategy")
     @patch("bot.should_execute_now")
     @patch("bot._execute_strategy")
     @patch("bot.CALM_ZONE_WAIT_TIMEOUT_MINUTES", 30)
-    @patch("bot.CALM_ZONE_POLL_SECONDS", 60)
+    @patch("bot.CALM_ZONE_GATEKEEPER_POLL_SECONDS", 60)
     def test_waiting_strategy_executes_when_calm(
         self, mock_exec, mock_gate, mock_update, _mock_logger, mock_now
     ):
         now = datetime.datetime(2026, 4, 8, 9, 31, 0)
         mock_now.return_value = now
         mock_gate.return_value = (True, "calm", {"bar_time": "2026-04-08 09:30:00"})
-        bot.STRATEGY_STATE = {
-            "N_W_0921": {
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE["N_W_0921"] = {
                 "name": "N_W_0921",
                 "status": "WAITING_FOR_CALM",
                 "gatekeeper_started_at": "2026-04-08T09:21:00",
                 "next_gatekeeper_check_at": now.timestamp() - 1,
             }
-        }
-        strategy = bot.STRATEGY_STATE["N_W_0921"]
+        strategy = STRATEGY_STATE["N_W_0921"]
         bot._process_waiting_for_calm(self.client, self.index_config, "10APR2026")
         mock_exec.assert_called_once_with(self.client, self.index_config, "10APR2026", strategy, force=True)
         self.assertTrue(mock_update.call_count >= 1)
 
-    @patch("bot.get_ist_now")
+    @patch("trading.strategy.gatekeeper.get_ist_now")
     @patch("bot.logger")
     @patch("bot.update_strategy")
     @patch("bot.should_execute_now")
     @patch("bot.CALM_ZONE_WAIT_TIMEOUT_MINUTES", 30)
-    @patch("bot.CALM_ZONE_POLL_SECONDS", 60)
+    @patch("bot.CALM_ZONE_GATEKEEPER_POLL_SECONDS", 60)
     def test_waiting_strategy_skips_after_timeout(
         self, mock_gate, mock_update, _mock_logger, mock_now
     ):
         now = datetime.datetime(2026, 4, 8, 10, 0, 0)
         mock_now.return_value = now
         mock_gate.return_value = (False, "volatile", {"bar_time": "2026-04-08 09:59:00"})
-        bot.STRATEGY_STATE = {
-            "N_W_0921": {
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE["N_W_0921"] = {
                 "name": "N_W_0921",
                 "status": "WAITING_FOR_CALM",
                 "gatekeeper_started_at": "2026-04-08T09:21:00",
                 "next_gatekeeper_check_at": now.timestamp() - 1,
             }
-        }
         bot._process_waiting_for_calm(self.client, self.index_config, "10APR2026")
         last_args = mock_update.call_args_list[-1]
         self.assertEqual(last_args.args[0], "N_W_0921")

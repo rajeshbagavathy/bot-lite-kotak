@@ -467,6 +467,7 @@ DASHBOARD_TEMPLATE = """
       <button class="tab-btn" onclick="switchTab(event, 'mtm')">MTM Snapshots</button>
       <button class="tab-btn" onclick="switchTab(event, 'volatility')">Volatility Monitor</button>
       <button class="tab-btn" onclick="switchTab(event, 'botlog')">Bot log</button>
+      <button class="tab-btn" onclick="switchTab(event, 'journal')">Trade Journal</button>
     </div>
 
     <div id="overview" class="tab-content active">
@@ -644,6 +645,23 @@ DASHBOARD_TEMPLATE = """
       <pre id="bot-log-pre" class="log-view">Loading...</pre>
     </div>
 
+    <div id="journal" class="tab-content">
+      <div class="card" style="margin-bottom: 12px;">
+        <div class="card-title">Trade journal — per-strategy lifecycle</div>
+        <p class="meta-label" style="margin-bottom: 8px;">
+          Structured events from <span id="journal-path">—</span>. Flow:
+          SLOTTED → WAITING_FOR_CALM / CALM_CHECK → CALM_PASSED → STRIKE_SELECTED → MARGIN_CHECK → HEDGE → LOTS_SIZED → ENTRY → SL → PROTECTED.
+        </p>
+        <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+          <label>Strategy <select id="journal-strategy-filter" style="padding:4px 8px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:4px;"><option value="__all__">All</option></select></label>
+          <label>Lines <select id="journal-lines" style="padding:4px 8px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:4px;"><option value="500">500</option><option value="1000" selected>1000</option><option value="2000">2000</option></select></label>
+          <button type="button" class="tab-btn" id="journal-refresh" style="padding:6px 12px;">Refresh</button>
+        </div>
+        <p class="meta-label" id="journal-meta">—</p>
+      </div>
+      <div id="journal-content"><p class="meta-label">Loading journal…</p></div>
+    </div>
+
     <div class="refresh-time">Last updated: <span id="update-time">-</span> (Auto-refresh every 2 seconds)</div>
   </div>
 
@@ -696,6 +714,65 @@ DASHBOARD_TEMPLATE = """
       if (tabName === 'volatility' && window.__volatilityChart) {
         setTimeout(function() { try { window.__volatilityChart.resize(); } catch (e) {} }, 80);
       }
+    }
+
+    function journalPhaseClass(phase) {
+      const p = String(phase || '').toUpperCase();
+      if (p.indexOf('SLOTTED') >= 0) return 'background:#4c1d95;color:#ede9fe;';
+      if (p.indexOf('WAIT') >= 0 || p.indexOf('CALM') >= 0) return 'background:#1e3a5f;color:#bfdbfe;';
+      if (p.indexOf('ENTRY') >= 0 || p.indexOf('STRIKE') >= 0 || p.indexOf('MARGIN') >= 0 || p.indexOf('HEDGE') >= 0 || p.indexOf('LOTS') >= 0) return 'background:#1e40af;color:#dbeafe;';
+      if (p.indexOf('SL') >= 0 || p === 'PROTECTED') return 'background:#065f46;color:#d1fae5;';
+      if (p.indexOf('FLATTEN') >= 0 || p.indexOf('ABORT') >= 0 || p.indexOf('FAIL') >= 0 || p.indexOf('MISSING') >= 0) return 'background:#7f1d1d;color:#fecaca;';
+      if (p.indexOf('SKIP') >= 0) return 'background:#78350f;color:#fde68a;';
+      return 'background:#475569;color:#f1f5f9;';
+    }
+
+    function renderJournalTab(journalData, stateStrategies) {
+      const pathEl = document.getElementById('journal-path');
+      const metaEl = document.getElementById('journal-meta');
+      const contentEl = document.getElementById('journal-content');
+      const filterEl = document.getElementById('journal-strategy-filter');
+      if (!contentEl) return;
+      const data = journalData || {};
+      if (pathEl) pathEl.textContent = data.path || '—';
+      const events = data.events || [];
+      if (metaEl) metaEl.textContent = (data.count || 0) + ' events in tail';
+      if (filterEl && data.strategies) {
+        const cur = filterEl.value;
+        const opts = '<option value="__all__">All</option>' + data.strategies.map(function(s) {
+          return '<option value="' + escHtml(s) + '">' + escHtml(s) + '</option>';
+        }).join('');
+        if (filterEl.innerHTML !== opts) filterEl.innerHTML = opts;
+        if (cur) filterEl.value = cur;
+      }
+      const filt = filterEl ? filterEl.value : '__all__';
+      const filtered = filt && filt !== '__all__' ? events.filter(function(e) { return e.strategy === filt; }) : events;
+      if (!filtered.length) {
+        contentEl.innerHTML = '<p class="meta-label">No journal events yet. Events appear when strategies reach their slot.</p>';
+        return;
+      }
+      const byStrat = {};
+      filtered.forEach(function(ev) {
+        const k = ev.strategy || '(system)';
+        if (!byStrat[k]) byStrat[k] = [];
+        byStrat[k].push(ev);
+      });
+      let html = '';
+      Object.keys(byStrat).sort().forEach(function(strat) {
+        const st = (stateStrategies || {})[strat] || {};
+        html += '<div style="margin-bottom:20px;"><div style="padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;margin-bottom:8px;"><strong>' + escHtml(strat) + '</strong> · status ' + escHtml(st.status || '—') + (st.message ? ' · ' + escHtml(String(st.message).slice(0,120)) : '') + '</div>';
+        html += '<table class="data-table"><thead><tr><th>Time</th><th>Phase</th><th>Message</th><th>Details</th></tr></thead><tbody>';
+        byStrat[strat].forEach(function(ev) {
+          const det = ev.details ? JSON.stringify(ev.details, null, 0) : '';
+          const sev = ev.severity === 'ERROR' || ev.severity === 'CRITICAL' ? 'color:#fca5a5;' : (ev.severity === 'WARNING' ? 'color:#fcd34d;' : '');
+          html += '<tr><td style="white-space:nowrap;font-size:11px;">' + escHtml(ev.ts || '') + '</td>';
+          html += '<td><span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;' + journalPhaseClass(ev.phase) + '">' + escHtml(ev.phase || '') + '</span></td>';
+          html += '<td style="' + sev + '">' + escHtml(ev.message || '') + '</td>';
+          html += '<td style="font-family:monospace;font-size:10px;color:#94a3b8;max-width:420px;word-break:break-word;">' + escHtml(det.length > 300 ? det.slice(0,297) + '…' : det) + '</td></tr>';
+        });
+        html += '</tbody></table></div>';
+      });
+      contentEl.innerHTML = html;
     }
 
     function buildCalmMarkAreas(rowsAsc) {
@@ -915,7 +992,11 @@ DASHBOARD_TEMPLATE = """
         const showFullLog = document.getElementById('bot-log-show-full')?.checked;
         const logMode = showFullLog ? 'all' : 'survivor';
         const noCache = { cache: 'no-store', credentials: 'same-origin' };
-        const [state, strategies, positions, orders, trades, mtm, volmon, botlog] = await Promise.all([
+        const journalLines = document.getElementById('journal-lines')?.value || '1000';
+        const journalStrategy = document.getElementById('journal-strategy-filter')?.value || '';
+        const journalQs = 'lines=' + encodeURIComponent(journalLines)
+          + (journalStrategy && journalStrategy !== '__all__' ? '&strategy=' + encodeURIComponent(journalStrategy) : '');
+        const [state, strategies, positions, orders, trades, mtm, volmon, botlog, journal] = await Promise.all([
           fetch('/state', noCache).then(r => r.json()),
           fetch('/api/strategies', noCache).then(r => r.json()),
           fetch('/api/positions', noCache).then(r => r.json()),
@@ -924,6 +1005,7 @@ DASHBOARD_TEMPLATE = """
           fetch('/api/mtm', noCache).then(r => r.json()),
           fetch('/api/volatility-monitor?page=' + encodeURIComponent(__volatilityPage) + '&page_size=' + encodeURIComponent(__volatilityPageSize), noCache).then(r => r.json()),
           fetch('/api/bot-log?lines=2500&mode=' + encodeURIComponent(logMode) + '&_=' + Date.now(), noCache).then(r => r.json()),
+          fetch('/api/trade-journal?' + journalQs, noCache).then(r => r.json()).catch(function() { return { events: [] }; }),
         ]);
 
         const portfolio = state.portfolio || {};
@@ -1401,6 +1483,23 @@ DASHBOARD_TEMPLATE = """
         if (logShowFull && !logShowFull.dataset.bound) {
           logShowFull.dataset.bound = '1';
           logShowFull.addEventListener('change', function() { loadDashboard(); });
+        }
+
+        renderJournalTab(journal, stateStrategies);
+        const journalRefresh = document.getElementById('journal-refresh');
+        if (journalRefresh && !journalRefresh.dataset.bound) {
+          journalRefresh.dataset.bound = '1';
+          journalRefresh.addEventListener('click', function() { loadDashboard(); });
+        }
+        const journalFilter = document.getElementById('journal-strategy-filter');
+        if (journalFilter && !journalFilter.dataset.bound) {
+          journalFilter.dataset.bound = '1';
+          journalFilter.addEventListener('change', function() { loadDashboard(); });
+        }
+        const journalLinesEl = document.getElementById('journal-lines');
+        if (journalLinesEl && !journalLinesEl.dataset.bound) {
+          journalLinesEl.dataset.bound = '1';
+          journalLinesEl.addEventListener('change', function() { loadDashboard(); });
         }
 
         document.getElementById('update-time').textContent = new Date().toLocaleTimeString();
@@ -1908,6 +2007,35 @@ def create_app(username: str, password: str) -> Flask:
         if mode not in ("survivor", "all"):
             mode = "survivor"
         return jsonify(read_bot_log_tail(max_lines=n, mode=mode))
+
+    @app.route("/api/trade-journal")
+    @basic_auth.required
+    def api_trade_journal():
+        """Structured per-strategy lifecycle events (trade_journal.jsonl)."""
+        from flask import request
+
+        from trading.journal import journal_path, read_tail
+
+        try:
+            n = int(request.args.get("lines", "500"))
+        except ValueError:
+            n = 500
+        n = max(10, min(n, 5000))
+        strategy = (request.args.get("strategy") or "").strip() or None
+        events = read_tail(n, strategy=strategy)
+        by_strategy: dict = {}
+        for ev in events:
+            key = str(ev.get("strategy") or "")
+            by_strategy.setdefault(key, []).append(ev)
+        return jsonify(
+            {
+                "events": events,
+                "by_strategy": by_strategy,
+                "strategies": sorted(k for k in by_strategy.keys() if k),
+                "path": journal_path(),
+                "count": len(events),
+            }
+        )
 
     # Flask/Werkzeug: access lines must not hit bot.log (see silence_werkzeug_http_access_log docstring).
     ensure_http_access_not_logged()

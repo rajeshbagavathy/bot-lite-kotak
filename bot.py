@@ -76,6 +76,12 @@ def _configure_bot_logging() -> None:
 
 _configure_bot_logging()
 
+from trading.journal import init_journal, Phase, record as journal_record
+from trading.context import STRATEGY_STATE
+from trading.strategy.executor import execute_strategy as _execute_strategy_modular
+from trading.strategy.gatekeeper import process_waiting_for_calm as _process_waiting_for_calm_modular
+from trading.orders.sl import verify_sl_orders_live as _verify_sl_orders_live
+
 from config import (
     INDEX_CONFIGS,
     HEDGE_PREMIUM_MAX_EXPIRY,
@@ -221,10 +227,11 @@ def _merge_restored_strategy(restored_strategy: dict) -> Dict[str, Any]:
 
 def _load_strategy_state(client: Any, index_config) -> None:
     """Build STRATEGY_STATE for today's index and push to UI snapshot."""
-    global STRATEGY_STATE
-    STRATEGY_STATE = {
+    new_state = {
         cfg.name: _strategy_state_entry(cfg) for cfg in get_today_strategies(index_config.name)
     }
+    STRATEGY_STATE.clear()
+    STRATEGY_STATE.update(new_state)
     restore_order_book: Optional[List[dict]] = None
     if client is not None:
         try:
@@ -1032,395 +1039,16 @@ def should_execute_now(strategy_id: str, index_name: str) -> Tuple[bool, str, Op
 
 
 def _process_waiting_for_calm(client: Any, index_config, expiry: str) -> None:
-    """Non-blocking retry path for strategies waiting on calm zone."""
-    now = get_ist_now()
-    now_ts = now.timestamp()
-    for strategy in STRATEGY_STATE.values():
-        if strategy.get("status") != "WAITING_FOR_CALM":
-            continue
-        started_at = strategy.get("gatekeeper_started_at")
-        if not started_at:
-            started_at = now.isoformat(timespec="seconds")
-            update_strategy(strategy["name"], gatekeeper_started_at=started_at)
-        try:
-            started_dt = datetime.datetime.fromisoformat(str(started_at))
-        except ValueError:
-            started_dt = now
-        elapsed_min = (now - started_dt).total_seconds() / 60.0
-        if elapsed_min > float(CALM_ZONE_WAIT_TIMEOUT_MINUTES):
-            msg = (
-                f"Strategy {strategy['name']} SKIPPED: No calm zone found within "
-                f"{CALM_ZONE_WAIT_TIMEOUT_MINUTES}-minute window."
-            )
-            logger.warning(msg)
-            update_strategy(
-                strategy["name"],
-                status="SKIPPED_VOLATILITY",
-                message=msg,
-                skip_reason="NO_CALM_ZONE_TIMEOUT",
-                gatekeeper_started_at=None,
-                next_gatekeeper_check_at=None,
-            )
-            db_id = strategy.get("db_id")
-            if db_id:
-                mark_strategy_skipped_volatility_db(
-                    int(db_id), strategy["name"], "NO_CALM_ZONE_TIMEOUT"
-                )
-            continue
-        next_check_at = strategy.get("next_gatekeeper_check_at") or 0
-        try:
-            next_check_at_f = float(next_check_at)
-        except (TypeError, ValueError):
-            next_check_at_f = 0.0
-        if now_ts < next_check_at_f:
-            continue
-        can_run, reason, row = should_execute_now(strategy["name"], index_config.name)
-        if can_run:
-            update_strategy(
-                strategy["name"],
-                gatekeeper_started_at=None,
-                next_gatekeeper_check_at=None,
-                message=f"Calm Zone detected ({reason}); executing delayed strategy.",
-            )
-            _execute_strategy(client, index_config, expiry, strategy, force=True)
-        else:
-            update_strategy(
-                strategy["name"],
-                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_GATEKEEPER_POLL_SECONDS),
-                message=(
-                    f"Waiting for Calm Zone ({reason}; {_calm_gatekeeper_context_blurb(row)})"
-                ),
-            )
+    """Non-blocking retry path for strategies waiting on calm zone (modular + journal)."""
+    _process_waiting_for_calm_modular(client, index_config, expiry, _execute_strategy)
 
 
 def _execute_strategy(client: Any, index_config, expiry: str, strategy, force: bool = False) -> None:
-    if strategy["status"] not in ("PENDING", "ERROR", "WAITING_FOR_CALM"):
-        return
-    if not force and get_ist_now().strftime("%H:%M:%S") < strategy["time"]:
-        return
-
-    name = strategy["name"]
-    if not _STRATEGY_EXEC_LOCK.acquire(blocking=False):
-        logger.info("Strategy %s: another entry is in progress — skipping duplicate run", name)
-        return
-    try:
-        _execute_strategy_locked(client, index_config, expiry, strategy, force=force)
-    finally:
-        _STRATEGY_EXEC_LOCK.release()
+    """Delegate to trading.strategy.executor (journal + SL lifecycle)."""
+    _execute_strategy_modular(client, index_config, expiry, strategy, force=force)
 
 
-def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, force: bool = False) -> None:
-    name = strategy["name"]
-    can_run, gate_reason, gate_row = should_execute_now(name, index_config.name)
-    if not can_run:
-        now_ts = get_ist_now().timestamp()
-        gk_started = strategy.get("gatekeeper_started_at") or _gatekeeper_window_start_iso(strategy)
-        update_strategy(
-            name,
-            status="WAITING_FOR_CALM",
-            gatekeeper_started_at=gk_started,
-            next_gatekeeper_check_at=now_ts + float(CALM_ZONE_GATEKEEPER_POLL_SECONDS),
-            message=(
-                "Strategy "
-                + name
-                + " waiting for Calm Zone. Volatility detected."
-                + (
-                    f" (reason={gate_reason}, {_calm_gatekeeper_context_blurb(gate_row)})"
-                    if gate_row
-                    else f" (reason={gate_reason})"
-                )
-            ),
-        )
-        sid = upsert_strategy_waiting_for_calm(
-            name,
-            int(strategy.get("lots") or 0),
-            float(strategy.get("leg_sl_pct") or 0.0),
-            float(strategy.get("strategy_sl") or 0.0),
-            gk_started,
-            int(strategy["db_id"]) if strategy.get("db_id") else None,
-        )
-        if sid > 0:
-            update_strategy(name, db_id=sid)
-        logger.info("Strategy %s waiting for Calm Zone. Volatility detected.", name)
-        return
-    if strategy.get("status") == "WAITING_FOR_CALM":
-        update_strategy(name, message="Calm Zone found; executing delayed strategy.")
-
-    is_expiry = _is_expiry_day(expiry)
-    atm_strike = _get_atm_strike(client, index_config)
-    if atm_strike is None:
-        update_strategy(name, status="ERROR", message="Spot LTP unavailable")
-        return
-
-    strike_diff = int(index_config.strike_diff)
-    use_premium_strike = get_trading_flag_or(
-        "use_premium_based_strike", USE_PREMIUM_BASED_STRIKE
-    ) and not is_expiry
-    if use_premium_strike:
-        # Premium-based: find CE and PE strikes whose LTP is in target±buffer, closest to target.
-        if index_config.name == "NIFTY":
-            target, buffer = STRIKE_PREMIUM_TARGET_NIFTY, STRIKE_PREMIUM_BUFFER_NIFTY
-        else:
-            target, buffer = STRIKE_PREMIUM_TARGET_SENSEX, STRIKE_PREMIUM_BUFFER_SENSEX
-        min_p = target - buffer
-        max_p = target + buffer
-
-        ce_result = _find_strike_by_premium(
-            client, index_config, expiry, "CE", atm_strike, target, min_p, max_p
-        )
-        pe_result = _find_strike_by_premium(
-            client, index_config, expiry, "PE", atm_strike, target, min_p, max_p
-        )
-        if ce_result is None or pe_result is None:
-            now_dt = get_ist_now()
-            now_ts = now_dt.timestamp()
-            gk_started = strategy.get("gatekeeper_started_at") or _gatekeeper_window_start_iso(
-                strategy
-            )
-            logger.warning(
-                "Strategy %s: no CE/PE in premium band ₹%.0f–₹%.0f (target ₹%.0f, ATM %s); "
-                "retrying within calm-zone window",
-                name,
-                min_p,
-                max_p,
-                target,
-                atm_strike,
-            )
-            update_strategy(
-                name,
-                status="WAITING_FOR_CALM",
-                gatekeeper_started_at=gk_started,
-                next_gatekeeper_check_at=now_ts + float(CALM_ZONE_GATEKEEPER_POLL_SECONDS),
-                message=(
-                    "Strike not in premium range at "
-                    + now_dt.strftime("%Y-%m-%d %H:%M:%S IST")
-                    + f" (CE in range: {ce_result is not None}, PE in range: {pe_result is not None}); "
-                    + f"retrying within {CALM_ZONE_WAIT_TIMEOUT_MINUTES}-minute Calm Zone window."
-                ),
-            )
-            sid = upsert_strategy_waiting_for_calm(
-                name,
-                int(strategy.get("lots") or 0),
-                float(strategy.get("leg_sl_pct") or 0.0),
-                float(strategy.get("strategy_sl") or 0.0),
-                gk_started,
-                int(strategy["db_id"]) if strategy.get("db_id") else None,
-            )
-            if sid > 0:
-                update_strategy(name, db_id=sid)
-            return
-        ce_strike, ce_id = ce_result
-        pe_strike, pe_id = pe_result
-    else:
-        if is_expiry and get_trading_flag_or("use_premium_based_strike", USE_PREMIUM_BASED_STRIKE):
-            logger.info(
-                "Strategy %s: expiry day — using ITM/ATM strikes (premium band skipped on expiry)",
-                name,
-            )
-        # ATM/ITM-based (legacy).
-        if is_expiry:
-            n = int(ITM_STRIKES_SENSEX) if index_config.name == "SENSEX" else int(ITM_STRIKES_NIFTY)
-            ce_strike = atm_strike - n * strike_diff
-            pe_strike = atm_strike + n * strike_diff
-        else:
-            ce_strike = pe_strike = atm_strike
-        ce_id = client.get_option_instrument_id(index_config, expiry, "CE", ce_strike)
-        pe_id = client.get_option_instrument_id(index_config, expiry, "PE", pe_strike)
-        if not ce_id or not pe_id:
-            logger.warning(
-                "Strategy %s: option instruments not found (CE %s / PE %s, expiry %s)",
-                name,
-                ce_strike,
-                pe_strike,
-                expiry,
-            )
-            update_strategy(name, status="ERROR", message="Option instruments not found")
-            return
-        logger.info(
-            "Strategy %s: expiry ITM strikes CE=%s (id %s) PE=%s (id %s) ATM=%s",
-            name,
-            ce_strike,
-            ce_id,
-            pe_strike,
-            pe_id,
-            atm_strike,
-        )
-
-    # Pre-check margin; if low, buy far-OTM hedges first and refresh.
-    if not _ensure_margin_or_skip_strategy(client, index_config, expiry, strategy, atm_strike):
-        st = STRATEGY_STATE.get(name, {})
-        logger.warning(
-            "Strategy %s: margin gate blocked entry — %s",
-            name,
-            st.get("message") or "margin check failed",
-        )
-        return
-
-    effective_lots = int(strategy["lots"])
-    effective_leg_sl_pct = float(strategy["leg_sl_pct"])
-    qty = effective_lots * index_config.lot_size
-    ce_tag = f"{name}_CE_SELL_{int(time.time())}"
-    pe_tag = f"{name}_PE_SELL_{int(time.time())}"
-
-    entry_ltps = client.get_ltp_map(
-        [
-            {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": int(ce_id)},
-            {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": int(pe_id)},
-        ]
-    )
-
-    placed_entry = []
-    for instrument_id, tag in [(ce_id, ce_tag), (pe_id, pe_tag)]:
-        order_id = client.place_market_order(
-            index_config=index_config,
-            instrument_id=instrument_id,
-            order_side=client.interactive.TRANSACTION_TYPE_SELL,
-            quantity=qty,
-            tag=tag,
-            product_type=client.interactive.PRODUCT_MIS,
-            ltp=entry_ltps.get(int(instrument_id)),
-        )
-        if order_id:
-            placed_entry.append({"app_order_id": order_id, "tag": tag, "instrument_id": int(instrument_id)})
-        else:
-            # Rollback any already placed entry order to avoid a naked leg.
-            for placed in placed_entry:
-                try:
-                    client.cancel_order(placed["app_order_id"], placed["tag"])
-                except Exception:
-                    logger.exception("Failed to cancel entry order %s", placed)
-
-            try:
-                positions = client.get_positions()
-                _close_positions_for_instruments(
-                    client,
-                    index_config,
-                    positions,
-                    [p["instrument_id"] for p in placed_entry],
-                )
-            except Exception:
-                logger.exception("Failed to rollback partial straddle for %s", name)
-
-            logger.warning(
-                "Strategy %s: entry order placement failed (CE id %s / PE id %s); check Kotak place_order logs",
-                name,
-                ce_id,
-                pe_id,
-            )
-            update_strategy(name, status="ERROR", message="Entry order placement failed (margin/blocked)")
-            return
-
-    for placed in placed_entry:
-        log_order(
-            name,
-            int(placed["app_order_id"]),
-            str(placed["tag"]),
-            int(placed["instrument_id"]),
-            "",
-            qty,
-            "LIMIT",
-            "SELL",
-        )
-
-    update_strategy(
-        name,
-        status="OPEN",
-        strike=atm_strike,
-        strike_ce=ce_strike,
-        strike_pe=pe_strike,
-        instrument_ids=[ce_id, pe_id],
-        entry_time=get_ist_timestamp(),
-        order_tags=[ce_tag, pe_tag],
-    )
-
-    # Log strategy execution to database
-    existing_id = strategy.get("db_id")
-    strategy_db_id = log_strategy_execution(
-        name,
-        atm_strike,
-        get_ist_timestamp(),
-        effective_lots,
-        effective_leg_sl_pct,
-        strategy.get("strategy_sl", 0.0),
-        existing_db_id=int(existing_id) if existing_id else None,
-    )
-    update_strategy(name, db_id=strategy_db_id)
-
-    time.sleep(5)
-    # Wait for entry orders to get filled (or partially filled) before placing SLs.
-    # This loop is resilient to slower fills and avoids missing SL placement.
-    filled: List[dict] = []
-    entry_app_order_ids = [int(p["app_order_id"]) for p in placed_entry if p.get("app_order_id") is not None]
-    max_wait_seconds = 45
-    poll_interval = 3
-    max_attempts = max(1, int(max_wait_seconds // poll_interval))
-    attempts = 0
-
-    while True:
-        try:
-            order_book = client.get_order_book()
-        except Exception as e:
-            logger.error("Failed to fetch order book while waiting for fills: %s", e)
-            break
-
-        filled = _get_filled_orders(order_book, entry_app_order_ids)
-        if len(filled) >= 2:
-            for order in filled:
-                oid = order.get("AppOrderID")
-                price = order.get("OrderAverageTradedPrice")
-                if oid is not None:
-                    update_order_status(app_order_id=int(oid), status="Filled", traded_price=float(price) if price is not None else None)
-            break
-
-        attempts += 1
-        if attempts >= max_attempts:
-            break
-
-        time.sleep(poll_interval)
-
-    if not filled:
-        logger.warning(
-            "No filled entry orders found for strategy %s (app_order_ids=%s); "
-            "SKIPPING SL placement for now.",
-            name,
-            entry_app_order_ids,
-        )
-        # Still update positions/DB if any eventually appear via other flows,
-        # but we can't place SLs safely without fills.
-        return
-
-    sl_orders, tag_to_instrument = _place_leg_sl_orders(client, index_config, filled, effective_leg_sl_pct, name)
-    positions = []
-    for order in filled:
-        try:
-            instrument_id = int(order.get("ExchangeInstrumentID", 0))
-            quantity = -abs(int(order.get("OrderQuantity", 0)))
-            entry_price = float(order.get("OrderAverageTradedPrice", 0.0))
-        except (TypeError, ValueError):
-            continue
-        # Target price: close leg when LTP reaches this (65% profit on executed sell premium = entry_price)
-        target_price = round(entry_price * (1 - LEG_TARGET_PCT / 100.0), 2)
-        positions.append(
-            {
-                "instrument_id": instrument_id,
-                "quantity": quantity,
-                "entry_price": entry_price,
-                "target_price": target_price,
-                "exit_price": None,
-                "symbol": order.get("TradingSymbol"),
-            }
-        )
-        # Log position to database
-        if strategy["db_id"] and strategy["db_id"] > 0:
-            log_position(
-                strategy["db_id"],
-                order.get("TradingSymbol"),
-                instrument_id,
-                quantity,
-                entry_price,
-                get_ist_timestamp(),
-            )
-    update_strategy(name, sl_orders=sl_orders, positions=positions, sl_tag_map=tag_to_instrument)
+# Legacy inline executor removed — see trading/strategy/executor.py
 
 
 def _place_close_order(client: Any, index_config, pos: dict, tag_prefix: str) -> None:
@@ -2524,7 +2152,6 @@ def _update_available_margin(client: Any) -> None:
         logger.debug("Available margin updated: %s", available_margin)
 
 
-STRATEGY_STATE: Dict[str, dict] = {}
 
 # Scheduler observability (main thread / schedule library)
 _MAIN_LOOP_LAST_TICK: float = 0.0
@@ -2786,6 +2413,7 @@ def _retry_pick_expiry(client: Any, auth: dict) -> None:
 
 
 def main() -> None:
+    init_journal()
     init_db()
     if DEMO_MODE:
         logger.debug("DEMO MODE - Simulated data")
@@ -2832,8 +2460,8 @@ def main() -> None:
     cleanup_previous_day_data()
 
     # Build today's strategy plan (per index) and STRATEGY_STATE
-    global STRATEGY_STATE, _MAIN_LOOP_LAST_TICK
-    STRATEGY_STATE = {}
+    global _MAIN_LOOP_LAST_TICK
+    STRATEGY_STATE.clear()
     if index_config is not None:
         _load_strategy_state(client, index_config)
 

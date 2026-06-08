@@ -1,0 +1,26 @@
+[run]
+source =
+    trading.journal
+    trading.compat
+    trading.state_bridge
+    trading.context
+    trading.orders.lifecycle
+    trading.orders.book
+    trading.orders.sl
+    trading.orders.close
+    trading.strategy.gatekeeper
+    trading.strategy.margin
+    trading.strategy.strikes
+    trading.strategy.executor
+    trading.utils
+branch = True
+
+[report]
+precision = 2
+show_missing = True
+fail_under = 99.5
+omit =
+    trading/logging_setup.py
+    trading/__init__.py
+    trading/orders/__init__.py
+    trading/strategy/__init__.py
