@@ -83,9 +83,9 @@ def ensure_margin_or_skip_strategy(
 
         if pe_hedge_qty > 0 or ce_hedge_qty > 0:
             journal(
-                Phase.HEDGE_PLACED,
+                Phase.HEDGE_SEARCH,
                 name,
-                f"Placing hedges PE qty={pe_hedge_qty} CE qty={ce_hedge_qty}",
+                f"Searching far-OTM hedges PE qty={pe_hedge_qty} CE qty={ce_hedge_qty}",
                 pe_hedge_qty=pe_hedge_qty,
                 ce_hedge_qty=ce_hedge_qty,
                 premium_band=[min_premium, max_premium],
@@ -154,6 +154,15 @@ def ensure_margin_or_skip_strategy(
                     return False
 
             if placed_now:
+                journal(
+                    Phase.HEDGE_PLACED,
+                    name,
+                    f"Hedge orders placed ({len(placed_now)} legs)",
+                    hedge_order_ids=[p.get("app_order_id") for p in placed_now],
+                    hedge_strikes=hedge_strikes,
+                    pe_hedge_qty=pe_hedge_qty,
+                    ce_hedge_qty=ce_hedge_qty,
+                )
                 update_strategy(
                     name,
                     hedge_orders=all_hedge_orders,

@@ -135,6 +135,9 @@ class KotakNeoClient:
         )
         # token (int) -> {"trdSym": str, "segment": str}
         self._token_meta: Dict[int, Dict[str, str]] = {}
+        # (index, expiry) -> scrip rows; (index, expiry, CE|PE, strike) -> token
+        self._option_chain_rows: Dict[Tuple[str, str], List[dict]] = {}
+        self._option_id_index: Dict[Tuple[str, str, str, int], int] = {}
         # index name -> recent (unix_ts, ltp) for synthetic 1m bars when REST OHLC is empty
         self._index_ltp_ticks: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
         self._ltp_history_cap = 720
@@ -639,6 +642,84 @@ class KotakNeoClient:
         # Scrip master still lists expired series; keep only today/future for index pick + trading.
         return [e for e in out if e.date() >= today]
 
+    @staticmethod
+    def _parse_scrip_strike_and_type(row: dict) -> Tuple[Optional[str], Optional[int]]:
+        ot = str(row.get("pOptionType") or "").strip().upper()
+        strike_raw = row.get("pStrikePrice") or row.get("lStrikePrice") or row.get("dStrikePrice")
+        strike: Optional[int] = None
+        if strike_raw is not None:
+            try:
+                strike = int(float(strike_raw))
+            except (TypeError, ValueError):
+                strike = None
+        sym = str(row.get("pTrdSymbol") or row.get("trdSym") or "").replace(" ", "").upper()
+        if ot not in ("CE", "PE"):
+            if sym.endswith("CE"):
+                ot = "CE"
+            elif sym.endswith("PE"):
+                ot = "PE"
+        if strike is None and sym:
+            m = re.search(r"(\d+)(CE|PE)$", sym)
+            if m:
+                strike = int(m.group(1))
+                if ot not in ("CE", "PE"):
+                    ot = m.group(2)
+        if ot not in ("CE", "PE") or strike is None:
+            return None, None
+        return ot, strike
+
+    def _register_scrip_row(self, index_name: str, expiry: str, row: dict) -> None:
+        tok = row.get("pSymbol")
+        if tok is None:
+            return
+        try:
+            tid = int(tok)
+        except (TypeError, ValueError):
+            return
+        ot, strike = self._parse_scrip_strike_and_type(row)
+        if ot is None or strike is None:
+            return
+        exp = (expiry or "").strip().upper()
+        sym = row.get("pTrdSymbol") or row.get("trdSym") or ""
+        ltp_hint = self._ltp_from_scrip_row(row)
+        self._token_meta[tid] = {
+            "trdSym": sym,
+            "segment": KOTAK_INDEX_META.get(index_name, {}).get("fo_seg", ""),
+            "ltp_hint": ltp_hint,
+        }
+        self._option_id_index[(index_name, exp, ot, int(strike))] = tid
+
+    def warm_option_chain(self, index_config: IndexConfig, expiry: str) -> int:
+        """Load full option chain for *expiry* in one scrip search (avoids per-strike API calls)."""
+        self._ensure()
+        meta = KOTAK_INDEX_META.get(index_config.name)
+        if not meta:
+            return 0
+        exp = (expiry or "").strip().upper()
+        key = (index_config.name, exp)
+        if key in self._option_chain_rows:
+            return sum(1 for k in self._option_id_index if k[0] == index_config.name and k[1] == exp)
+        rows = self._api.search_scrip(
+            exchange_segment=meta["fo_seg"],
+            symbol=meta["search_symbol"],
+            expiry=exp,
+            option_type="",
+            strike_price="",
+        )
+        chain = rows if isinstance(rows, list) else []
+        self._option_chain_rows[key] = chain
+        for row in chain:
+            if isinstance(row, dict):
+                self._register_scrip_row(index_config.name, exp, row)
+        logger.info(
+            "Kotak option chain loaded: %s %s (%d rows, %d indexed strikes)",
+            index_config.name,
+            exp,
+            len(chain),
+            sum(1 for k in self._option_id_index if k[0] == index_config.name and k[1] == exp),
+        )
+        return len(chain)
+
     def get_option_instrument_id(
         self, index_config: IndexConfig, expiry: str, option_type: str, strike: int
     ) -> Optional[int]:
@@ -647,12 +728,20 @@ class KotakNeoClient:
         if not meta:
             return None
         exp = (expiry or "").strip().upper()
+        ot = (option_type or "").upper()
+        stk = int(strike)
+        cache_key = (index_config.name, exp, ot, stk)
+        if cache_key not in self._option_id_index:
+            self.warm_option_chain(index_config, exp)
+        cached = self._option_id_index.get(cache_key)
+        if cached is not None:
+            return cached
         rows = self._api.search_scrip(
             exchange_segment=meta["fo_seg"],
             symbol=meta["search_symbol"],
             expiry=exp,
             option_type=(option_type or "").lower(),
-            strike_price=str(int(strike)),
+            strike_price=str(stk),
         )
         if not isinstance(rows, list) or not rows:
             return None
@@ -668,6 +757,7 @@ class KotakNeoClient:
             "segment": meta["fo_seg"],
             "ltp_hint": ltp_hint,
         }
+        self._option_id_index[(index_config.name, exp, ot, stk)] = tid
         return tid
 
     @staticmethod

@@ -155,6 +155,19 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
         )
 
     is_expiry = is_expiry_day(expiry)
+    warm_chain = getattr(client, "warm_option_chain", None)
+    if callable(warm_chain):
+        try:
+            chain_rows = warm_chain(index_config, expiry)
+            journal(
+                Phase.CRITERIA_CHECK,
+                name,
+                f"Option chain loaded ({chain_rows} scrip rows)",
+                expiry=expiry,
+                chain_rows=chain_rows,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Option chain preload failed: %s", name, exc)
     atm_strike = resolve("_get_atm_strike", _get_atm_strike)(client, index_config)
     if atm_strike is None:
         journal(Phase.CRITERIA_FAILED, name, "Spot LTP unavailable", severity="ERROR")
