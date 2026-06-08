@@ -1,5 +1,7 @@
 """Order book helpers."""
-from typing import Any, Dict, List
+from __future__ import annotations
+
+from typing import List
 
 
 def get_filled_orders(order_book: List[dict], app_order_ids: List[int]) -> List[dict]:
