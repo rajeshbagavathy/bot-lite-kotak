@@ -136,9 +136,8 @@ def process_waiting_for_calm(client: Any, index_config, expiry: str, execute_fn)
         if strategy.get("status") != "WAITING_FOR_CALM":
             continue
         name = strategy["name"]
-        started_at = strategy.get("gatekeeper_started_at")
-        if not started_at:
-            started_at = now.isoformat(timespec="seconds")
+        started_at = strategy.get("gatekeeper_started_at") or gatekeeper_window_start_iso(strategy)
+        if not strategy.get("gatekeeper_started_at"):
             update_strategy(name, gatekeeper_started_at=started_at)
         try:
             started_dt = datetime.datetime.fromisoformat(str(started_at))
@@ -178,9 +177,8 @@ def process_waiting_for_calm(client: Any, index_config, expiry: str, execute_fn)
             )
             update_strategy(
                 name,
-                gatekeeper_started_at=None,
-                next_gatekeeper_check_at=None,
-                message=f"Calm Zone detected ({reason}); executing.",
+                next_gatekeeper_check_at=now_ts + 600,
+                message=f"Calm Zone detected ({reason}); executing entry pipeline.",
             )
             execute_fn(client, index_config, expiry, strategy, force=True)
         else:

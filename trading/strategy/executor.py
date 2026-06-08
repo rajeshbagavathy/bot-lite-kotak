@@ -65,6 +65,15 @@ def execute_strategy(client: Any, index_config, expiry: str, strategy, force: bo
         return
     try:
         _execute_strategy_locked(client, index_config, expiry, strategy, force=force)
+    except Exception as exc:
+        logger.exception("[%s] Entry pipeline failed", name)
+        journal(
+            Phase.STRATEGY_ABORT,
+            name,
+            f"Entry pipeline error: {exc}",
+            severity="ERROR",
+        )
+        update_strategy(name, status="ERROR", message=f"Entry pipeline error: {exc}"[:200])
     finally:
         lock.release()
 
@@ -80,7 +89,11 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
             planned_lots=strategy.get("lots"),
         )
 
-    can_run, gate_reason, gate_row = resolve("should_execute_now", _should_execute_now)(name, index_config.name)
+    skip_calm_recheck = force and strategy.get("status") == "WAITING_FOR_CALM"
+    if skip_calm_recheck:
+        can_run, gate_reason, gate_row = True, "calm_gatekeeper", None
+    else:
+        can_run, gate_reason, gate_row = resolve("should_execute_now", _should_execute_now)(name, index_config.name)
     if not can_run:
         now_ts = get_ist_now().timestamp()
         gk_started = strategy.get("gatekeeper_started_at") or gatekeeper_window_start_iso(strategy)
@@ -105,6 +118,15 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
                 bar=gate_row,
                 timeout_min=CALM_ZONE_WAIT_TIMEOUT_MINUTES,
             )
+        elif was_waiting:
+            journal(
+                Phase.CRITERIA_FAILED,
+                name,
+                f"Calm no longer valid ({gate_reason}); resuming wait",
+                severity="WARNING",
+                gate_reason=gate_reason,
+                bar=gate_row,
+            )
         sid = upsert_strategy_waiting_for_calm(
             name,
             int(strategy.get("lots") or 0),
@@ -118,7 +140,11 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
         return
 
     if strategy.get("status") == "WAITING_FOR_CALM":
-        update_strategy(name, message="Calm Zone found; executing delayed strategy.")
+        update_strategy(
+            name,
+            message="Calm zone confirmed; running entry pipeline (strikes → margin → orders)",
+            next_gatekeeper_check_at=get_ist_now().timestamp() + 600,
+        )
     elif gate_reason not in ("gatekeeper_disabled",):
         journal(
             Phase.CALM_PASSED,

@@ -417,6 +417,27 @@ class TestExecutorCoverage(unittest.TestCase):
             force=True,
         )
 
+    @patch("bot.should_execute_now", return_value=(False, "volatile", {"bar_time": "t"}))
+    @patch("bot._get_atm_strike", return_value=22000)
+    @patch("trading.strategy.executor.is_expiry_day", return_value=False)
+    @patch("trading.strategy.executor.USE_PREMIUM_BASED_STRIKE", False)
+    @patch("bot._ensure_margin_or_skip_strategy", return_value=True)
+    @patch("trading.strategy.executor.complete_entry_with_sl_protection")
+    @patch("bot.update_strategy")
+    @patch("trading.strategy.executor.log_strategy_execution", return_value=7)
+    @patch("trading.strategy.executor.log_order")
+    @patch("time.time", return_value=1)
+    @patch("time.sleep")
+    def test_execute_gatekeeper_force_skips_calm_recheck(self, _sleep, _time, _log, _log_strat, _upd, mock_prot, *_):
+        """After gatekeeper CALM_PASSED, entry must not re-fail on a volatile re-read."""
+        self.client.get_option_instrument_id.side_effect = [11, 22]
+        self.client.get_ltp_map.return_value = {11: 1.0, 22: 1.0}
+        self.client.place_market_order.side_effect = [1001, 1002]
+        mock_prot.return_value = SlProtectionResult(ok=True, sl_orders=[], positions=[], sl_tag_map={})
+        strat = {"name": "S", "status": "WAITING_FOR_CALM", "time": "09:00:00", "lots": 1, "leg_sl_pct": 20}
+        execute_strategy(self.client, self.cfg, "12FEB2026", strat, force=True)
+        self.assertEqual(self.client.place_market_order.call_count, 2)
+
     @patch("bot.should_execute_now", return_value=(True, "calm", {}))
     @patch("bot._get_atm_strike", return_value=22000)
     @patch("trading.strategy.executor.is_expiry_day", return_value=False)
