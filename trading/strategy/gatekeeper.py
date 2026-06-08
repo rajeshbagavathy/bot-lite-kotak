@@ -161,17 +161,27 @@ def process_waiting_for_calm(client: Any, index_config, expiry: str, execute_fn)
         if now_ts < next_check_at_f:
             continue
         can_run, reason, row = resolve("should_execute_now", should_execute_now)(name, index_config.name)
-        journal(
-            Phase.CALM_CHECK,
-            name,
-            f"Calm poll: {'PASS' if can_run else 'WAIT'} ({reason})",
-            gate_reason=reason,
-            bar_context=calm_gatekeeper_context_blurb(row),
-            elapsed_min=round(elapsed_min, 1),
-        )
         if can_run:
-            update_strategy(name, message=f"Calm Zone detected ({reason}); executing.")
-            journal(Phase.CALM_PASSED, name, f"Calm zone passed ({reason})", gate_reason=reason, bar=row)
+            logger.info(
+                "[%s] Calm gatekeeper passed (%s; %s) — executing delayed entry",
+                name,
+                reason,
+                calm_gatekeeper_context_blurb(row),
+            )
+            journal(
+                Phase.CALM_PASSED,
+                name,
+                f"Calm zone passed ({reason}); executing delayed entry",
+                gate_reason=reason,
+                bar=row,
+                elapsed_min=round(elapsed_min, 1),
+            )
+            update_strategy(
+                name,
+                gatekeeper_started_at=None,
+                next_gatekeeper_check_at=None,
+                message=f"Calm Zone detected ({reason}); executing.",
+            )
             execute_fn(client, index_config, expiry, strategy, force=True)
         else:
             update_strategy(

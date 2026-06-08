@@ -37,7 +37,15 @@ from trading.utils import get_atm_strike as _get_atm_strike, is_expiry_day
 
 logger = logging.getLogger("xts-bot-lite")
 
-_exec_lock = threading.Lock()
+_exec_locks: dict[str, threading.Lock] = {}
+_exec_locks_guard = threading.Lock()
+
+
+def _strategy_exec_lock(name: str) -> threading.Lock:
+    with _exec_locks_guard:
+        if name not in _exec_locks:
+            _exec_locks[name] = threading.Lock()
+        return _exec_locks[name]
 
 
 def execute_strategy(client: Any, index_config, expiry: str, strategy, force: bool = False) -> None:
@@ -46,13 +54,19 @@ def execute_strategy(client: Any, index_config, expiry: str, strategy, force: bo
     if not force and get_ist_now().strftime("%H:%M:%S") < strategy["time"]:
         return
     name = strategy["name"]
-    if not _exec_lock.acquire(blocking=False):
-        journal(Phase.CRITERIA_FAILED, name, "Another entry in progress — skipped duplicate run", severity="WARNING")
+    lock = _strategy_exec_lock(name)
+    if not lock.acquire(blocking=False):
+        journal(
+            Phase.CRITERIA_FAILED,
+            name,
+            "Entry already in progress for this strategy — skipped duplicate run",
+            severity="WARNING",
+        )
         return
     try:
         _execute_strategy_locked(client, index_config, expiry, strategy, force=force)
     finally:
-        _exec_lock.release()
+        lock.release()
 
 
 def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, force: bool = False) -> None:
@@ -73,6 +87,7 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
         wait_msg = (
             f"Waiting for calm zone ({gate_reason}; {calm_gatekeeper_context_blurb(gate_row)})"
         )
+        was_waiting = strategy.get("status") == "WAITING_FOR_CALM"
         update_strategy(
             name,
             status="WAITING_FOR_CALM",
@@ -80,15 +95,16 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
             next_gatekeeper_check_at=now_ts + float(CALM_ZONE_GATEKEEPER_POLL_SECONDS),
             message=wait_msg,
         )
-        journal(
-            Phase.WAITING_FOR_CALM,
-            name,
-            wait_msg,
-            severity="WARNING",
-            gate_reason=gate_reason,
-            bar=gate_row,
-            timeout_min=CALM_ZONE_WAIT_TIMEOUT_MINUTES,
-        )
+        if not was_waiting:
+            journal(
+                Phase.WAITING_FOR_CALM,
+                name,
+                wait_msg,
+                severity="WARNING",
+                gate_reason=gate_reason,
+                bar=gate_row,
+                timeout_min=CALM_ZONE_WAIT_TIMEOUT_MINUTES,
+            )
         sid = upsert_strategy_waiting_for_calm(
             name,
             int(strategy.get("lots") or 0),
@@ -103,13 +119,14 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
 
     if strategy.get("status") == "WAITING_FOR_CALM":
         update_strategy(name, message="Calm Zone found; executing delayed strategy.")
-    journal(
-        Phase.CALM_PASSED,
-        name,
-        f"Gatekeeper passed ({gate_reason})",
-        gate_reason=gate_reason,
-        bar=gate_row,
-    )
+    elif gate_reason not in ("gatekeeper_disabled",):
+        journal(
+            Phase.CALM_PASSED,
+            name,
+            f"Gatekeeper passed ({gate_reason})",
+            gate_reason=gate_reason,
+            bar=gate_row,
+        )
 
     is_expiry = is_expiry_day(expiry)
     atm_strike = resolve("_get_atm_strike", _get_atm_strike)(client, index_config)

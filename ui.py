@@ -650,7 +650,7 @@ DASHBOARD_TEMPLATE = """
         <div class="card-title">Trade journal — per-strategy lifecycle</div>
         <p class="meta-label" style="margin-bottom: 8px;">
           Structured events from <span id="journal-path">—</span>. Flow:
-          SLOTTED → WAITING_FOR_CALM / CALM_CHECK → CALM_PASSED → STRIKE_SELECTED → MARGIN_CHECK → HEDGE → LOTS_SIZED → ENTRY → SL → PROTECTED.
+          SLOTTED → WAITING_FOR_CALM → CALM_PASSED → STRIKE_SELECTED → MARGIN_CHECK → HEDGE → LOTS_SIZED → ENTRY → SL → PROTECTED.
         </p>
         <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
           <label>Strategy <select id="journal-strategy-filter" style="padding:4px 8px; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:4px;"><option value="__all__">All</option></select></label>

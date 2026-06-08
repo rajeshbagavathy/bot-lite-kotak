@@ -29,7 +29,7 @@ from trading.orders.close import (
     positions_exposure_for_instruments,
 )
 from trading.orders.lifecycle import SlProtectionResult
-from trading.strategy.executor import _exec_lock, execute_strategy
+from trading.strategy.executor import _exec_locks, _exec_locks_guard, _strategy_exec_lock, execute_strategy
 from trading.strategy.gatekeeper import (
     calm_gatekeeper_context_blurb,
     gatekeeper_window_start_iso,
@@ -51,6 +51,14 @@ from trading.utils import (
     pick_index_and_expiry,
     round_to_tick,
 )
+
+
+def _release_all_strategy_exec_locks() -> None:
+    with _exec_locks_guard:
+        for lock in _exec_locks.values():
+            while lock.locked():
+                lock.release()
+        _exec_locks.clear()
 
 
 def _index_cfg(name="NIFTY", strike_diff=None):
@@ -330,8 +338,7 @@ class TestExecutorCoverage(unittest.TestCase):
         journal_mod._journal_path = None
         init_journal(os.path.join(os.environ.get("TMPDIR", "/tmp"), "cov_exec.jsonl"))
         STRATEGY_STATE.clear()
-        while _exec_lock.locked():
-            _exec_lock.release()
+        _release_all_strategy_exec_locks()
         self.client = MagicMock()
         self.client.interactive.TRANSACTION_TYPE_SELL = "SELL"
         self.client.interactive.PRODUCT_MIS = "MIS"
@@ -348,7 +355,7 @@ class TestExecutorCoverage(unittest.TestCase):
             )
 
     def test_execute_lock_busy(self):
-        _exec_lock.acquire()
+        _strategy_exec_lock("S").acquire()
         try:
             execute_strategy(
                 self.client, self.cfg, "12FEB2026",
@@ -356,7 +363,15 @@ class TestExecutorCoverage(unittest.TestCase):
                 force=True,
             )
         finally:
-            _exec_lock.release()
+            _strategy_exec_lock("S").release()
+
+    def test_execute_locks_are_per_strategy(self):
+        lock_a = _strategy_exec_lock("A")
+        lock_b = _strategy_exec_lock("B")
+        self.assertTrue(lock_a.acquire(blocking=False))
+        self.assertTrue(lock_b.acquire(blocking=False))
+        lock_a.release()
+        lock_b.release()
 
     @patch("bot.should_execute_now", return_value=(True, "calm", {}))
     @patch("bot._get_atm_strike", return_value=None)
@@ -470,8 +485,7 @@ class TestRemainingCoverage(unittest.TestCase):
         journal_mod._journal_path = None
         init_journal(os.path.join(os.environ.get("TMPDIR", "/tmp"), "cov_rem.jsonl"))
         STRATEGY_STATE.clear()
-        while _exec_lock.locked():
-            _exec_lock.release()
+        _release_all_strategy_exec_locks()
 
     @patch("bot.USE_CALM_ZONE_GATEKEEPER", True)
     @patch("bot.CALM_ZONE_GATEKEEPER_MODE", "current_or_prior_calm")
