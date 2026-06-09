@@ -12,6 +12,7 @@ from brokers.mappers.kotak_normalize import (  # noqa: E402
     kotak_positions_to_normalized,
     parse_kotak_place_order_n_ord_no,
 )
+from mtm import calculate_mtm  # noqa: E402
 
 
 class TestKotakOrderNormalize(unittest.TestCase):
@@ -93,6 +94,59 @@ class TestKotakPositionsNormalize(unittest.TestCase):
         self.assertEqual(out[0]["OpenBuyQuantity"], 130)
         self.assertEqual(out[0]["OpenSellQuantity"], 0)
         self.assertEqual(out[0]["SumOfTradedQuantityAndPriceBuy"], 130 * 50.0)
+
+    def test_fno_short_row_uses_sell_amount_not_zero_avg(self):
+        """Kotak FNO rows often lack avgPrc; sellAmt/flSellQty must drive MTM."""
+        rows = [
+            {
+                "trdSym": "NIFTY09JUN202623100CE",
+                "tok": "42272",
+                "prod": "MIS",
+                "posFlg": "true",
+                "flBuyQty": "0",
+                "flSellQty": "195",
+                "cfBuyQty": "0",
+                "cfSellQty": "0",
+                "buyAmt": "0.00",
+                "sellAmt": "15132.00",
+                "lotSz": "65",
+                "multiplier": "1",
+                "genNum": "1",
+                "genDen": "1",
+                "prcNum": "1",
+                "prcDen": "1",
+            }
+        ]
+        out = kotak_positions_to_normalized(rows)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["Quantity"], -195)
+        self.assertAlmostEqual(out[0]["AveragePrice"], 15132.0 / 195.0, places=2)
+        self.assertAlmostEqual(out[0]["SumOfTradedQuantityAndPriceSell"], 15132.0)
+        _, unrealized, total = calculate_mtm(out, {42272: 60.0})
+        # Short 195 @ ~77.6, LTP 60 → profit ~3432
+        self.assertGreater(total, 3000.0)
+        self.assertGreater(unrealized, 3000.0)
+
+    def test_fno_hedge_long_row(self):
+        rows = [
+            {
+                "trdSym": "NIFTY09JUN202622900PE",
+                "tok": "42265",
+                "prod": "MIS",
+                "posFlg": "true",
+                "flBuyQty": "195",
+                "flSellQty": "0",
+                "buyAmt": "419.25",
+                "sellAmt": "0.00",
+                "lotSz": "65",
+                "multiplier": "1",
+            }
+        ]
+        out = kotak_positions_to_normalized(rows)
+        self.assertEqual(out[0]["Quantity"], 195)
+        _, _, total = calculate_mtm(out, {42265: 2.5})
+        # Long hedge ~2.15 → 2.5 small profit
+        self.assertGreater(total, 0.0)
 
 
 if __name__ == "__main__":

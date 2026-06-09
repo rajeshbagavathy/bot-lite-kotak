@@ -141,82 +141,159 @@ def _instrument_token_from_kotak_row(row: Dict[str, Any]) -> int:
     return 0
 
 
-def _net_qty_from_kotak_row(row: Dict[str, Any]) -> int:
-    for k in ("netQty", "netqty", "ntQty", "NetQty", "Qty", "qty"):
-        if k in row and row[k] is not None and str(row[k]).strip() != "":
-            v = _safe_int(row[k])
-            if v is not None:
-                return v
-    buy = (_safe_int(row.get("cfBuyQty")) or 0) + (_safe_int(row.get("flBuyQty")) or 0)
-    sell = (_safe_int(row.get("cfSellQty")) or 0) + (_safe_int(row.get("flSellQty")) or 0)
-    lot = _safe_int(row.get("lotSz")) or 1
-    if lot > 1:
-        buy = buy // lot
-        sell = sell // lot
-    return buy - sell
+def _kotak_price_scale(row: Dict[str, Any]) -> float:
+    mult = _safe_float(row.get("multiplier")) or 1.0
+    gen_num = _safe_float(row.get("genNum")) or 1.0
+    gen_den = _safe_float(row.get("genDen")) or 1.0
+    prc_num = _safe_float(row.get("prcNum")) or 1.0
+    prc_den = _safe_float(row.get("prcDen")) or 1.0
+    if gen_den == 0 or prc_den == 0:
+        return mult
+    return mult * (gen_num / gen_den) * (prc_num / prc_den)
+
+
+def _kotak_row_is_open_position(row: Dict[str, Any]) -> bool:
+    """Prefer ``posFlg=true`` rows; skip fill-only rows when flagged."""
+    flag = row.get("posFlg")
+    if flag is None or str(flag).strip() == "":
+        return True
+    return str(flag).strip().lower() in ("true", "1", "y", "yes")
+
+
+def _kotak_row_qty_amounts(row: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Kotak positions qty/amount totals in **exchange units (shares)**, not lots.
+
+    See Kotak Positions.md: net = (cfBuy+flBuy) - (cfSell+flSell); amounts from buyAmt/sellAmt.
+    """
+    buy_qty = float((_safe_int(row.get("cfBuyQty")) or 0) + (_safe_int(row.get("flBuyQty")) or 0))
+    sell_qty = float((_safe_int(row.get("cfSellQty")) or 0) + (_safe_int(row.get("flSellQty")) or 0))
+    buy_amt = float(_safe_float(row.get("cfBuyAmt")) or 0.0) + float(_safe_float(row.get("buyAmt")) or 0.0)
+    sell_amt = float(_safe_float(row.get("cfSellAmt")) or 0.0) + float(_safe_float(row.get("sellAmt")) or 0.0)
+    net_qty = buy_qty - sell_qty
+    # Legacy / alternate payloads
+    for k in ("netQty", "netqty", "ntQty", "NetQty"):
+        v = _safe_int(row.get(k))
+        if v is not None and (buy_qty == 0 and sell_qty == 0):
+            net_qty = float(v)
+            if net_qty > 0:
+                buy_qty = abs(net_qty)
+            elif net_qty < 0:
+                sell_qty = abs(net_qty)
+            break
+    if buy_qty == 0 and sell_qty == 0:
+        q = _safe_int(row.get("qty"))
+        if q is not None and q != 0:
+            net_qty = float(q)
+            if net_qty > 0:
+                buy_qty = abs(net_qty)
+            else:
+                sell_qty = abs(net_qty)
+    return {
+        "buy_qty": buy_qty,
+        "sell_qty": sell_qty,
+        "buy_amt": buy_amt,
+        "sell_amt": sell_amt,
+        "net_qty": net_qty,
+    }
+
+
+def _kotak_weighted_avg_price(total_amt: float, total_qty: float, scale: float) -> float:
+    denom = total_qty * scale
+    if denom <= 0:
+        return 0.0
+    return total_amt / denom
 
 
 def kotak_positions_to_normalized(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Normalize Kotak positions() ``data`` list to XTS positionList-like dicts.
 
-    Aggregates by (trdSym, tok, prod) when multiple rows exist.
+    Aggregates by (trdSym, prod). Uses Kotak buy/sell amounts for average price
+    (``avgPrc`` is often absent on FNO rows — without it MTM was computed as ~-qty*LTP).
     """
     buckets: Dict[tuple, Dict[str, Any]] = {}
     for row in rows:
+        if not _kotak_row_is_open_position(row):
+            continue
         sym = row.get("trdSym") or row.get("sym") or ""
-        prod = (row.get("prod") or "MIS").upper()
-        # One bucket per contract/symbol (``tok`` is often blank; trdSym encodes FNO leg).
+        prod = (row.get("prod") or row.get("prdCode") or "MIS").upper()
         key = (sym, prod)
-        q = _net_qty_from_kotak_row(row)
+        qa = _kotak_row_qty_amounts(row)
+        rpnl = _safe_float(row.get("rPNL") or row.get("rpnl") or row.get("RPNL"))
+        upnl = _safe_float(row.get("uPNL") or row.get("upnl") or row.get("UPNL"))
         if key not in buckets:
             buckets[key] = {
                 "sym": sym,
                 "prod": prod,
-                "qty": 0,
+                "buy_qty": 0.0,
+                "sell_qty": 0.0,
+                "buy_amt": 0.0,
+                "sell_amt": 0.0,
+                "rpnl": 0.0,
+                "upnl": 0.0,
+                "has_broker_pnl": False,
                 "row": row,
             }
-        buckets[key]["qty"] += q
-        # Prefer last row for avg price etc.
-        buckets[key]["row"] = row
+        b = buckets[key]
+        b["buy_qty"] += qa["buy_qty"]
+        b["sell_qty"] += qa["sell_qty"]
+        b["buy_amt"] += qa["buy_amt"]
+        b["sell_amt"] += qa["sell_amt"]
+        if rpnl is not None:
+            b["rpnl"] += rpnl
+            b["has_broker_pnl"] = True
+        if upnl is not None:
+            b["upnl"] += upnl
+            b["has_broker_pnl"] = True
+        b["row"] = row
 
     out: List[Dict[str, Any]] = []
     for b in buckets.values():
-        qtot = int(b["qty"])
-        if qtot == 0:
+        buy_qty = b["buy_qty"]
+        sell_qty = b["sell_qty"]
+        net_qty = buy_qty - sell_qty
+        if net_qty == 0:
             continue
         row = b["row"]
         iid = _instrument_token_from_kotak_row(row)
-        avg = _safe_float(row.get("avgPrc")) or _safe_float(row.get("prc")) or 0.0
+        scale = _kotak_price_scale(row)
         mult = _safe_int(row.get("multiplier")) or 1
-
-        # XTS-style fields required by mtm.calculate_mtm (Open*, SumOfTraded*, Multiplier).
+        qtot = int(round(net_qty))
         absq = abs(qtot)
-        avg_f = float(avg or 0.0)
+
+        buy_avg = _kotak_weighted_avg_price(b["buy_amt"], buy_qty, scale)
+        sell_avg = _kotak_weighted_avg_price(b["sell_amt"], sell_qty, scale)
         if qtot > 0:
             open_buy, open_sell = absq, 0
-            sum_buy_px_qty = avg_f * absq
+            avg = buy_avg or (_safe_float(row.get("buyAvg")) or _safe_float(row.get("avgPrc")) or 0.0)
+            sum_buy_px_qty = float(b["buy_amt"]) if b["buy_amt"] > 0 else float(avg) * absq
             sum_sell_px_qty = 0.0
         else:
             open_buy, open_sell = 0, absq
+            avg = sell_avg or (_safe_float(row.get("sellAvg")) or _safe_float(row.get("avgPrc")) or 0.0)
             sum_buy_px_qty = 0.0
-            sum_sell_px_qty = avg_f * absq
+            sum_sell_px_qty = float(b["sell_amt"]) if b["sell_amt"] > 0 else float(avg) * absq
 
-        out.append(
-            {
-                "ExchangeInstrumentId": iid,
-                "ExchangeInstrumentID": iid,
-                "TradingSymbol": b["sym"],
-                "Quantity": qtot,
-                "ProductType": b["prod"],
-                "AveragePrice": avg,
-                "OpenBuyQuantity": open_buy,
-                "OpenSellQuantity": open_sell,
-                "SumOfTradedQuantityAndPriceBuy": sum_buy_px_qty,
-                "SumOfTradedQuantityAndPriceSell": sum_sell_px_qty,
-                "Multiplier": mult,
-            }
-        )
+        rec: Dict[str, Any] = {
+            "ExchangeInstrumentId": iid,
+            "ExchangeInstrumentID": iid,
+            "TradingSymbol": b["sym"],
+            "Quantity": qtot,
+            "ProductType": b["prod"],
+            "AveragePrice": avg,
+            "OpenBuyQuantity": open_buy,
+            "OpenSellQuantity": open_sell,
+            "SumOfTradedQuantityAndPriceBuy": sum_buy_px_qty,
+            "SumOfTradedQuantityAndPriceSell": sum_sell_px_qty,
+            "Multiplier": mult,
+            "KotakBuyAmount": b["buy_amt"],
+            "KotakSellAmount": b["sell_amt"],
+        }
+        if b["has_broker_pnl"]:
+            rec["KotakRealizedMtm"] = b["rpnl"]
+            rec["KotakUnrealizedMtm"] = b["upnl"]
+        out.append(rec)
     return out
 
 

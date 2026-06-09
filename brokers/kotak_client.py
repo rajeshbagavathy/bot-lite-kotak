@@ -898,6 +898,14 @@ class KotakNeoClient:
         if r.get("Error") or r.get("error") or r.get("Error Message"):
             logger.debug("Kotak limits MTM: error payload")
             return None
+        stat = str(r.get("stat") or r.get("Stat") or "").strip().lower()
+        if stat and stat not in ("ok", "success"):
+            logger.debug("Kotak limits MTM: stat=%s", stat)
+            return None
+        err_msg = r.get("errMsg") or r.get("errmsg") or r.get("ErrMsg")
+        if err_msg and str(err_msg).strip():
+            logger.debug("Kotak limits MTM: errMsg=%s", err_msg)
+            return None
         r = self._unwrap_limits_root(r)
         mtm_keys = (
             "UnrealizedMtomPrsnt",

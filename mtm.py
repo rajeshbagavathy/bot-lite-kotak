@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 def _safe_float(value, default=0.0) -> float:
@@ -14,6 +14,22 @@ def _safe_int(value, default=0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def calculate_mtm_from_kotak_broker_pnl(positions: Iterable[dict]) -> Optional[Tuple[float, float, float]]:
+    """Sum Kotak ``rPNL``/``uPNL`` when present on normalized positions."""
+    realized = 0.0
+    unrealized = 0.0
+    saw = False
+    for pos in positions:
+        if "KotakRealizedMtm" not in pos and "KotakUnrealizedMtm" not in pos:
+            continue
+        saw = True
+        realized += _safe_float(pos.get("KotakRealizedMtm"))
+        unrealized += _safe_float(pos.get("KotakUnrealizedMtm"))
+    if not saw:
+        return None
+    return realized, unrealized, realized + unrealized
 
 
 def calculate_mtm(positions: Iterable[dict], ltp_map: Dict[int, float]) -> Tuple[float, float, float]:

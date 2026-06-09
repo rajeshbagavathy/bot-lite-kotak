@@ -144,7 +144,7 @@ from db import (
     fetch_last_two_spot_bar_rows,
     fetch_recent_calm_spot_row,
 )
-from mtm import calculate_mtm, calculate_strategy_mtm
+from mtm import calculate_mtm, calculate_mtm_from_kotak_broker_pnl, calculate_strategy_mtm
 from state import (
     get_mtm_snapshots_enabled,
     get_trading_flag_or,
@@ -1794,7 +1794,10 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
             limits_mtm = client.get_portfolio_mtm_from_limits()
         except Exception:
             logger.debug("Broker limits MTM unavailable", exc_info=True)
-    if limits_mtm is not None:
+    broker_pos_pnl = calculate_mtm_from_kotak_broker_pnl(positions)
+    if broker_pos_pnl is not None:
+        realized, unrealized, overall = broker_pos_pnl
+    elif limits_mtm is not None:
         realized, unrealized, overall = limits_mtm
     else:
         realized, unrealized, overall = calculate_mtm(positions, ltp_map)
