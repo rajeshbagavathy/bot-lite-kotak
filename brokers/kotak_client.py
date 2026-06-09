@@ -846,7 +846,28 @@ class KotakNeoClient:
         data = r.get("data")
         if not isinstance(data, list):
             return []
-        return kotak_positions_to_normalized(data)
+        out = kotak_positions_to_normalized(data)
+        return self._fill_position_instrument_ids(out)
+
+    def _fill_position_instrument_ids(self, positions: List[dict]) -> List[dict]:
+        """Resolve missing ``tok`` on Kotak position rows via warmed ``_token_meta``."""
+        sym_to_iid: Dict[str, int] = {}
+        for tid, meta in (self._token_meta or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            sym = str(meta.get("trdSym") or "").strip()
+            if sym:
+                sym_to_iid[sym] = int(tid)
+        for pos in positions:
+            iid = int(pos.get("ExchangeInstrumentId") or 0)
+            if iid != 0:
+                continue
+            sym = str(pos.get("TradingSymbol") or "").strip()
+            resolved = sym_to_iid.get(sym)
+            if resolved:
+                pos["ExchangeInstrumentId"] = resolved
+                pos["ExchangeInstrumentID"] = resolved
+        return positions
 
     def get_order_book(self) -> List[dict]:
         self._ensure()

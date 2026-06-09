@@ -12,7 +12,7 @@ from brokers.mappers.kotak_normalize import (  # noqa: E402
     kotak_positions_to_normalized,
     parse_kotak_place_order_n_ord_no,
 )
-from mtm import calculate_mtm  # noqa: E402
+from mtm import calculate_mtm, calculate_mtm_kotak_amounts  # noqa: E402
 
 
 class TestKotakOrderNormalize(unittest.TestCase):
@@ -147,6 +147,28 @@ class TestKotakPositionsNormalize(unittest.TestCase):
         _, _, total = calculate_mtm(out, {42265: 2.5})
         # Long hedge ~2.15 → 2.5 small profit
         self.assertGreater(total, 0.0)
+
+    def test_kotak_amounts_formula_short(self):
+        rows = kotak_positions_to_normalized(
+            [
+                {
+                    "trdSym": "NIFTY09JUN202623100CE",
+                    "tok": "42272",
+                    "prod": "MIS",
+                    "posFlg": "true",
+                    "flSellQty": "195",
+                    "flBuyQty": "0",
+                    "sellAmt": "15132.00",
+                    "buyAmt": "0.00",
+                    "multiplier": "1",
+                }
+            ]
+        )
+        r, u, t = calculate_mtm_kotak_amounts(rows, {42272: 60.0})
+        self.assertIsNotNone(r)
+        assert r is not None and u is not None and t is not None
+        self.assertAlmostEqual(t, 15132.0 - 195 * 60.0, places=1)
+        self.assertGreater(t, 3000.0)
 
 
 if __name__ == "__main__":

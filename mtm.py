@@ -17,19 +17,91 @@ def _safe_int(value, default=0) -> int:
 
 
 def calculate_mtm_from_kotak_broker_pnl(positions: Iterable[dict]) -> Optional[Tuple[float, float, float]]:
-    """Sum Kotak ``rPNL``/``uPNL`` when present on normalized positions."""
+    """Sum Kotak ``rPNL``/``uPNL`` only when **every** open position row includes them."""
+    pos_list = list(positions)
+    open_rows = [p for p in pos_list if _safe_int(p.get("Quantity")) != 0]
+    if not open_rows:
+        return None
     realized = 0.0
     unrealized = 0.0
-    saw = False
-    for pos in positions:
-        if "KotakRealizedMtm" not in pos and "KotakUnrealizedMtm" not in pos:
-            continue
-        saw = True
+    for pos in open_rows:
+        if "KotakRealizedMtm" not in pos or "KotakUnrealizedMtm" not in pos:
+            return None
         realized += _safe_float(pos.get("KotakRealizedMtm"))
         unrealized += _safe_float(pos.get("KotakUnrealizedMtm"))
-    if not saw:
-        return None
     return realized, unrealized, realized + unrealized
+
+
+def calculate_mtm_kotak_amounts(
+    positions: Iterable[dict], ltp_map: Dict[int, float]
+) -> Optional[Tuple[float, float, float]]:
+    """
+    Kotak Positions.md: PnL = (sellAmt - buyAmt) + netQty * LTP * multiplier.
+
+    Works without avgPrc; preferred over XTS-style OpenBuy/Sell weighting for Kotak FNO.
+    """
+    pos_list = list(positions)
+    open_rows = [p for p in pos_list if _safe_int(p.get("Quantity")) != 0]
+    if not open_rows:
+        return None
+    if not any(
+        _safe_float(p.get("KotakBuyAmount")) != 0.0 or _safe_float(p.get("KotakSellAmount")) != 0.0
+        for p in open_rows
+    ):
+        return None
+
+    realized = 0.0
+    unrealized = 0.0
+    for pos in open_rows:
+        buy_amt = _safe_float(pos.get("KotakBuyAmount"))
+        sell_amt = _safe_float(pos.get("KotakSellAmount"))
+        qty = _safe_int(pos.get("Quantity"))
+        mult = _safe_int(pos.get("Multiplier"), 1)
+        iid = _safe_int(pos.get("ExchangeInstrumentId"))
+        booked = sell_amt - buy_amt
+        ltp = ltp_map.get(iid) if iid else None
+        if qty == 0 or ltp is None:
+            realized += booked
+            continue
+        realized += booked
+        unrealized += float(qty) * float(ltp) * mult
+
+    return realized, unrealized, realized + unrealized
+
+
+def mtm_position_breakdown(
+    positions: Iterable[dict], ltp_map: Dict[int, float]
+) -> List[dict]:
+    """Per-position MTM diagnostics for logging / debug API."""
+    rows: List[dict] = []
+    for pos in positions:
+        qty = _safe_int(pos.get("Quantity"))
+        if qty == 0:
+            continue
+        iid = _safe_int(pos.get("ExchangeInstrumentId"))
+        buy_amt = _safe_float(pos.get("KotakBuyAmount"))
+        sell_amt = _safe_float(pos.get("KotakSellAmount"))
+        ltp = ltp_map.get(iid) if iid else None
+        mult = _safe_int(pos.get("Multiplier"), 1)
+        booked = sell_amt - buy_amt
+        if ltp is not None and qty != 0:
+            total = booked + float(qty) * float(ltp) * mult
+        else:
+            total = booked
+        rows.append(
+            {
+                "symbol": pos.get("TradingSymbol"),
+                "instrument_id": iid,
+                "qty": qty,
+                "buy_amt": buy_amt,
+                "sell_amt": sell_amt,
+                "ltp": ltp,
+                "booked": booked,
+                "total_pnl": total,
+                "avg": pos.get("AveragePrice"),
+            }
+        )
+    return rows
 
 
 def calculate_mtm(positions: Iterable[dict], ltp_map: Dict[int, float]) -> Tuple[float, float, float]:

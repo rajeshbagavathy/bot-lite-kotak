@@ -144,7 +144,13 @@ from db import (
     fetch_last_two_spot_bar_rows,
     fetch_recent_calm_spot_row,
 )
-from mtm import calculate_mtm, calculate_mtm_from_kotak_broker_pnl, calculate_strategy_mtm
+from mtm import (
+    calculate_mtm,
+    calculate_mtm_from_kotak_broker_pnl,
+    calculate_mtm_kotak_amounts,
+    calculate_strategy_mtm,
+    mtm_position_breakdown,
+)
 from state import (
     get_mtm_snapshots_enabled,
     get_trading_flag_or,
@@ -167,6 +173,7 @@ from xts_client import marketable_limit_price
 logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
 _LAST_MTM_LOG: Dict[str, float] = {}  # strategy_name -> last log timestamp (for throttling)
+_LAST_PORTFOLIO_MTM_LOG: float = 0.0
 
 
 def _strategy_state_entry(cfg) -> dict:
@@ -1777,6 +1784,16 @@ def _sync_strategy_positions_from_broker(
 
 
 def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
+    from state import STATE as _STATE
+
+    expiry = (_STATE.get("index") or {}).get("expiry")
+    warm_chain = getattr(client, "warm_option_chain", None)
+    if callable(warm_chain) and expiry:
+        try:
+            warm_chain(index_config, expiry)
+        except Exception:
+            logger.debug("Option chain warm before MTM failed", exc_info=True)
+
     positions = client.get_positions()
     try:
         order_book = client.get_order_book()
@@ -1785,23 +1802,67 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
     instruments = [
         {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": pos["ExchangeInstrumentId"]}
         for pos in positions
-        if int(pos["ExchangeInstrumentId"]) != 0
+        if int(pos.get("ExchangeInstrumentId") or 0) != 0
     ]
     ltp_map = client.get_ltp_map(instruments)
+    for pos in positions:
+        iid = int(pos.get("ExchangeInstrumentId") or 0)
+        if iid == 0 or iid in ltp_map:
+            continue
+        get_ltp = getattr(client, "get_option_ltp", None)
+        if callable(get_ltp):
+            try:
+                px = get_ltp(index_config, iid)
+                if px is not None:
+                    ltp_map[iid] = float(px)
+            except Exception:
+                logger.debug("MTM LTP fallback failed for %s", iid, exc_info=True)
     limits_mtm = None
     if hasattr(client, "get_portfolio_mtm_from_limits"):
         try:
             limits_mtm = client.get_portfolio_mtm_from_limits()
         except Exception:
             logger.debug("Broker limits MTM unavailable", exc_info=True)
-    broker_pos_pnl = calculate_mtm_from_kotak_broker_pnl(positions)
-    if broker_pos_pnl is not None:
-        realized, unrealized, overall = broker_pos_pnl
-    elif limits_mtm is not None:
-        realized, unrealized, overall = limits_mtm
+    mtm_source = "kotak_amounts"
+    kotak_amt_mtm = calculate_mtm_kotak_amounts(positions, ltp_map)
+    if kotak_amt_mtm is not None:
+        realized, unrealized, overall = kotak_amt_mtm
     else:
-        realized, unrealized, overall = calculate_mtm(positions, ltp_map)
+        broker_pos_pnl = calculate_mtm_from_kotak_broker_pnl(positions)
+        if broker_pos_pnl is not None:
+            mtm_source = "kotak_rpnl_upnl"
+            realized, unrealized, overall = broker_pos_pnl
+        elif limits_mtm is not None:
+            mtm_source = "kotak_limits"
+            realized, unrealized, overall = limits_mtm
+        else:
+            mtm_source = "xts_positions"
+            realized, unrealized, overall = calculate_mtm(positions, ltp_map)
     update_portfolio(overall, realized, unrealized, portfolio_sl)
+
+    global _LAST_PORTFOLIO_MTM_LOG
+    now_ts = time.time()
+    if now_ts - _LAST_PORTFOLIO_MTM_LOG >= 60:
+        _LAST_PORTFOLIO_MTM_LOG = now_ts
+        breakdown = mtm_position_breakdown(positions, ltp_map)
+        logger.info(
+            "Portfolio MTM %.2f (realized=%.2f unrealized=%.2f source=%s positions=%d)",
+            overall,
+            realized,
+            unrealized,
+            mtm_source,
+            len(breakdown),
+        )
+        for row in breakdown[:12]:
+            logger.info(
+                "  MTM leg %s id=%s qty=%s ltp=%s booked=%.2f total=%.2f",
+                row.get("symbol"),
+                row.get("instrument_id"),
+                row.get("qty"),
+                row.get("ltp"),
+                row.get("booked", 0),
+                row.get("total_pnl", 0),
+            )
 
     for strategy in STRATEGY_STATE.values():
         # **FIRST**: Sync SL order status from XTS order book (single source of truth)
