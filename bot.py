@@ -430,56 +430,15 @@ def _find_strike_by_premium(
 
 
 def _bot_tracked_open_short_qty_by_side() -> Tuple[int, int]:
-    """Return bot-tracked open short quantity as (ce_short_qty, pe_short_qty)."""
-    ce_short_qty = 0
-    pe_short_qty = 0
-    for strategy in STRATEGY_STATE.values():
-        for pos in strategy.get("positions") or []:
-            if pos.get("exit_price") is not None:
-                continue
-            try:
-                qty = int(pos.get("quantity") or 0)
-            except (TypeError, ValueError):
-                continue
-            if qty >= 0:
-                continue
-            symbol = str(pos.get("symbol") or "").upper()
-            if "CE" in symbol:
-                ce_short_qty += abs(qty)
-            elif "PE" in symbol:
-                pe_short_qty += abs(qty)
-    return ce_short_qty, pe_short_qty
+    from trading.utils import bot_tracked_open_short_qty_by_side
+
+    return bot_tracked_open_short_qty_by_side()
 
 
 def _bot_tracked_hedge_buy_qty_by_side() -> Tuple[int, int]:
-    """Return cumulative far-OTM hedge buy qty already placed (PE hedges CE shorts, CE hedges PE shorts)."""
-    pe_hedge_qty = 0
-    ce_hedge_qty = 0
-    for strategy in STRATEGY_STATE.values():
-        side_qty = strategy.get("hedge_side_qty")
-        if isinstance(side_qty, dict):
-            try:
-                pe_hedge_qty += int(side_qty.get("PE") or 0)
-            except (TypeError, ValueError):
-                pass
-            try:
-                ce_hedge_qty += int(side_qty.get("CE") or 0)
-            except (TypeError, ValueError):
-                pass
-            continue
-        for order in strategy.get("hedge_orders") or []:
-            side = str(order.get("side") or "").upper()
-            try:
-                qty = int(order.get("quantity") or 0)
-            except (TypeError, ValueError):
-                qty = 0
-            if qty <= 0:
-                continue
-            if side == "PE":
-                pe_hedge_qty += qty
-            elif side == "CE":
-                ce_hedge_qty += qty
-    return pe_hedge_qty, ce_hedge_qty
+    from trading.utils import bot_tracked_hedge_buy_qty_by_side
+
+    return bot_tracked_hedge_buy_qty_by_side()
 
 
 def _compute_effective_lots_from_margin(
@@ -564,11 +523,10 @@ def _ensure_margin_or_skip_strategy(
         available is not None and float(available) < required_for_planned
     )
     if need_hedge:
-        ce_short_qty, pe_short_qty = _bot_tracked_open_short_qty_by_side()
-        pe_hedged_qty, ce_hedged_qty = _bot_tracked_hedge_buy_qty_by_side()
+        from trading.utils import _hedge_qty_from_orders, compute_incremental_hedge_quantities
+
         planned_entry_qty = entry_qty if HEDGE_ON_EVERY_STRATEGY else 0
-        pe_hedge_qty = max(0, int(ce_short_qty) + int(planned_entry_qty) - int(pe_hedged_qty))
-        ce_hedge_qty = max(0, int(pe_short_qty) + int(planned_entry_qty) - int(ce_hedged_qty))
+        pe_hedge_qty, ce_hedge_qty, hedge_ctx = compute_incremental_hedge_quantities(planned_entry_qty)
 
         target_premium = float(HEDGE_TARGET_PREMIUM_EXPIRY) if is_expiry else float(HEDGE_TARGET_PREMIUM_NON_EXPIRY)
         min_premium = float(HEDGE_PREMIUM_MIN_EXPIRY) if is_expiry else float(HEDGE_PREMIUM_MIN_NON_EXPIRY)
@@ -580,13 +538,15 @@ def _ensure_margin_or_skip_strategy(
                 message=(
                     f"Buying far-OTM hedges (target ~₹{target_premium}, LTP ₹{min_premium}-₹{max_premium}); "
                     f"PE buy qty={pe_hedge_qty}, CE buy qty={ce_hedge_qty} "
-                    f"(short CE={ce_short_qty}, short PE={pe_short_qty}, planned entry qty={planned_entry_qty})"
+                    f"(existing hedges PE={hedge_ctx['pe_hedge_existing']} CE={hedge_ctx['ce_hedge_existing']}; "
+                    f"shorts CE={hedge_ctx['ce_short_existing']} PE={hedge_ctx['pe_short_existing']}; "
+                    f"new sell qty={hedge_ctx['planned_sell_qty']})"
                 ),
             )
 
             all_hedge_orders: List[dict] = list(strategy.get("hedge_orders") or [])
             hedge_strikes: Dict[str, Optional[int]] = dict(strategy.get("hedge_strikes") or {"PE": None, "CE": None})
-            hedge_side_qty: Dict[str, int] = {"PE": pe_hedged_qty, "CE": ce_hedged_qty}
+            strat_pe, strat_ce = _hedge_qty_from_orders(all_hedge_orders)
 
             pe_hedge = (
                 _find_hedge_by_target_premium(
@@ -665,7 +625,10 @@ def _ensure_margin_or_skip_strategy(
                     }
                     placed_now.append(order_rec)
                     all_hedge_orders.append(order_rec)
-                    hedge_side_qty[side] = int(hedge_side_qty.get(side) or 0) + int(qty)
+                    if side == "PE":
+                        strat_pe += int(qty)
+                    elif side == "CE":
+                        strat_ce += int(qty)
                 else:
                     for placed in placed_now:
                         try:
@@ -691,7 +654,7 @@ def _ensure_margin_or_skip_strategy(
                     hedge_orders=all_hedge_orders,
                     hedge_target_premium=target_premium,
                     hedge_qty=sum(int(o.get("quantity") or 0) for o in all_hedge_orders),
-                    hedge_side_qty=hedge_side_qty,
+                    hedge_side_qty={"PE": strat_pe, "CE": strat_ce},
                     hedge_strikes=hedge_strikes,
                     message="Far-OTM hedge orders placed; rechecking margin",
                 )

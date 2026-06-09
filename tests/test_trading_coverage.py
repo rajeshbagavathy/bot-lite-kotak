@@ -46,6 +46,7 @@ from trading.utils import (
     bot_tracked_hedge_buy_qty_by_side,
     bot_tracked_open_short_qty_by_side,
     compute_effective_lots_from_margin,
+    compute_incremental_hedge_quantities,
     get_atm_strike,
     is_expiry_day,
     pick_index_and_expiry,
@@ -160,6 +161,51 @@ class TestUtilsCoverage(unittest.TestCase):
         STRATEGY_STATE["S2"] = {"hedge_orders": [{"side": "PE", "quantity": 5}, {"side": "XX", "quantity": 1}]}
         pe_h2, _ = bot_tracked_hedge_buy_qty_by_side()
         self.assertGreaterEqual(pe_h2, 5)
+
+    def test_incremental_hedge_only_uncovered_qty(self):
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE["S1"] = {
+            "hedge_orders": [
+                {"side": "PE", "quantity": 195},
+                {"side": "CE", "quantity": 195},
+            ],
+            "positions": [
+                {"symbol": "NIFTY CE", "quantity": -195, "exit_price": None},
+                {"symbol": "NIFTY PE", "quantity": -195, "exit_price": None},
+            ],
+        }
+        pe, ce, _ = compute_incremental_hedge_quantities(195)
+        self.assertEqual(pe, 195)
+        self.assertEqual(ce, 195)
+
+    def test_incremental_hedge_skips_when_existing_covers_new_sells(self):
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE["S1"] = {
+            "hedge_orders": [
+                {"side": "PE", "quantity": 390},
+                {"side": "CE", "quantity": 390},
+            ],
+        }
+        pe, ce = bot_tracked_hedge_buy_qty_by_side()
+        self.assertEqual(pe, 390)
+        pe_need, ce_need, _ = compute_incremental_hedge_quantities(195)
+        self.assertEqual(pe_need, 0)
+        self.assertEqual(ce_need, 0)
+
+    def test_hedge_orders_preferred_over_portfolio_side_qty_totals(self):
+        """Avoid double-counting when hedge_side_qty stored portfolio totals per strategy."""
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE["S1"] = {
+            "hedge_side_qty": {"PE": 390, "CE": 390},
+            "hedge_orders": [{"side": "PE", "quantity": 195}, {"side": "CE", "quantity": 195}],
+        }
+        STRATEGY_STATE["S2"] = {
+            "hedge_side_qty": {"PE": 390, "CE": 390},
+            "hedge_orders": [{"side": "PE", "quantity": 195}, {"side": "CE", "quantity": 195}],
+        }
+        pe, ce = bot_tracked_hedge_buy_qty_by_side()
+        self.assertEqual(pe, 390)
+        self.assertEqual(ce, 390)
 
 
 class TestStrikesCoverage(unittest.TestCase):

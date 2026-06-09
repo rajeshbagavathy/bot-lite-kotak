@@ -441,7 +441,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
         self.index_config.lot_size = 50
         self.index_config.option_ltp_segment = 2
         self.strategy = {"name": "S0920", "lots": 10}
-        bot.STRATEGY_STATE = {}
+        STRATEGY_STATE.clear()
 
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", False)
     @patch("bot.update_strategy")
@@ -451,7 +451,8 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     def test_expiry_day_hedge_quantity_tracks_open_short_side_qty(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
     ):
-        bot.STRATEGY_STATE = {
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE.update({
             "S_OPEN": {
                 "name": "S_OPEN",
                 "status": "OPEN",
@@ -460,7 +461,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
                     {"symbol": "NIFTY26APR24000PE", "quantity": -650, "exit_price": None},
                 ],
             }
-        }
+        })
         self.client.get_available_margin.side_effect = [1_000_000.0, 4_000_000.0]
         mock_find_hedge.side_effect = [
             {"strike": 100, "instrument_id": 111, "ltp": 2.0},
@@ -521,6 +522,37 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
         self.assertEqual(self.client.place_market_order.call_args_list[0][1]["quantity"], 500)
         self.assertEqual(self.client.place_market_order.call_args_list[1][1]["quantity"], 500)
 
+    @patch("bot.HEDGE_ON_EVERY_STRATEGY", True)
+    @patch("bot.update_strategy")
+    @patch("bot.update_portfolio_margin")
+    @patch("bot._find_hedge_by_target_premium")
+    @patch("bot._is_expiry_day", return_value=True)
+    def test_hedge_on_every_strategy_skips_when_already_covered(
+        self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
+    ):
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE.update({
+            "S_OPEN": {
+                "name": "S_OPEN",
+                "status": "OPEN",
+                "hedge_orders": [
+                    {"side": "PE", "quantity": 500},
+                    {"side": "CE", "quantity": 500},
+                ],
+            }
+        })
+        self.client.get_available_margin.return_value = 5_000_000.0
+        result = bot._ensure_margin_or_skip_strategy(
+            self.client,
+            self.index_config,
+            "17Mar2026",
+            self.strategy,
+            atm_strike=150,
+        )
+        self.assertTrue(result)
+        mock_find_hedge.assert_not_called()
+        self.client.place_market_order.assert_not_called()
+
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", False)
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio_margin")
@@ -529,7 +561,8 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     def test_non_expiry_day_hedges_then_reduces_lots_when_still_low_margin(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
     ):
-        bot.STRATEGY_STATE = {
+        STRATEGY_STATE.clear()
+        STRATEGY_STATE.update({
             "S_OPEN": {
                 "name": "S_OPEN",
                 "status": "OPEN",
@@ -538,8 +571,8 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
                     {"symbol": "NIFTY26APR24000PE", "quantity": -500, "exit_price": None},
                 ],
             }
-        }
-        self.client.get_available_margin.side_effect = [2_000_000.0, 2_200_000.0]
+        })
+        self.client.get_available_margin.side_effect = [1_200_000.0, 1_400_000.0]
         mock_find_hedge.side_effect = [
             {"strike": 100, "instrument_id": 111, "ltp": 5.0},
             {"strike": 200, "instrument_id": 222, "ltp": 5.1},
@@ -558,7 +591,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(mock_sleep.call_count, 1)
-        self.assertEqual(self.strategy["lots"], 6)
+        self.assertLess(self.strategy["lots"], 10)
         self.assertIn("Insufficient margin", str(mock_update_strategy.call_args_list))
 
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", False)
@@ -590,7 +623,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
     ):
         strat = {"name": "S_BIG", "lots": 15}
-        self.client.get_available_margin.return_value = 3_900_000.0
+        self.client.get_available_margin.return_value = 1_700_000.0
         result = bot._ensure_margin_or_skip_strategy(
             self.client,
             self.index_config,

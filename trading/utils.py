@@ -114,10 +114,35 @@ def bot_tracked_open_short_qty_by_side() -> Tuple[int, int]:
     return ce_short_qty, pe_short_qty
 
 
+def _hedge_qty_from_orders(orders: list) -> Tuple[int, int]:
+    pe_hedge_qty = 0
+    ce_hedge_qty = 0
+    for order in orders or []:
+        side = str(order.get("side") or "").upper()
+        try:
+            qty = int(order.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            continue
+        if side == "PE":
+            pe_hedge_qty += qty
+        elif side == "CE":
+            ce_hedge_qty += qty
+    return pe_hedge_qty, ce_hedge_qty
+
+
 def bot_tracked_hedge_buy_qty_by_side() -> Tuple[int, int]:
+    """Portfolio-wide far-OTM hedge buy qty (sum of per-strategy hedge_orders)."""
     pe_hedge_qty = 0
     ce_hedge_qty = 0
     for strategy in STRATEGY_STATE.values():
+        orders = strategy.get("hedge_orders") or []
+        if orders:
+            pe, ce = _hedge_qty_from_orders(orders)
+            pe_hedge_qty += pe
+            ce_hedge_qty += ce
+            continue
         side_qty = strategy.get("hedge_side_qty")
         if isinstance(side_qty, dict):
             try:
@@ -128,17 +153,28 @@ def bot_tracked_hedge_buy_qty_by_side() -> Tuple[int, int]:
                 ce_hedge_qty += int(side_qty.get("CE") or 0)
             except (TypeError, ValueError):
                 pass
-            continue
-        for order in strategy.get("hedge_orders") or []:
-            side = str(order.get("side") or "").upper()
-            try:
-                qty = int(order.get("quantity") or 0)
-            except (TypeError, ValueError):
-                qty = 0
-            if qty <= 0:
-                continue
-            if side == "PE":
-                pe_hedge_qty += qty
-            elif side == "CE":
-                ce_hedge_qty += qty
     return pe_hedge_qty, ce_hedge_qty
+
+
+def compute_incremental_hedge_quantities(planned_entry_qty: int) -> Tuple[int, int, dict]:
+    """
+    Far-OTM PE hedges CE shorts; CE hedges PE shorts.
+
+  Only return qty for *new* buys needed before this strategy's planned straddle sells.
+    """
+    ce_short_qty, pe_short_qty = bot_tracked_open_short_qty_by_side()
+    pe_hedged_qty, ce_hedged_qty = bot_tracked_hedge_buy_qty_by_side()
+    new_sell = max(int(planned_entry_qty or 0), 0)
+    total_ce_short = int(ce_short_qty) + new_sell
+    total_pe_short = int(pe_short_qty) + new_sell
+    pe_hedge_qty = max(0, total_ce_short - int(pe_hedged_qty))
+    ce_hedge_qty = max(0, total_pe_short - int(ce_hedged_qty))
+    return pe_hedge_qty, ce_hedge_qty, {
+        "ce_short_existing": int(ce_short_qty),
+        "pe_short_existing": int(pe_short_qty),
+        "pe_hedge_existing": int(pe_hedged_qty),
+        "ce_hedge_existing": int(ce_hedged_qty),
+        "planned_sell_qty": new_sell,
+        "total_ce_short_after": total_ce_short,
+        "total_pe_short_after": total_pe_short,
+    }
