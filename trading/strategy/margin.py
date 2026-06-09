@@ -160,14 +160,32 @@ def ensure_margin_or_skip_strategy(
                 update_strategy(name, status="ERROR", message="Unable to find hedge options")
                 return False
 
-            instruments = []
-            if pe_hedge and pe_hedge_qty > 0:
-                instruments.append({"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": int(pe_hedge["instrument_id"])})
-                hedge_strikes["PE"] = int(pe_hedge.get("strike"))
-            if ce_hedge and ce_hedge_qty > 0:
-                instruments.append({"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": int(ce_hedge["instrument_id"])})
-                hedge_strikes["CE"] = int(ce_hedge.get("strike"))
-            hedge_ltps = client.get_ltp_map(instruments) if instruments else {}
+            hedge_ltps: Dict[int, float] = {}
+            for hedge in (pe_hedge, ce_hedge):
+                if not hedge:
+                    continue
+                iid = int(hedge["instrument_id"])
+                hint = hedge.get("ltp")
+                if hint is not None:
+                    try:
+                        hedge_ltps[iid] = float(hint)
+                    except (TypeError, ValueError):
+                        pass
+
+            missing_quote: List[dict] = []
+            for hedge, qty in ((pe_hedge, pe_hedge_qty), (ce_hedge, ce_hedge_qty)):
+                if not hedge or qty <= 0:
+                    continue
+                iid = int(hedge["instrument_id"])
+                if iid not in hedge_ltps:
+                    missing_quote.append(
+                        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": iid}
+                    )
+                side = "PE" if hedge is pe_hedge else "CE"
+                hedge_strikes[side] = int(hedge.get("strike"))
+
+            if missing_quote:
+                hedge_ltps.update(client.get_ltp_map(missing_quote))
 
             placed_now: List[dict] = []
             for hedge, side, qty in ((pe_hedge, "PE", pe_hedge_qty), (ce_hedge, "CE", ce_hedge_qty)):

@@ -142,6 +142,7 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
     if strategy.get("status") == "WAITING_FOR_CALM":
         update_strategy(
             name,
+            status="ENTERING",
             message="Calm zone confirmed; running entry pipeline (strikes → margin → orders)",
             next_gatekeeper_check_at=get_ist_now().timestamp() + 600,
         )

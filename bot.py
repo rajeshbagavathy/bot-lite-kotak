@@ -317,56 +317,20 @@ def _find_hedge_by_target_premium(
     max_premium: float,
     max_steps: int = 40,
 ) -> Optional[dict]:
-    """
-    Find a far-OTM hedge option with LTP within [min_premium, max_premium], preferring
-    the *lowest* premium in range (closest to min_premium).
-    For CE: scans strikes above ATM; For PE: scans strikes below ATM.
-    Returns dict with strike, instrument_id, ltp.
-    """
-    direction = 1 if option_type.upper() == "CE" else -1
-    strike_diff = int(index_config.strike_diff)
+    """Delegate to modular hedge search (in-memory chain LTP; no batch quote hang)."""
+    from trading.strategy.strikes import find_hedge_by_target_premium
 
-    candidates: List[Tuple[int, int]] = []
-    for i in range(1, max_steps + 1):
-        strike = atm_strike + (i * strike_diff * direction)
-        instrument_id = client.get_option_instrument_id(index_config, expiry, option_type.upper(), strike)
-        if instrument_id:
-            try:
-                candidates.append((strike, int(instrument_id)))
-            except (TypeError, ValueError):
-                continue
-
-    if not candidates:
-        return None
-
-    instruments = [
-        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": instrument_id}
-        for _, instrument_id in candidates
-    ]
-    ltp_map = client.get_ltp_map(instruments)
-
-    best = None  # (distance_from_min, strike, instrument_id, ltp)
-    for strike, instrument_id in candidates:
-        ltp = ltp_map.get(instrument_id)
-        if ltp is None:
-            continue
-        try:
-            ltp_val = float(ltp)
-        except (TypeError, ValueError):
-            continue
-        if not (min_premium <= ltp_val <= max_premium):
-            continue
-        # User intent: when range is 2-8, prefer 2-ish hedge (cheapest in range),
-        # not mid/high values. Keep stable tiebreak by strike proximity via scan order.
-        diff = ltp_val - float(min_premium)
-        if best is None or diff < best[0]:
-            best = (diff, strike, instrument_id, ltp_val)
-
-    if best is None:
-        return None
-
-    _, strike, instrument_id, ltp_val = best
-    return {"strike": strike, "instrument_id": instrument_id, "ltp": ltp_val}
+    return find_hedge_by_target_premium(
+        client,
+        index_config,
+        expiry,
+        option_type,
+        atm_strike,
+        target_premium,
+        min_premium,
+        max_premium,
+        max_steps=max_steps,
+    )
 
 
 def _find_strike_by_premium(
