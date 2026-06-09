@@ -36,6 +36,19 @@ class TestKotakOptionChainCache(unittest.TestCase):
         self.assertEqual(pe, 101)
         self.assertEqual(client._api.search_scrip.call_count, 1)
 
+    @patch.object(KotakNeoClient, "_ensure", lambda self: None)
+    def test_chain_ltp_map_from_scrip_rows(self):
+        rows = [
+            {"pSymbol": 100, "pTrdSymbol": "NIFTY09JUN23200CE", "pOptionType": "CE", "pStrikePrice": 23200, "lLtp": 5.5},
+            {"pSymbol": 101, "pTrdSymbol": "NIFTY09JUN22000PE", "pOptionType": "PE", "pStrikePrice": 22000, "lLtp": 3.2},
+        ]
+        client = self._client_with_rows(rows)
+        cfg = INDEX_CONFIGS["NIFTY"]
+        client.warm_option_chain(cfg, "09JUN2026")
+        ltps = client.chain_ltp_map(cfg, "09JUN2026")
+        self.assertEqual(ltps[("CE", 23200)], 5.5)
+        self.assertEqual(ltps[("PE", 22000)], 3.2)
+
 
 if __name__ == "__main__":
     unittest.main()

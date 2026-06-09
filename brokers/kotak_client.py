@@ -720,6 +720,23 @@ class KotakNeoClient:
         )
         return len(chain)
 
+    def chain_ltp_map(self, index_config: IndexConfig, expiry: str) -> Dict[Tuple[str, int], float]:
+        """LTP hints from warmed scrip rows — no live quotes."""
+        exp = (expiry or "").strip().upper()
+        key = (index_config.name, exp)
+        out: Dict[Tuple[str, int], float] = {}
+        for row in self._option_chain_rows.get(key, []):
+            if not isinstance(row, dict):
+                continue
+            ot, strike = self._parse_scrip_strike_and_type(row)
+            if ot is None or strike is None:
+                continue
+            ltp = self._ltp_from_scrip_row(row)
+            if ltp is None:
+                continue
+            out[(ot, int(strike))] = float(ltp)
+        return out
+
     def get_option_instrument_id(
         self, index_config: IndexConfig, expiry: str, option_type: str, strike: int
     ) -> Optional[int]:

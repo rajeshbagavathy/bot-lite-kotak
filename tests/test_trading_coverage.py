@@ -233,7 +233,7 @@ class TestStrikesCoverage(unittest.TestCase):
 
     def test_find_hedge_no_match(self):
         self.client.get_option_instrument_id.return_value = 99
-        self.client.get_ltp_map.return_value = {99: 100.0}
+        self.client._token_meta = {99: {"ltp_hint": 100.0}}
         self.assertIsNone(
             find_hedge_by_target_premium(self.client, self.cfg, "12FEB2026", "CE", 22000, 5, 1, 3, max_steps=1)
         )
@@ -830,7 +830,7 @@ class TestRemainingCoverage(unittest.TestCase):
     def test_find_hedge_pe_direction(self):
         client = MagicMock()
         client.get_option_instrument_id.return_value = 55
-        client.get_ltp_map.return_value = {55: 5.0}
+        client._token_meta = {55: {"ltp_hint": 5.0}}
         out = find_hedge_by_target_premium(client, _index_cfg(), "12FEB2026", "PE", 22000, 5, 3, 10, max_steps=1)
         self.assertIsNotNone(out)
 
@@ -945,7 +945,7 @@ class TestRemainingCoverage(unittest.TestCase):
     def test_find_hedge_skips_bad_ltp(self):
         client = MagicMock()
         client.get_option_instrument_id.return_value = 1
-        client.get_ltp_map.return_value = {1: None}
+        client._token_meta = {1: {"ltp_hint": None}}
         self.assertIsNone(find_hedge_by_target_premium(client, _index_cfg(), "12FEB2026", "CE", 22000, 5, 1, 10, max_steps=1))
 
     def test_bot_tracked_invalid_qty_and_side(self):
@@ -1180,7 +1180,7 @@ class TestRemainingCoverage(unittest.TestCase):
     def test_find_hedge_bad_ltp_float(self):
         client = MagicMock()
         client.get_option_instrument_id.return_value = 1
-        client.get_ltp_map.return_value = {1: object()}
+        client._token_meta = {1: {"ltp_hint": object()}}
         self.assertIsNone(find_hedge_by_target_premium(client, _index_cfg(), "12FEB2026", "CE", 22000, 5, 1, 10, max_steps=1))
 
     def test_hedge_side_qty_ce_from_orders(self):
