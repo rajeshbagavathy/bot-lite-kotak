@@ -9,6 +9,26 @@ logger = logging.getLogger("xts-bot-lite")
 _QUOTE_BATCH_SIZE = 25
 
 
+def _ensure_chain_index(client: Any, index_config, expiry: str) -> int:
+    warm = getattr(client, "warm_option_chain", None)
+    if callable(warm):
+        try:
+            warm(index_config, expiry)
+        except Exception:
+            logger.debug("warm_option_chain failed", exc_info=True)
+    reindex = getattr(client, "reindex_option_chain", None)
+    if callable(reindex):
+        try:
+            return int(reindex(index_config, expiry))
+        except Exception:
+            logger.debug("reindex_option_chain failed", exc_info=True)
+    idx = getattr(client, "_option_id_index", None)
+    if isinstance(idx, dict):
+        exp = (expiry or "").strip().upper()
+        return sum(1 for k in idx if k[0] == index_config.name and k[1] == exp)
+    return 0
+
+
 def _chain_ltp_lookup(client: Any, index_config, expiry: str) -> Dict[Tuple[str, int], float]:
     fn = getattr(client, "chain_ltp_map", None)
     if callable(fn):
@@ -37,21 +57,6 @@ def _option_ltp_hint(client: Any, instrument_id: int) -> Optional[float]:
         return None
 
 
-def _indexed_instrument_id(client: Any, index_config, expiry: str, option_type: str, strike: int) -> Optional[int]:
-    """Lookup from warmed chain index only — never triggers live scrip search."""
-    fn = getattr(client, "get_option_instrument_id", None)
-    if not callable(fn):
-        return None
-    try:
-        return fn(index_config, expiry, option_type, strike, allow_search=False)
-    except TypeError:
-        idx = getattr(client, "_option_id_index", None)
-        if isinstance(idx, dict):
-            key = (index_config.name, (expiry or "").strip().upper(), option_type.upper(), int(strike))
-            return idx.get(key)
-        return None
-
-
 def _otm_indexed_candidates(
     client: Any,
     index_config,
@@ -60,19 +65,28 @@ def _otm_indexed_candidates(
     atm_strike: int,
     max_steps: int,
 ) -> List[Tuple[int, int]]:
+    """Far-OTM strikes from warmed ``_option_id_index`` only (no per-strike scrip search)."""
+    _ensure_chain_index(client, index_config, expiry)
     direction = 1 if option_type.upper() == "CE" else -1
     strike_diff = int(index_config.strike_diff)
     ot = option_type.upper()
+    exp = (expiry or "").strip().upper()
+    name = index_config.name
+    strike_to_iid: Dict[int, int] = {}
+    idx = getattr(client, "_option_id_index", None)
+    if isinstance(idx, dict):
+        for (iname, e, o, strike), tid in idx.items():
+            if iname == name and e == exp and o == ot:
+                try:
+                    strike_to_iid[int(strike)] = int(tid)
+                except (TypeError, ValueError):
+                    continue
     out: List[Tuple[int, int]] = []
     for i in range(1, max_steps + 1):
         strike = atm_strike + (i * strike_diff * direction)
-        instrument_id = _indexed_instrument_id(client, index_config, expiry, ot, strike)
-        if not instrument_id:
-            continue
-        try:
-            out.append((int(strike), int(instrument_id)))
-        except (TypeError, ValueError):
-            continue
+        iid = strike_to_iid.get(int(strike))
+        if iid is not None:
+            out.append((int(strike), iid))
     return out
 
 
@@ -112,12 +126,23 @@ def find_hedge_by_target_premium(
     max_premium: float,
     max_steps: int = 40,
 ) -> Optional[dict]:
-    """Pick far-OTM hedge from warmed chain; one batched quote if scrip rows lack LTP."""
+    """
+    Pick far-OTM hedge from warmed chain index, then one batched Kotak quote for premiums.
+
+    Matches pre-refactor behaviour (index + batch ``get_ltp_map``) without per-strike ``search_scrip``.
+    """
     ot = option_type.upper()
+    indexed_n = _ensure_chain_index(client, index_config, expiry)
     chain_ltps = _chain_ltp_lookup(client, index_config, expiry)
     candidates = _otm_indexed_candidates(client, index_config, expiry, ot, atm_strike, max_steps)
     if not candidates:
-        logger.warning("No indexed %s strikes within %d OTM steps of ATM %s", ot, max_steps, atm_strike)
+        logger.warning(
+            "No indexed %s strikes within %d OTM steps of ATM %s (index_entries=%d)",
+            ot,
+            max_steps,
+            atm_strike,
+            indexed_n,
+        )
         return None
 
     ltp_by_id: Dict[int, float] = {}
@@ -146,17 +171,20 @@ def find_hedge_by_target_premium(
             best = (diff, strike, iid, ltp_val)
 
     if best is None:
+        quoted = [ltp_by_id[i] for _, i in candidates if i in ltp_by_id]
+        sample = quoted[:5]
         logger.warning(
             "No %s hedge in ₹%.1f–₹%.1f band within %d steps of ATM %s "
-            "(candidates=%d, chain_ltps=%d, quoted=%d)",
+            "(candidates=%d, index_entries=%d, quoted=%d, sample_ltps=%s)",
             ot,
             min_premium,
             max_premium,
             max_steps,
             atm_strike,
             len(candidates),
-            len(chain_ltps),
-            len(ltp_by_id),
+            indexed_n,
+            len(quoted),
+            sample,
         )
         return None
     _, strike, instrument_id, ltp_val = best

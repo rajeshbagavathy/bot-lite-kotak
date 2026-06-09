@@ -689,6 +689,19 @@ class KotakNeoClient:
         }
         self._option_id_index[(index_name, exp, ot, int(strike))] = tid
 
+    def _indexed_strike_count(self, index_name: str, exp: str) -> int:
+        return sum(1 for k in self._option_id_index if k[0] == index_name and k[1] == exp)
+
+    def reindex_option_chain(self, index_config: IndexConfig, expiry: str) -> int:
+        """Rebuild ``_option_id_index`` from cached scrip rows (no API)."""
+        exp = (expiry or "").strip().upper()
+        key = (index_config.name, exp)
+        rows = self._option_chain_rows.get(key) or []
+        for row in rows:
+            if isinstance(row, dict):
+                self._register_scrip_row(index_config.name, exp, row)
+        return self._indexed_strike_count(index_config.name, exp)
+
     def warm_option_chain(self, index_config: IndexConfig, expiry: str) -> int:
         """Load full option chain for *expiry* in one scrip search (avoids per-strike API calls)."""
         self._ensure()
@@ -698,7 +711,10 @@ class KotakNeoClient:
         exp = (expiry or "").strip().upper()
         key = (index_config.name, exp)
         if key in self._option_chain_rows:
-            return sum(1 for k in self._option_id_index if k[0] == index_config.name and k[1] == exp)
+            indexed = self._indexed_strike_count(index_config.name, exp)
+            if indexed == 0 and self._option_chain_rows[key]:
+                indexed = self.reindex_option_chain(index_config, exp)
+            return indexed
         rows = self._api.search_scrip(
             exchange_segment=meta["fo_seg"],
             symbol=meta["search_symbol"],

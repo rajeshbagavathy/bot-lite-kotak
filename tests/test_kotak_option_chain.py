@@ -49,6 +49,17 @@ class TestKotakOptionChainCache(unittest.TestCase):
         self.assertEqual(ltps[("CE", 23200)], 5.5)
         self.assertEqual(ltps[("PE", 22000)], 3.2)
 
+    @patch.object(KotakNeoClient, "_ensure", lambda self: None)
+    def test_reindex_option_chain_from_cached_rows(self):
+        rows = [
+            {"pSymbol": 100, "pTrdSymbol": "NIFTY09JUN23200CE", "pOptionType": "CE", "pStrikePrice": 23200},
+        ]
+        client = self._client_with_rows(rows)
+        cfg = INDEX_CONFIGS["NIFTY"]
+        client._option_chain_rows[("NIFTY", "09JUN2026")] = rows
+        self.assertEqual(client.reindex_option_chain(cfg, "09JUN2026"), 1)
+        self.assertEqual(client.get_option_instrument_id(cfg, "09JUN2026", "CE", 23200, allow_search=False), 100)
+
 
 if __name__ == "__main__":
     unittest.main()
