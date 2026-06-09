@@ -104,22 +104,59 @@ def ensure_margin_or_skip_strategy(
             hedge_strikes: Dict[str, Optional[int]] = dict(strategy.get("hedge_strikes") or {"PE": None, "CE": None})
             strat_pe, strat_ce = _hedge_qty_from_orders(all_hedge_orders)
 
-            pe_hedge = (
-                resolve("_find_hedge_by_target_premium", find_hedge_by_target_premium)(
-                    client, index_config, expiry, "PE", atm_strike, target_premium, min_premium, max_premium
+            try:
+                pe_hedge = (
+                    resolve("_find_hedge_by_target_premium", find_hedge_by_target_premium)(
+                        client, index_config, expiry, "PE", atm_strike, target_premium, min_premium, max_premium
+                    )
+                    if pe_hedge_qty > 0
+                    else None
                 )
-                if pe_hedge_qty > 0
-                else None
-            )
-            ce_hedge = (
-                resolve("_find_hedge_by_target_premium", find_hedge_by_target_premium)(
-                    client, index_config, expiry, "CE", atm_strike, target_premium, min_premium, max_premium
+                ce_hedge = (
+                    resolve("_find_hedge_by_target_premium", find_hedge_by_target_premium)(
+                        client, index_config, expiry, "CE", atm_strike, target_premium, min_premium, max_premium
+                    )
+                    if ce_hedge_qty > 0
+                    else None
                 )
-                if ce_hedge_qty > 0
-                else None
-            )
+            except Exception as exc:
+                logger.exception("[%s] Hedge search failed", name)
+                journal(
+                    Phase.CRITERIA_FAILED,
+                    name,
+                    f"Hedge search error: {exc}",
+                    severity="ERROR",
+                    premium_band=[min_premium, max_premium],
+                )
+                update_strategy(name, status="ERROR", message=f"Hedge search error: {exc}"[:200])
+                return False
+
+            if pe_hedge:
+                journal(
+                    Phase.CRITERIA_CHECK,
+                    name,
+                    f"PE hedge strike {pe_hedge.get('strike')} LTP={pe_hedge.get('ltp')}",
+                    side="PE",
+                    **pe_hedge,
+                )
+            if ce_hedge:
+                journal(
+                    Phase.CRITERIA_CHECK,
+                    name,
+                    f"CE hedge strike {ce_hedge.get('strike')} LTP={ce_hedge.get('ltp')}",
+                    side="CE",
+                    **ce_hedge,
+                )
             if (pe_hedge_qty > 0 and not pe_hedge) or (ce_hedge_qty > 0 and not ce_hedge):
-                journal(Phase.CRITERIA_FAILED, name, "Unable to find hedge options", severity="ERROR")
+                journal(
+                    Phase.CRITERIA_FAILED,
+                    name,
+                    f"Unable to find hedge options in ₹{min_premium:.0f}–₹{max_premium:.0f} band",
+                    severity="ERROR",
+                    pe_needed=pe_hedge_qty,
+                    ce_needed=ce_hedge_qty,
+                    premium_band=[min_premium, max_premium],
+                )
                 update_strategy(name, status="ERROR", message="Unable to find hedge options")
                 return False
 

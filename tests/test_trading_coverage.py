@@ -223,6 +223,14 @@ class TestStrikesCoverage(unittest.TestCase):
         out = find_strike_by_premium(self.client, self.cfg, "12FEB2026", "CE", 22000, 150, 100, 200, max_steps=1)
         self.assertEqual(out, (22000, 103))
 
+    def test_find_hedge_uses_token_meta_hint(self):
+        client = MagicMock()
+        client._token_meta = {77: {"ltp_hint": 5.0, "trdSym": "NIFTYPE"}}
+        client.get_option_instrument_id.return_value = 77
+        out = find_hedge_by_target_premium(client, self.cfg, "12FEB2026", "PE", 22000, 5, 3, 10, max_steps=1)
+        self.assertEqual(out, {"strike": 21950, "instrument_id": 77, "ltp": 5.0})
+        client.get_ltp_map.assert_not_called()
+
     def test_find_hedge_no_match(self):
         self.client.get_option_instrument_id.return_value = 99
         self.client.get_ltp_map.return_value = {99: 100.0}

@@ -1,7 +1,44 @@
 """Strike and hedge selection."""
 from __future__ import annotations
 
+import logging
 from typing import Any, List, Optional, Tuple
+
+logger = logging.getLogger("xts-bot-lite")
+
+
+def _option_ltp_hint(client: Any, instrument_id: int) -> Optional[float]:
+    meta = getattr(client, "_token_meta", None)
+    if not isinstance(meta, dict):
+        return None
+    tm = meta.get(int(instrument_id)) or {}
+    if not isinstance(tm, dict):
+        return None
+    hint = tm.get("ltp_hint")
+    if hint is None:
+        return None
+    try:
+        return float(hint)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_single_option_ltp(client: Any, index_config, instrument_id: int) -> Optional[float]:
+    ltp_map = client.get_ltp_map(
+        [
+            {
+                "exchangeSegment": index_config.option_ltp_segment,
+                "exchangeInstrumentID": int(instrument_id),
+            }
+        ]
+    )
+    val = ltp_map.get(int(instrument_id))
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def find_hedge_by_target_premium(
@@ -15,39 +52,38 @@ def find_hedge_by_target_premium(
     max_premium: float,
     max_steps: int = 40,
 ) -> Optional[dict]:
+    """Pick far-OTM hedge; prefer cached scrip LTP hints to avoid slow bulk quote fallbacks."""
     direction = 1 if option_type.upper() == "CE" else -1
     strike_diff = int(index_config.strike_diff)
-    candidates: List[Tuple[int, int]] = []
+    best: Optional[Tuple[float, int, int, float]] = None
     for i in range(1, max_steps + 1):
         strike = atm_strike + (i * strike_diff * direction)
         instrument_id = client.get_option_instrument_id(index_config, expiry, option_type.upper(), strike)
-        if instrument_id:
-            try:
-                candidates.append((strike, int(instrument_id)))
-            except (TypeError, ValueError):
-                continue
-    if not candidates:
-        return None
-    instruments = [
-        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": iid}
-        for _, iid in candidates
-    ]
-    ltp_map = client.get_ltp_map(instruments)
-    best = None
-    for strike, instrument_id in candidates:
-        ltp = ltp_map.get(instrument_id)
-        if ltp is None:
+        if not instrument_id:
             continue
         try:
-            ltp_val = float(ltp)
+            iid = int(instrument_id)
         except (TypeError, ValueError):
+            continue
+        ltp_val = _option_ltp_hint(client, iid)
+        if ltp_val is None:
+            ltp_val = _fetch_single_option_ltp(client, index_config, iid)
+        if ltp_val is None:
             continue
         if not (min_premium <= ltp_val <= max_premium):
             continue
         diff = ltp_val - float(min_premium)
         if best is None or diff < best[0]:
-            best = (diff, strike, instrument_id, ltp_val)
+            best = (diff, strike, iid, ltp_val)
     if best is None:
+        logger.warning(
+            "No %s hedge in ₹%.1f–₹%.1f band within %d steps of ATM %s",
+            option_type.upper(),
+            min_premium,
+            max_premium,
+            max_steps,
+            atm_strike,
+        )
         return None
     _, strike, instrument_id, ltp_val = best
     return {"strike": strike, "instrument_id": instrument_id, "ltp": ltp_val}
@@ -84,6 +120,8 @@ def find_strike_by_premium(
     best: Optional[Tuple[float, int, int]] = None
     for strike, instrument_id in candidates:
         ltp = ltp_map.get(instrument_id)
+        if ltp is None:
+            ltp = _option_ltp_hint(client, instrument_id)
         if ltp is None:
             continue
         try:
