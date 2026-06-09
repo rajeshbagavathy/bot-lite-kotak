@@ -240,6 +240,15 @@ class TestStrikesCoverage(unittest.TestCase):
             find_hedge_by_target_premium(self.client, self.cfg, "12FEB2026", "CE", 22000, 5, 1, 3, max_steps=1)
         )
 
+    def test_find_hedge_batch_quote_when_no_chain_ltp(self):
+        client = MagicMock()
+        client.get_option_instrument_id.return_value = 88
+        client._token_meta = {}
+        client.get_ltp_map.return_value = {88: 5.0}
+        out = find_hedge_by_target_premium(client, self.cfg, "12FEB2026", "PE", 22000, 5, 3, 10, max_steps=1)
+        self.assertEqual(out, {"strike": 21950, "instrument_id": 88, "ltp": 5.0})
+        client.get_ltp_map.assert_called_once()
+
     def test_find_hedge_invalid_instrument_id(self):
         self.client.get_option_instrument_id.return_value = "bad"
         self.assertIsNone(find_hedge_by_target_premium(self.client, self.cfg, "12FEB2026", "PE", 22000, 5, 1, 10, max_steps=1))

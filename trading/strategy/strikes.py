@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("xts-bot-lite")
 
+_QUOTE_BATCH_SIZE = 25
+
 
 def _chain_ltp_lookup(client: Any, index_config, expiry: str) -> Dict[Tuple[str, int], float]:
     fn = getattr(client, "chain_ltp_map", None)
@@ -43,12 +45,60 @@ def _indexed_instrument_id(client: Any, index_config, expiry: str, option_type: 
     try:
         return fn(index_config, expiry, option_type, strike, allow_search=False)
     except TypeError:
-        # Older client stubs without allow_search
         idx = getattr(client, "_option_id_index", None)
         if isinstance(idx, dict):
             key = (index_config.name, (expiry or "").strip().upper(), option_type.upper(), int(strike))
             return idx.get(key)
         return None
+
+
+def _otm_indexed_candidates(
+    client: Any,
+    index_config,
+    expiry: str,
+    option_type: str,
+    atm_strike: int,
+    max_steps: int,
+) -> List[Tuple[int, int]]:
+    direction = 1 if option_type.upper() == "CE" else -1
+    strike_diff = int(index_config.strike_diff)
+    ot = option_type.upper()
+    out: List[Tuple[int, int]] = []
+    for i in range(1, max_steps + 1):
+        strike = atm_strike + (i * strike_diff * direction)
+        instrument_id = _indexed_instrument_id(client, index_config, expiry, ot, strike)
+        if not instrument_id:
+            continue
+        try:
+            out.append((int(strike), int(instrument_id)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _batch_quote_ltps(client: Any, index_config, instrument_ids: List[int]) -> Dict[int, float]:
+    if not instrument_ids:
+        return {}
+    seg = int(index_config.option_ltp_segment)
+    out: Dict[int, float] = {}
+    for start in range(0, len(instrument_ids), _QUOTE_BATCH_SIZE):
+        chunk = instrument_ids[start : start + _QUOTE_BATCH_SIZE]
+        instruments = [{"exchangeSegment": seg, "exchangeInstrumentID": iid} for iid in chunk]
+        try:
+            ltp_map = client.get_ltp_map(instruments)
+        except Exception:
+            logger.warning("Hedge quote batch failed for %d instrument(s)", len(chunk), exc_info=True)
+            continue
+        if not isinstance(ltp_map, dict):
+            continue
+        for iid, ltp in ltp_map.items():
+            if ltp is None:
+                continue
+            try:
+                out[int(iid)] = float(ltp)
+            except (TypeError, ValueError):
+                continue
+    return out
 
 
 def find_hedge_by_target_premium(
@@ -62,24 +112,31 @@ def find_hedge_by_target_premium(
     max_premium: float,
     max_steps: int = 40,
 ) -> Optional[dict]:
-    """Pick far-OTM hedge using in-memory scrip LTP only (no per-strike live quotes)."""
-    direction = 1 if option_type.upper() == "CE" else -1
-    strike_diff = int(index_config.strike_diff)
+    """Pick far-OTM hedge from warmed chain; one batched quote if scrip rows lack LTP."""
     ot = option_type.upper()
     chain_ltps = _chain_ltp_lookup(client, index_config, expiry)
-    best: Optional[Tuple[float, int, int, float]] = None
-    for i in range(1, max_steps + 1):
-        strike = atm_strike + (i * strike_diff * direction)
-        instrument_id = _indexed_instrument_id(client, index_config, expiry, ot, strike)
-        if not instrument_id:
-            continue
-        try:
-            iid = int(instrument_id)
-        except (TypeError, ValueError):
-            continue
-        ltp_val = chain_ltps.get((ot, int(strike)))
+    candidates = _otm_indexed_candidates(client, index_config, expiry, ot, atm_strike, max_steps)
+    if not candidates:
+        logger.warning("No indexed %s strikes within %d OTM steps of ATM %s", ot, max_steps, atm_strike)
+        return None
+
+    ltp_by_id: Dict[int, float] = {}
+    need_quote: List[int] = []
+    for strike, iid in candidates:
+        ltp_val = chain_ltps.get((ot, strike))
         if ltp_val is None:
             ltp_val = _option_ltp_hint(client, iid)
+        if ltp_val is not None:
+            ltp_by_id[iid] = float(ltp_val)
+        elif iid not in need_quote:
+            need_quote.append(iid)
+
+    if need_quote:
+        ltp_by_id.update(_batch_quote_ltps(client, index_config, need_quote))
+
+    best: Optional[Tuple[float, int, int, float]] = None
+    for strike, iid in candidates:
+        ltp_val = ltp_by_id.get(iid)
         if ltp_val is None:
             continue
         if not (min_premium <= ltp_val <= max_premium):
@@ -87,15 +144,19 @@ def find_hedge_by_target_premium(
         diff = ltp_val - float(min_premium)
         if best is None or diff < best[0]:
             best = (diff, strike, iid, ltp_val)
+
     if best is None:
         logger.warning(
-            "No %s hedge in ₹%.1f–₹%.1f band within %d steps of ATM %s (chain_ltps=%d, indexed_only=True)",
+            "No %s hedge in ₹%.1f–₹%.1f band within %d steps of ATM %s "
+            "(candidates=%d, chain_ltps=%d, quoted=%d)",
             ot,
             min_premium,
             max_premium,
             max_steps,
             atm_strike,
+            len(candidates),
             len(chain_ltps),
+            len(ltp_by_id),
         )
         return None
     _, strike, instrument_id, ltp_val = best
