@@ -446,7 +446,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", False)
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio_margin")
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     @patch("bot._is_expiry_day", return_value=True)
     def test_expiry_day_hedge_quantity_tracks_open_short_side_qty(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
@@ -495,7 +495,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", True)
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio_margin")
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     @patch("bot._is_expiry_day", return_value=True)
     def test_hedge_on_every_strategy_first_entry_buys_planned_qty(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
@@ -525,7 +525,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", True)
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio_margin")
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     @patch("bot._is_expiry_day", return_value=True)
     def test_hedge_on_every_strategy_skips_when_already_covered(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
@@ -556,7 +556,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", False)
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio_margin")
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     @patch("bot._is_expiry_day", return_value=False)
     def test_non_expiry_day_hedges_then_reduces_lots_when_still_low_margin(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy
@@ -617,7 +617,7 @@ class TestEnsureMarginOrSkipStrategy(unittest.TestCase):
     @patch("bot.HEDGE_ON_EVERY_STRATEGY", False)
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio_margin")
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     @patch("bot._is_expiry_day", return_value=True)
     def test_insufficient_margin_recomputes_then_reduces_one_without_hedge(
         self, mock_is_expiry, mock_find_hedge, mock_update_port_margin, mock_update_strategy

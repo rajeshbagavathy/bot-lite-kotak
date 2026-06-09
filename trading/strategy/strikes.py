@@ -35,6 +35,22 @@ def _option_ltp_hint(client: Any, instrument_id: int) -> Optional[float]:
         return None
 
 
+def _indexed_instrument_id(client: Any, index_config, expiry: str, option_type: str, strike: int) -> Optional[int]:
+    """Lookup from warmed chain index only — never triggers live scrip search."""
+    fn = getattr(client, "get_option_instrument_id", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn(index_config, expiry, option_type, strike, allow_search=False)
+    except TypeError:
+        # Older client stubs without allow_search
+        idx = getattr(client, "_option_id_index", None)
+        if isinstance(idx, dict):
+            key = (index_config.name, (expiry or "").strip().upper(), option_type.upper(), int(strike))
+            return idx.get(key)
+        return None
+
+
 def find_hedge_by_target_premium(
     client: Any,
     index_config,
@@ -54,7 +70,7 @@ def find_hedge_by_target_premium(
     best: Optional[Tuple[float, int, int, float]] = None
     for i in range(1, max_steps + 1):
         strike = atm_strike + (i * strike_diff * direction)
-        instrument_id = client.get_option_instrument_id(index_config, expiry, ot, strike)
+        instrument_id = _indexed_instrument_id(client, index_config, expiry, ot, strike)
         if not instrument_id:
             continue
         try:
@@ -73,7 +89,7 @@ def find_hedge_by_target_premium(
             best = (diff, strike, iid, ltp_val)
     if best is None:
         logger.warning(
-            "No %s hedge in ₹%.1f–₹%.1f band within %d steps of ATM %s (chain_ltps=%d)",
+            "No %s hedge in ₹%.1f–₹%.1f band within %d steps of ATM %s (chain_ltps=%d, indexed_only=True)",
             ot,
             min_premium,
             max_premium,

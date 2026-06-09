@@ -229,7 +229,9 @@ class TestStrikesCoverage(unittest.TestCase):
         client.get_option_instrument_id.return_value = 77
         out = find_hedge_by_target_premium(client, self.cfg, "12FEB2026", "PE", 22000, 5, 3, 10, max_steps=1)
         self.assertEqual(out, {"strike": 21950, "instrument_id": 77, "ltp": 5.0})
-        client.get_ltp_map.assert_not_called()
+        client.get_option_instrument_id.assert_called_with(
+            self.cfg, "12FEB2026", "PE", 21950, allow_search=False
+        )
 
     def test_find_hedge_no_match(self):
         self.client.get_option_instrument_id.return_value = 99
@@ -287,7 +289,7 @@ class TestMarginCoverage(unittest.TestCase):
     @patch("trading.strategy.margin.update_portfolio_margin")
     @patch("trading.strategy.margin.time.sleep")
     @patch("trading.strategy.margin.is_expiry_day", return_value=True)
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     def test_margin_hedge_success(self, mock_find, *_):
         mock_find.side_effect = [{"strike": 1, "instrument_id": 11}, {"strike": 2, "instrument_id": 22}]
         self.client.get_available_margin.side_effect = [5_000_000, 5_000_000]
@@ -310,7 +312,7 @@ class TestMarginCoverage(unittest.TestCase):
     @patch("trading.strategy.margin.update_strategy")
     @patch("trading.strategy.margin.update_portfolio_margin")
     @patch("trading.strategy.margin.is_expiry_day", return_value=True)
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     def test_margin_hedge_place_fail(self, mock_find, *_):
         mock_find.side_effect = [{"strike": 1, "instrument_id": 11}, {"strike": 2, "instrument_id": 22}]
         self.client.get_available_margin.return_value = 1_000_000
@@ -638,7 +640,7 @@ class TestRemainingCoverage(unittest.TestCase):
     @patch("trading.strategy.margin.update_strategy")
     @patch("trading.strategy.margin.update_portfolio_margin")
     @patch("trading.strategy.margin.is_expiry_day", return_value=True)
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     def test_margin_hedge_cancel_exception(self, mock_find, *_):
         mock_find.side_effect = [{"strike": 1, "instrument_id": 11}, {"strike": 2, "instrument_id": 22}]
         client = MagicMock()
@@ -812,7 +814,7 @@ class TestRemainingCoverage(unittest.TestCase):
     @patch("trading.strategy.margin.update_portfolio_margin")
     @patch("trading.strategy.margin.time.sleep")
     @patch("trading.strategy.margin.is_expiry_day", return_value=False)
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     def test_margin_low_margin_hedges_open_shorts(self, mock_find, *_):
         STRATEGY_STATE["OPEN"] = {
             "positions": [{"symbol": "NIFTY24MAR22000CE", "quantity": -130, "exit_price": None}],
@@ -907,7 +909,7 @@ class TestRemainingCoverage(unittest.TestCase):
     @patch("trading.strategy.margin.update_strategy")
     @patch("trading.strategy.margin.update_portfolio_margin")
     @patch("trading.strategy.margin.is_expiry_day", return_value=False)
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     def test_margin_pe_only_hedge(self, mock_find, *_):
         STRATEGY_STATE["X"] = {
             "positions": [{"symbol": "NIFTY24MAR22000CE", "quantity": -65, "exit_price": None}],
@@ -1025,7 +1027,7 @@ class TestRemainingCoverage(unittest.TestCase):
     @patch("trading.strategy.margin.update_strategy")
     @patch("trading.strategy.margin.update_portfolio_margin")
     @patch("trading.strategy.margin.is_expiry_day", return_value=False)
-    @patch("bot._find_hedge_by_target_premium")
+    @patch("trading.strategy.margin.find_hedge_by_target_premium")
     def test_margin_ce_hedge_only(self, mock_find, *_):
         STRATEGY_STATE["X"] = {
             "positions": [{"symbol": "NIFTY24MAR22000PE", "quantity": -65, "exit_price": None}],

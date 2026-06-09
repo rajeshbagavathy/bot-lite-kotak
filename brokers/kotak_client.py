@@ -738,7 +738,7 @@ class KotakNeoClient:
         return out
 
     def get_option_instrument_id(
-        self, index_config: IndexConfig, expiry: str, option_type: str, strike: int
+        self, index_config: IndexConfig, expiry: str, option_type: str, strike: int, *, allow_search: bool = True
     ) -> Optional[int]:
         self._ensure()
         meta = KOTAK_INDEX_META.get(index_config.name)
@@ -753,6 +753,8 @@ class KotakNeoClient:
         cached = self._option_id_index.get(cache_key)
         if cached is not None:
             return cached
+        if not allow_search:
+            return None
         rows = self._api.search_scrip(
             exchange_segment=meta["fo_seg"],
             symbol=meta["search_symbol"],

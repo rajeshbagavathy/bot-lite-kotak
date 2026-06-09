@@ -106,14 +106,14 @@ def ensure_margin_or_skip_strategy(
 
             try:
                 pe_hedge = (
-                    resolve("_find_hedge_by_target_premium", find_hedge_by_target_premium)(
+                    find_hedge_by_target_premium(
                         client, index_config, expiry, "PE", atm_strike, target_premium, min_premium, max_premium
                     )
                     if pe_hedge_qty > 0
                     else None
                 )
                 ce_hedge = (
-                    resolve("_find_hedge_by_target_premium", find_hedge_by_target_premium)(
+                    find_hedge_by_target_premium(
                         client, index_config, expiry, "CE", atm_strike, target_premium, min_premium, max_premium
                     )
                     if ce_hedge_qty > 0
@@ -130,6 +130,14 @@ def ensure_margin_or_skip_strategy(
                 )
                 update_strategy(name, status="ERROR", message=f"Hedge search error: {exc}"[:200])
                 return False
+
+            journal(
+                Phase.CRITERIA_CHECK,
+                name,
+                f"Hedge search done PE={'yes' if pe_hedge else 'no'} CE={'yes' if ce_hedge else 'no'}",
+                pe_hedge=pe_hedge,
+                ce_hedge=ce_hedge,
+            )
 
             if pe_hedge:
                 journal(
