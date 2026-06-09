@@ -643,15 +643,30 @@ class KotakNeoClient:
         return [e for e in out if e.date() >= today]
 
     @staticmethod
+    def _normalize_kotak_strike_value(strike_raw: Any) -> Optional[int]:
+        """Kotak FO scrip master stores strike in ``dStrikePrice;`` as strike×100 (e.g. 2310000 → 23100)."""
+        if strike_raw is None:
+            return None
+        try:
+            v = float(strike_raw)
+        except (TypeError, ValueError):
+            return None
+        if v <= 0:
+            return None
+        if v >= 100_000:
+            return int(round(v / 100.0))
+        return int(round(v))
+
+    @staticmethod
     def _parse_scrip_strike_and_type(row: dict) -> Tuple[Optional[str], Optional[int]]:
         ot = str(row.get("pOptionType") or "").strip().upper()
-        strike_raw = row.get("pStrikePrice") or row.get("lStrikePrice") or row.get("dStrikePrice")
-        strike: Optional[int] = None
-        if strike_raw is not None:
-            try:
-                strike = int(float(strike_raw))
-            except (TypeError, ValueError):
-                strike = None
+        strike_raw = (
+            row.get("pStrikePrice")
+            or row.get("lStrikePrice")
+            or row.get("dStrikePrice")
+            or row.get("dStrikePrice;")
+        )
+        strike = KotakNeoClient._normalize_kotak_strike_value(strike_raw)
         sym = str(row.get("pTrdSymbol") or row.get("trdSym") or "").replace(" ", "").upper()
         if ot not in ("CE", "PE"):
             if sym.endswith("CE"):
@@ -659,7 +674,10 @@ class KotakNeoClient:
             elif sym.endswith("PE"):
                 ot = "PE"
         if strike is None and sym:
-            m = re.search(r"(\d+)(CE|PE)$", sym)
+            # Kotak symbols embed expiry before strike: NIFTY09JUN202623100PE → strike 23100 (not 202623100).
+            m = re.search(r"^NIFTY\d{2}[A-Z]{3}\d{4}(\d{4,6})(CE|PE)$", sym)
+            if not m:
+                m = re.search(r"(\d{5})(CE|PE)$", sym)
             if m:
                 strike = int(m.group(1))
                 if ot not in ("CE", "PE"):
@@ -712,7 +730,7 @@ class KotakNeoClient:
         key = (index_config.name, exp)
         if key in self._option_chain_rows:
             indexed = self._indexed_strike_count(index_config.name, exp)
-            if indexed == 0 and self._option_chain_rows[key]:
+            if self._option_chain_rows[key]:
                 indexed = self.reindex_option_chain(index_config, exp)
             return indexed
         rows = self._api.search_scrip(

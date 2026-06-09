@@ -22,8 +22,18 @@ class TestKotakOptionChainCache(unittest.TestCase):
     @patch.object(KotakNeoClient, "_ensure", lambda self: None)
     def test_warm_option_chain_indexes_strikes(self):
         rows = [
-            {"pSymbol": 100, "pTrdSymbol": "NIFTY09JUN23200CE", "pOptionType": "CE", "pStrikePrice": 23200},
-            {"pSymbol": 101, "pTrdSymbol": "NIFTY09JUN23200PE", "pOptionType": "PE", "pStrikePrice": 23200},
+            {
+                "pSymbol": 100,
+                "pTrdSymbol": "NIFTY09JUN202623200CE",
+                "pOptionType": "CE",
+                "dStrikePrice;": 2320000,
+            },
+            {
+                "pSymbol": 101,
+                "pTrdSymbol": "NIFTY09JUN202623200PE",
+                "pOptionType": "PE",
+                "dStrikePrice;": 2320000,
+            },
         ]
         client = self._client_with_rows(rows)
         cfg = INDEX_CONFIGS["NIFTY"]
@@ -48,6 +58,24 @@ class TestKotakOptionChainCache(unittest.TestCase):
         ltps = client.chain_ltp_map(cfg, "09JUN2026")
         self.assertEqual(ltps[("CE", 23200)], 5.5)
         self.assertEqual(ltps[("PE", 22000)], 3.2)
+
+    def test_parse_kotak_strike_from_dStrikePrice_semicolon(self):
+        ot, strike = KotakNeoClient._parse_scrip_strike_and_type(
+            {
+                "pTrdSymbol": "NIFTY09JUN202623100PE",
+                "pOptionType": "PE",
+                "dStrikePrice;": 2310000,
+            }
+        )
+        self.assertEqual(ot, "PE")
+        self.assertEqual(strike, 23100)
+
+    def test_parse_strike_from_symbol_without_swallowing_expiry(self):
+        ot, strike = KotakNeoClient._parse_scrip_strike_and_type(
+            {"pTrdSymbol": "NIFTY09JUN202623200CE", "pOptionType": "CE"}
+        )
+        self.assertEqual(ot, "CE")
+        self.assertEqual(strike, 23200)
 
     @patch.object(KotakNeoClient, "_ensure", lambda self: None)
     def test_reindex_option_chain_from_cached_rows(self):
