@@ -25,6 +25,8 @@ def main() -> int:
         calculate_mtm,
         calculate_mtm_from_kotak_broker_pnl,
         calculate_mtm_kotak_amounts,
+        calculate_portfolio_mtm_from_broker,
+        is_fno_market_open,
         mtm_position_breakdown,
     )
 
@@ -48,15 +50,19 @@ def main() -> int:
     ]
     ltp_map = client.get_ltp_map(instruments)
 
+    mo = is_fno_market_open()
+    port = calculate_portfolio_mtm_from_broker(positions, ltp_map, market_open=mo)
     amt = calculate_mtm_kotak_amounts(positions, ltp_map)
     rpnl = calculate_mtm_from_kotak_broker_pnl(positions)
     xts = calculate_mtm(positions, ltp_map)
-    breakdown = mtm_position_breakdown(positions, ltp_map)
+    breakdown = mtm_position_breakdown(positions, ltp_map if mo else {})
 
     payload = {
         "expiry": expiry,
+        "market_open": mo,
         "raw_row_count": len((raw or {}).get("data") or []),
         "normalized_positions": len(positions),
+        "portfolio_mtm": {"realized": port[0], "unrealized": port[1], "total": port[2], "source": port[3]},
         "mtm_kotak_amounts": amt,
         "mtm_rpnl_upnl": rpnl,
         "mtm_xts_style": {"realized": xts[0], "unrealized": xts[1], "total": xts[2]},

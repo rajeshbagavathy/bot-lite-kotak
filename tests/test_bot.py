@@ -867,19 +867,20 @@ class TestMonitorMTM(unittest.TestCase):
         """Restore original STRATEGY_STATE."""
         bot.STRATEGY_STATE = self.original_strategy_state
 
+    @patch("bot.is_fno_market_open", return_value=True)
     @patch("bot._adjust_survivor_sl_to_cost_after_peer_sl")
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio")
     @patch("bot.calculate_strategy_mtm")
-    @patch("bot.calculate_portfolio_mtm_from_strategies")
-    def test_monitor_mtm_normal(self, mock_calc_port, mock_calc_mtm_inst, mock_update_port, mock_update_strat, mock_survivor):
+    @patch("bot.calculate_portfolio_mtm_from_broker")
+    def test_monitor_mtm_normal(self, mock_calc_port, mock_calc_mtm_inst, mock_update_port, mock_update_strat, mock_survivor, _mo):
         """Test normal MTM monitoring."""
         positions = [
             {"ExchangeInstrumentId": "12345", "Quantity": "-520"},
         ]
         self.client.get_positions.return_value = positions
         self.client.get_ltp_map.return_value = {}
-        mock_calc_port.return_value = (1000.0, 500.0, 1500.0)  # realized, unrealized, overall
+        mock_calc_port.return_value = (1000.0, 500.0, 1500.0, "broker_kotak_amounts")
         mock_calc_mtm_inst.return_value = (500.0, 250.0, 750.0)
         
         bot._monitor_mtm(self.client, self.index_config, -80000.0)
@@ -888,38 +889,40 @@ class TestMonitorMTM(unittest.TestCase):
         # S0920 should be updated, S1001 should be skipped (no instrument_ids)
         self.assertEqual(mock_update_strat.call_count, 1)
 
+    @patch("bot.is_fno_market_open", return_value=True)
     @patch("bot._close_strategy")
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio")
     @patch("bot.calculate_strategy_mtm")
-    @patch("bot.calculate_portfolio_mtm_from_strategies")
+    @patch("bot.calculate_portfolio_mtm_from_broker")
     def test_monitor_mtm_strategy_sl_hit(
-        self, mock_calc_port, mock_calc_mtm_inst, mock_update_port, mock_update_strat, mock_close_strat
+        self, mock_calc_port, mock_calc_mtm_inst, mock_update_port, mock_update_strat, mock_close_strat, _mo
     ):
         """Test strategy SL hit."""
         positions = []
         self.client.get_positions.return_value = positions
         self.client.get_ltp_map.return_value = {}
-        mock_calc_port.return_value = (0.0, -20000.0, -20000.0)
+        mock_calc_port.return_value = (0.0, -20000.0, -20000.0, "broker_kotak_amounts")
         mock_calc_mtm_inst.return_value = (0.0, -17000.0, -17000.0)  # Below -16000 SL
         
         bot._monitor_mtm(self.client, self.index_config, -80000.0)
         
         mock_close_strat.assert_called_once()
 
+    @patch("bot.is_fno_market_open", return_value=True)
     @patch("bot._square_off_all")
     @patch("bot.update_strategy")
     @patch("bot.update_portfolio")
     @patch("bot.calculate_strategy_mtm")
-    @patch("bot.calculate_portfolio_mtm_from_strategies")
+    @patch("bot.calculate_portfolio_mtm_from_broker")
     def test_monitor_mtm_portfolio_sl_hit(
-        self, mock_calc_port, mock_calc_mtm_inst, mock_update_port, mock_update_strat, mock_square_off
+        self, mock_calc_port, mock_calc_mtm_inst, mock_update_port, mock_update_strat, mock_square_off, _mo
     ):
         """Test portfolio SL hit."""
         positions = []
         self.client.get_positions.return_value = positions
         self.client.get_ltp_map.return_value = {}
-        mock_calc_port.return_value = (0.0, -85000.0, -85000.0)  # Below -80000 SL
+        mock_calc_port.return_value = (0.0, -85000.0, -85000.0, "broker_kotak_amounts")
         mock_calc_mtm_inst.return_value = (0.0, -10000.0, -10000.0)
         
         bot._monitor_mtm(self.client, self.index_config, -80000.0)
@@ -929,12 +932,13 @@ class TestMonitorMTM(unittest.TestCase):
         close_calls = [call for call in mock_update_strat.call_args_list if "CLOSED" in str(call)]
         self.assertGreaterEqual(len(close_calls), 2)
 
-    @patch("bot.calculate_portfolio_mtm_from_strategies", return_value=(0.0, -4600.0, -4600.0))
+    @patch("bot.is_fno_market_open", return_value=True)
+    @patch("bot.calculate_portfolio_mtm_from_broker", return_value=(0.0, -4600.0, -4600.0, "broker_kotak_amounts"))
     @patch("bot._close_strategy_via_open_sl_orders")
     @patch("bot.update_strategy")
     @patch("bot.calculate_strategy_mtm")
     def test_monitor_mtm_multi_strategy_conflict_fix(
-        self, mock_calc_mtm_inst, mock_update_strat, mock_close_via_sl, _mock_port
+        self, mock_calc_mtm_inst, mock_update_strat, mock_close_via_sl, _mock_port, _mo
     ):
         """
         Test that closing one strategy via _close_strategy_via_open_sl_orders()

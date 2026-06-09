@@ -1,4 +1,4 @@
-"""Portfolio MTM from strategies + hedges."""
+"""Portfolio MTM from broker positions."""
 
 import os
 import sys
@@ -6,51 +6,56 @@ import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from mtm import calculate_portfolio_mtm_from_strategies  # noqa: E402
+from mtm import (  # noqa: E402
+    calculate_mtm_kotak_booked_only,
+    calculate_portfolio_mtm_from_broker,
+)
 
 
-class TestPortfolioMtmFromStrategies(unittest.TestCase):
-    def test_straddle_plus_hedge(self):
-        strategies = [
+class TestPortfolioMtmFromBroker(unittest.TestCase):
+    def test_booked_only_after_close(self):
+        positions = [
             {
-                "name": "S1",
-                "status": "OPEN",
-                "instrument_ids": [100, 200],
-                "positions": [
-                    {"instrument_id": 100, "quantity": -195, "entry_price": 77.6},
-                    {"instrument_id": 200, "quantity": -195, "entry_price": 79.85},
-                ],
+                "ExchangeInstrumentId": 1,
+                "Quantity": 0,
+                "KotakBuyAmount": 5000.0,
+                "KotakSellAmount": 4500.0,
+                "Multiplier": 1,
             },
             {
-                "name": "S2",
-                "status": "OPEN",
-                "instrument_ids": [100, 200],
-                "positions": [
-                    {"instrument_id": 100, "quantity": -195, "entry_price": 74.55},
-                    {"instrument_id": 200, "quantity": -195, "entry_price": 81.05},
-                ],
+                "ExchangeInstrumentId": 2,
+                "Quantity": 0,
+                "KotakBuyAmount": 100.0,
+                "KotakSellAmount": 200.0,
+                "Multiplier": 1,
             },
         ]
-        broker = [
+        r, u, t = calculate_mtm_kotak_booked_only(positions)
+        self.assertEqual(u, 0.0)
+        self.assertAlmostEqual(t, -400.0)  # -500 + 100
+        self.assertAlmostEqual(r, -400.0)
+
+        br, bu, bt, src = calculate_portfolio_mtm_from_broker(positions, {}, market_open=False)
+        self.assertEqual(src, "broker_booked_closed")
+        self.assertAlmostEqual(bt, -400.0)
+
+    def test_open_short_uses_ltp_when_market_open(self):
+        positions = [
             {
-                "ExchangeInstrumentId": 300,
-                "Quantity": 390,
-                "KotakBuyAmount": 887.25,
-                "KotakSellAmount": 0.0,
+                "ExchangeInstrumentId": 42272,
+                "Quantity": -195,
+                "KotakBuyAmount": 0.0,
+                "KotakSellAmount": 15132.0,
+                "OpenSellQuantity": 195,
+                "OpenBuyQuantity": 0,
+                "SumOfTradedQuantityAndPriceSell": 15132.0,
+                "SumOfTradedQuantityAndPriceBuy": 0.0,
                 "Multiplier": 1,
-                "OpenBuyQuantity": 390,
-                "OpenSellQuantity": 0,
-                "SumOfTradedQuantityAndPriceBuy": 887.25,
-                "SumOfTradedQuantityAndPriceSell": 0.0,
             }
         ]
-        ltp = {100: 50.0, 200: 32.0, 300: 0.45}
-        _, _, total = calculate_portfolio_mtm_from_strategies(strategies, broker, ltp)
-        # CE shorts profit + PE shorts profit + small hedge loss ≈ not dominated by one leg
-        ce_pnl = (77.6 - 50) * 195 + (74.55 - 50) * 195
-        pe_pnl = (79.85 - 32) * 195 + (81.05 - 32) * 195
-        hedge_pnl = (0.45 - 887.25 / 390) * 390
-        self.assertAlmostEqual(total, ce_pnl + pe_pnl + hedge_pnl, places=0)
+        _, _, total, src = calculate_portfolio_mtm_from_broker(positions, {42272: 60.0}, market_open=True)
+        self.assertEqual(src, "broker_kotak_amounts")
+        self.assertGreater(total, 3000.0)
 
 
 if __name__ == "__main__":

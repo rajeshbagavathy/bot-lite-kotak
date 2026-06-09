@@ -145,11 +145,9 @@ from db import (
     fetch_recent_calm_spot_row,
 )
 from mtm import (
-    calculate_mtm,
-    calculate_mtm_from_kotak_broker_pnl,
-    calculate_mtm_kotak_amounts,
-    calculate_portfolio_mtm_from_strategies,
+    calculate_portfolio_mtm_from_broker,
     calculate_strategy_mtm,
+    is_fno_market_open,
     mtm_position_breakdown,
 )
 from state import (
@@ -1838,11 +1836,15 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
             except Exception:
                 logger.debug("MTM LTP fallback failed for %s", iid, exc_info=True)
 
-    realized, unrealized, overall = calculate_portfolio_mtm_from_strategies(
-        STRATEGY_STATE.values(), positions, ltp_map
-    )
-    mtm_source = "strategies_plus_hedges"
-    update_portfolio(overall, realized, unrealized, portfolio_sl)
+    market_open = is_fno_market_open()
+    if positions or market_open:
+        realized, unrealized, overall, mtm_source = calculate_portfolio_mtm_from_broker(
+            positions, ltp_map, market_open=market_open
+        )
+        update_portfolio(overall, realized, unrealized, portfolio_sl)
+    else:
+        mtm_source = "broker_empty_after_close"
+        realized = unrealized = overall = 0.0
 
     global _LAST_PORTFOLIO_MTM_LOG
     now_ts = time.time()
@@ -1858,47 +1860,31 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
             _, _, st = calculate_strategy_mtm(s_pos, ltp_map)
             strat_sum += st
             logger.info(
-                "  MTM strategy %s total=%.2f legs=%d",
+                "  MTM strategy %s total=%.2f legs=%d (display only)",
                 strategy.get("name"),
                 st,
                 len(s_pos),
             )
-        strat_inst: set[int] = set()
-        for s in STRATEGY_STATE.values():
-            if s.get("status") != "OPEN":
-                continue
-            for i in s.get("instrument_ids") or []:
-                try:
-                    strat_inst.add(int(i))
-                except (TypeError, ValueError):
-                    pass
-            for p in s.get("positions") or []:
-                try:
-                    pid = int(p.get("instrument_id") or 0)
-                except (TypeError, ValueError):
-                    pid = 0
-                if pid:
-                    strat_inst.add(pid)
-        hedge_breakdown = mtm_position_breakdown(
-            [p for p in positions if int(p.get("ExchangeInstrumentId") or 0) not in strat_inst],
-            ltp_map,
-        )
+        broker_breakdown = mtm_position_breakdown(positions, ltp_map if market_open else {})
         logger.info(
-            "Portfolio MTM %.2f (realized=%.2f unrealized=%.2f source=%s strat_sum=%.2f hedge_legs=%d)",
+            "Portfolio MTM %.2f (realized=%.2f unrealized=%.2f source=%s market_open=%s "
+            "broker_legs=%d strat_sum_display=%.2f)",
             overall,
             realized,
             unrealized,
             mtm_source,
+            market_open,
+            len(broker_breakdown),
             strat_sum,
-            len(hedge_breakdown),
         )
-        for row in hedge_breakdown[:8]:
+        for row in broker_breakdown[:12]:
             logger.info(
-                "  MTM hedge %s id=%s qty=%s ltp=%s total=%.2f",
+                "  MTM broker %s id=%s qty=%s ltp=%s booked=%.2f total=%.2f",
                 row.get("symbol"),
                 row.get("instrument_id"),
                 row.get("qty"),
                 row.get("ltp"),
+                row.get("booked", 0),
                 row.get("total_pnl", 0),
             )
 

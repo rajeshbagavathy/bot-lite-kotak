@@ -74,6 +74,61 @@ def calculate_mtm_kotak_amounts(
     return realized, unrealized, realized + unrealized
 
 
+def is_fno_market_open(now=None) -> bool:
+    """NSE F&O regular session 09:15–15:30 IST (no holiday calendar)."""
+    from db import get_ist_now
+
+    t = (now or get_ist_now()).time()
+    return (t.hour, t.minute) >= (9, 15) and (t.hour, t.minute) <= (15, 30)
+
+
+def calculate_mtm_kotak_booked_only(
+    positions: Iterable[dict],
+) -> Tuple[float, float, float]:
+    """Settled / after-hours P&L: sum ``sellAmt - buyAmt`` only (no LTP)."""
+    realized = 0.0
+    for pos in positions:
+        buy_amt = _safe_float(pos.get("KotakBuyAmount"))
+        sell_amt = _safe_float(pos.get("KotakSellAmount"))
+        if buy_amt == 0.0 and sell_amt == 0.0:
+            continue
+        realized += sell_amt - buy_amt
+    return realized, 0.0, realized
+
+
+def calculate_portfolio_mtm_from_broker(
+    broker_positions: Iterable[dict],
+    ltp_map: Dict[int, float],
+    *,
+    market_open: bool = True,
+) -> Tuple[float, float, float, str]:
+    """
+    Portfolio MTM from Kotak ``positions()`` only (matches broker RMS; no per-strategy double-count).
+
+    When market is closed, uses booked cashflows only — after-hours quotes are unreliable.
+    """
+    pos_list = list(broker_positions)
+    if not pos_list:
+        return 0.0, 0.0, 0.0, "broker_empty"
+
+    if not market_open:
+        r, u, t = calculate_mtm_kotak_booked_only(pos_list)
+        return r, u, t, "broker_booked_closed"
+
+    broker_pnl = calculate_mtm_from_kotak_broker_pnl(pos_list)
+    if broker_pnl is not None:
+        r, u, t = broker_pnl
+        return r, u, t, "broker_rpnl_upnl"
+
+    kotak_amt = calculate_mtm_kotak_amounts(pos_list, ltp_map)
+    if kotak_amt is not None:
+        r, u, t = kotak_amt
+        return r, u, t, "broker_kotak_amounts"
+
+    r, u, t = calculate_mtm(pos_list, ltp_map)
+    return r, u, t, "broker_xts_fallback"
+
+
 def calculate_portfolio_mtm_from_strategies(
     strategies: Iterable[dict],
     broker_positions: Iterable[dict],
@@ -143,14 +198,14 @@ def mtm_position_breakdown(
     rows: List[dict] = []
     for pos in positions:
         qty = _safe_int(pos.get("Quantity"))
-        if qty == 0:
-            continue
-        iid = _safe_int(pos.get("ExchangeInstrumentId"))
         buy_amt = _safe_float(pos.get("KotakBuyAmount"))
         sell_amt = _safe_float(pos.get("KotakSellAmount"))
+        booked = sell_amt - buy_amt
+        if qty == 0 and abs(booked) < 0.01:
+            continue
+        iid = _safe_int(pos.get("ExchangeInstrumentId"))
         ltp = ltp_map.get(iid) if iid else None
         mult = _safe_int(pos.get("Multiplier"), 1)
-        booked = sell_amt - buy_amt
         if ltp is not None and qty != 0:
             total = booked + float(qty) * float(ltp) * mult
         else:
