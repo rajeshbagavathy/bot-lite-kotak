@@ -148,6 +148,7 @@ from mtm import (
     calculate_mtm,
     calculate_mtm_from_kotak_broker_pnl,
     calculate_mtm_kotak_amounts,
+    calculate_portfolio_mtm_from_strategies,
     calculate_strategy_mtm,
     mtm_position_breakdown,
 )
@@ -1799,17 +1800,36 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
         order_book = client.get_order_book()
     except Exception:
         order_book = None
-    instruments = [
-        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": pos["ExchangeInstrumentId"]}
-        for pos in positions
-        if int(pos.get("ExchangeInstrumentId") or 0) != 0
-    ]
-    ltp_map = client.get_ltp_map(instruments)
+    quote_ids: set[int] = set()
     for pos in positions:
         iid = int(pos.get("ExchangeInstrumentId") or 0)
-        if iid == 0 or iid in ltp_map:
+        if iid:
+            quote_ids.add(iid)
+    for strategy in STRATEGY_STATE.values():
+        if strategy.get("status") != "OPEN":
             continue
-        get_ltp = getattr(client, "get_option_ltp", None)
+        for iid in strategy.get("instrument_ids") or []:
+            try:
+                quote_ids.add(int(iid))
+            except (TypeError, ValueError):
+                pass
+        for p in strategy.get("positions") or []:
+            try:
+                iid = int(p.get("instrument_id") or 0)
+            except (TypeError, ValueError):
+                iid = 0
+            if iid:
+                quote_ids.add(iid)
+
+    instruments = [
+        {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": iid}
+        for iid in sorted(quote_ids)
+    ]
+    ltp_map = client.get_ltp_map(instruments)
+    get_ltp = getattr(client, "get_option_ltp", None)
+    for iid in quote_ids:
+        if iid in ltp_map:
+            continue
         if callable(get_ltp):
             try:
                 px = get_ltp(index_config, iid)
@@ -1817,50 +1837,68 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
                     ltp_map[iid] = float(px)
             except Exception:
                 logger.debug("MTM LTP fallback failed for %s", iid, exc_info=True)
-    limits_mtm = None
-    if hasattr(client, "get_portfolio_mtm_from_limits"):
-        try:
-            limits_mtm = client.get_portfolio_mtm_from_limits()
-        except Exception:
-            logger.debug("Broker limits MTM unavailable", exc_info=True)
-    mtm_source = "kotak_amounts"
-    kotak_amt_mtm = calculate_mtm_kotak_amounts(positions, ltp_map)
-    if kotak_amt_mtm is not None:
-        realized, unrealized, overall = kotak_amt_mtm
-    else:
-        broker_pos_pnl = calculate_mtm_from_kotak_broker_pnl(positions)
-        if broker_pos_pnl is not None:
-            mtm_source = "kotak_rpnl_upnl"
-            realized, unrealized, overall = broker_pos_pnl
-        elif limits_mtm is not None:
-            mtm_source = "kotak_limits"
-            realized, unrealized, overall = limits_mtm
-        else:
-            mtm_source = "xts_positions"
-            realized, unrealized, overall = calculate_mtm(positions, ltp_map)
+
+    realized, unrealized, overall = calculate_portfolio_mtm_from_strategies(
+        STRATEGY_STATE.values(), positions, ltp_map
+    )
+    mtm_source = "strategies_plus_hedges"
     update_portfolio(overall, realized, unrealized, portfolio_sl)
 
     global _LAST_PORTFOLIO_MTM_LOG
     now_ts = time.time()
     if now_ts - _LAST_PORTFOLIO_MTM_LOG >= 60:
         _LAST_PORTFOLIO_MTM_LOG = now_ts
-        breakdown = mtm_position_breakdown(positions, ltp_map)
+        strat_sum = 0.0
+        for strategy in STRATEGY_STATE.values():
+            if strategy.get("status") != "OPEN":
+                continue
+            s_pos = strategy.get("positions") or []
+            if not s_pos:
+                continue
+            _, _, st = calculate_strategy_mtm(s_pos, ltp_map)
+            strat_sum += st
+            logger.info(
+                "  MTM strategy %s total=%.2f legs=%d",
+                strategy.get("name"),
+                st,
+                len(s_pos),
+            )
+        strat_inst: set[int] = set()
+        for s in STRATEGY_STATE.values():
+            if s.get("status") != "OPEN":
+                continue
+            for i in s.get("instrument_ids") or []:
+                try:
+                    strat_inst.add(int(i))
+                except (TypeError, ValueError):
+                    pass
+            for p in s.get("positions") or []:
+                try:
+                    pid = int(p.get("instrument_id") or 0)
+                except (TypeError, ValueError):
+                    pid = 0
+                if pid:
+                    strat_inst.add(pid)
+        hedge_breakdown = mtm_position_breakdown(
+            [p for p in positions if int(p.get("ExchangeInstrumentId") or 0) not in strat_inst],
+            ltp_map,
+        )
         logger.info(
-            "Portfolio MTM %.2f (realized=%.2f unrealized=%.2f source=%s positions=%d)",
+            "Portfolio MTM %.2f (realized=%.2f unrealized=%.2f source=%s strat_sum=%.2f hedge_legs=%d)",
             overall,
             realized,
             unrealized,
             mtm_source,
-            len(breakdown),
+            strat_sum,
+            len(hedge_breakdown),
         )
-        for row in breakdown[:12]:
+        for row in hedge_breakdown[:8]:
             logger.info(
-                "  MTM leg %s id=%s qty=%s ltp=%s booked=%.2f total=%.2f",
+                "  MTM hedge %s id=%s qty=%s ltp=%s total=%.2f",
                 row.get("symbol"),
                 row.get("instrument_id"),
                 row.get("qty"),
                 row.get("ltp"),
-                row.get("booked", 0),
                 row.get("total_pnl", 0),
             )
 

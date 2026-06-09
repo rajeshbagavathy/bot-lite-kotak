@@ -41,7 +41,12 @@ def calculate_mtm_kotak_amounts(
     Works without avgPrc; preferred over XTS-style OpenBuy/Sell weighting for Kotak FNO.
     """
     pos_list = list(positions)
-    open_rows = [p for p in pos_list if _safe_int(p.get("Quantity")) != 0]
+    open_rows = [
+        p
+        for p in pos_list
+        if _safe_int(p.get("Quantity")) != 0
+        or abs(_safe_float(p.get("KotakSellAmount")) - _safe_float(p.get("KotakBuyAmount"))) > 0.01
+    ]
     if not open_rows:
         return None
     if not any(
@@ -67,6 +72,68 @@ def calculate_mtm_kotak_amounts(
         unrealized += float(qty) * float(ltp) * mult
 
     return realized, unrealized, realized + unrealized
+
+
+def calculate_portfolio_mtm_from_strategies(
+    strategies: Iterable[dict],
+    broker_positions: Iterable[dict],
+    ltp_map: Dict[int, float],
+) -> Tuple[float, float, float]:
+    """
+    Portfolio MTM = sum(OPEN strategy straddle legs at entry) + broker hedge/other legs.
+
+    Strategy legs are authoritative for straddle P&L (broker may net or omit rows).
+    """
+    strat_realized = 0.0
+    strat_unrealized = 0.0
+    strat_total = 0.0
+    strat_instruments: set[int] = set()
+
+    for strategy in strategies:
+        if strategy.get("status") != "OPEN":
+            continue
+        for iid in strategy.get("instrument_ids") or []:
+            try:
+                strat_instruments.add(int(iid))
+            except (TypeError, ValueError):
+                continue
+        s_positions = strategy.get("positions") or []
+        for p in s_positions:
+            try:
+                iid = int(p.get("instrument_id") or 0)
+            except (TypeError, ValueError):
+                iid = 0
+            if iid:
+                strat_instruments.add(iid)
+        if s_positions:
+            sr, su, st = calculate_strategy_mtm(s_positions, ltp_map)
+            strat_realized += sr
+            strat_unrealized += su
+            strat_total += st
+
+    hedge_positions: List[dict] = []
+    for pos in broker_positions:
+        try:
+            iid = int(pos.get("ExchangeInstrumentId") or 0)
+        except (TypeError, ValueError):
+            iid = 0
+        if iid in strat_instruments:
+            continue
+        qty = _safe_int(pos.get("Quantity"))
+        booked = _safe_float(pos.get("KotakSellAmount")) - _safe_float(pos.get("KotakBuyAmount"))
+        if qty == 0 and abs(booked) < 0.01:
+            continue
+        hedge_positions.append(pos)
+
+    if hedge_positions:
+        hedge_mtm = calculate_mtm_kotak_amounts(hedge_positions, ltp_map)
+        if hedge_mtm is None:
+            hedge_mtm = calculate_mtm(hedge_positions, ltp_map)
+        hr, hu, ht = hedge_mtm
+    else:
+        hr = hu = ht = 0.0
+
+    return strat_realized + hr, strat_unrealized + hu, strat_total + ht
 
 
 def mtm_position_breakdown(

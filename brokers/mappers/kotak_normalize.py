@@ -253,9 +253,36 @@ def kotak_positions_to_normalized(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         buy_qty = b["buy_qty"]
         sell_qty = b["sell_qty"]
         net_qty = buy_qty - sell_qty
-        if net_qty == 0:
-            continue
         row = b["row"]
+        row_net = _safe_int(row.get("netQty") or row.get("netqty"))
+        if row_net is not None:
+            net_qty = float(row_net)
+        booked = b["sell_amt"] - b["buy_amt"]
+        if net_qty == 0:
+            if abs(booked) < 0.01 and not b["has_broker_pnl"]:
+                continue
+            iid = _instrument_token_from_kotak_row(row)
+            rec_closed: Dict[str, Any] = {
+                "ExchangeInstrumentId": iid,
+                "ExchangeInstrumentID": iid,
+                "TradingSymbol": b["sym"],
+                "Quantity": 0,
+                "ProductType": b["prod"],
+                "AveragePrice": 0.0,
+                "OpenBuyQuantity": 0,
+                "OpenSellQuantity": 0,
+                "SumOfTradedQuantityAndPriceBuy": float(b["buy_amt"]),
+                "SumOfTradedQuantityAndPriceSell": float(b["sell_amt"]),
+                "Multiplier": _safe_int(row.get("multiplier")) or 1,
+                "KotakBuyAmount": b["buy_amt"],
+                "KotakSellAmount": b["sell_amt"],
+                "KotakClosedLeg": True,
+            }
+            if b["has_broker_pnl"]:
+                rec_closed["KotakRealizedMtm"] = b["rpnl"]
+                rec_closed["KotakUnrealizedMtm"] = b["upnl"]
+            out.append(rec_closed)
+            continue
         iid = _instrument_token_from_kotak_row(row)
         scale = _kotak_price_scale(row)
         mult = _safe_int(row.get("multiplier")) or 1
