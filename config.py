@@ -82,8 +82,9 @@ STRATEGIES = []  # Deprecated: use day-based plans below.
 #
 # Example: N_M_S10_1146 → NIFTY, Monday, slot S10 at 11:46.
 #
-# Slots/times match xts-bot-lite; Kotak uses a fixed 3 lots per strategy (override via STRATEGY_LOTS env).
+# Slots/times match xts-bot-lite. Default 3 lots (STRATEGY_LOTS); Wednesday uses STRATEGY_LOTS_WEDNESDAY (default 1).
 STRATEGY_LOTS = int(os.getenv("STRATEGY_LOTS", "3"))
+STRATEGY_LOTS_WEDNESDAY = int(os.getenv("STRATEGY_LOTS_WEDNESDAY", "1"))
 
 # Monday NIFTY (sorted by time)
 # S2_9.31am, S4_10.01am, S9_11.16am, S11_11.46am, S13_12.16pm, S16_1.01pm, S18_1.31pm, S21_2.16pm
@@ -119,18 +120,18 @@ TUESDAY_NIFTY_STRATEGIES = [
     StrategyConfig("N_T_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
 ]
 
-# Wednesday – same slots/times as xts-bot-lite; Kotak uses STRATEGY_LOTS for every slot.
+# Wednesday – same slots/times as xts-bot-lite; 1 lot per slot (STRATEGY_LOTS_WEDNESDAY).
 # Bot picks one index by nearest expiry (SENSEX wins ties), so both lists must exist or the portal shows no rows.
 # S1_9.21am, S3_9.46am, S7_10.46am, S9_11.16am, S12_12.01pm, S16_1.01pm, S19_1.46pm, S21_2.16pm
 WEDNESDAY_NIFTY_STRATEGIES = [
-    StrategyConfig("N_W_0921", "09:21:00", STRATEGY_LOTS, 20.0, 0.0),   # S1_9.21am
-    StrategyConfig("N_W_0946", "09:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S3_9.46am
-    StrategyConfig("N_W_1046", "10:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S7_10.46am
-    StrategyConfig("N_W_1116", "11:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S9_11.16am
-    StrategyConfig("N_W_1201", "12:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S12_12.01pm
-    StrategyConfig("N_W_1301", "13:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S16_1.01pm
-    StrategyConfig("N_W_1346", "13:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S19_1.46pm
-    StrategyConfig("N_W_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
+    StrategyConfig("N_W_0921", "09:21:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S1_9.21am
+    StrategyConfig("N_W_0946", "09:46:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S3_9.46am
+    StrategyConfig("N_W_1046", "10:46:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S7_10.46am
+    StrategyConfig("N_W_1116", "11:16:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("N_W_1201", "12:01:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("N_W_1301", "13:01:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("N_W_1346", "13:46:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S19_1.46pm
+    StrategyConfig("N_W_1416", "14:16:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S21_2.16pm
 ]
 # WEDNESDAY_SENSEX_STRATEGIES = [
 #     StrategyConfig("X_W_0921", "09:21:00", STRATEGY_LOTS, 20.0, 0.0),   # S1_9.21am
@@ -143,14 +144,14 @@ WEDNESDAY_NIFTY_STRATEGIES = [
 #     StrategyConfig("X_W_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
 # ]
 WEDNESDAY_SENSEX_STRATEGIES = [
-    StrategyConfig("X_W_0921", "09:21:00", STRATEGY_LOTS, 20.0, 0.0),   # S1_9.21am
-    StrategyConfig("X_W_0946", "09:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S3_9.46am
-    StrategyConfig("X_W_1046", "10:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S7_10.46am
-    StrategyConfig("X_W_1116", "11:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S9_11.16am
-    StrategyConfig("X_W_1201", "12:01:00", STRATEGY_LOTS, 20.0, 0.0),   # S12_12.01pm
-    StrategyConfig("X_W_1301", "13:04:00", STRATEGY_LOTS, 20.0, 0.0),   # S16_1.01pm
-    StrategyConfig("X_W_1346", "13:46:00", STRATEGY_LOTS, 20.0, 0.0),   # S19_1.46pm
-    StrategyConfig("X_W_1416", "14:16:00", STRATEGY_LOTS, 20.0, 0.0),   # S21_2.16pm
+    StrategyConfig("X_W_0921", "09:21:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S1_9.21am
+    StrategyConfig("X_W_0946", "09:46:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S3_9.46am
+    StrategyConfig("X_W_1046", "10:46:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S7_10.46am
+    StrategyConfig("X_W_1116", "11:16:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S9_11.16am
+    StrategyConfig("X_W_1201", "12:01:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S12_12.01pm
+    StrategyConfig("X_W_1301", "13:04:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S16_1.01pm
+    StrategyConfig("X_W_1346", "13:46:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S19_1.46pm
+    StrategyConfig("X_W_1416", "14:16:00", STRATEGY_LOTS_WEDNESDAY, 20.0, 0.0),   # S21_2.16pm
 ]
 # Thursday SENSEX (sorted by time)
 # Slot / score / note from expectancy backtest (see table in repo history).
