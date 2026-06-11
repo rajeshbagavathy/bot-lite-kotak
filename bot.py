@@ -993,6 +993,14 @@ def _close_strategy(client: Any, index_config, strategy: dict, positions: List[d
     # Keep `positions` so UI can continue showing realized P&L for CLOSED strategies.
     # Clear SL order tracking to avoid reusing old SL orders/tags.
     update_strategy(strategy["name"], status="CLOSED", sl_orders=[], sl_tag_map={})
+    journal_record(
+        Phase.STRATEGY_CLOSE,
+        strategy["name"],
+        reason,
+        reason=reason,
+        mtm=strategy.get("mtm"),
+        realized=strategy.get("realized"),
+    )
 
 
 def _square_off_all(client: Any, index_config, positions: List[dict], reason: str) -> None:
@@ -1137,12 +1145,27 @@ def _finalize_eod_strategy_states(reason: str) -> None:
                 sl_orders=[],
                 sl_tag_map={},
             )
+            journal_record(
+                Phase.EOD_SQUAREOFF,
+                name,
+                reason,
+                reason=reason,
+                prior_status=st,
+                mtm=strategy.get("mtm"),
+            )
         elif st in ("PENDING", "WAITING_FOR_CALM", "ERROR"):
             update_strategy(
                 name,
                 status="SKIPPED_VOLATILITY",
                 message=f"Skipped: {reason}",
                 skip_reason="EOD_HALT",
+            )
+            journal_record(
+                Phase.EOD_SQUAREOFF,
+                name,
+                f"Skipped: {reason}",
+                skip_reason="EOD_HALT",
+                prior_status=st,
             )
 
 
@@ -1162,6 +1185,12 @@ def _eod_squareoff_and_cleanup(client: Any, index_config) -> None:
     if not is_eod_halt():
         mark_eod_halt_started(f"{reason} in progress…")
         _update_eod_banner_state()
+        journal_record(
+            Phase.EOD_SQUAREOFF,
+            "",
+            f"Starting {reason}",
+            severity="WARNING",
+        )
         logger.warning("Starting %s", reason)
     try:
         positions = client.get_positions()
@@ -1350,7 +1379,18 @@ def _sync_sl_order_status_and_capture_exits(
                     matching_position["exit_price"] = exit_price
                     matching_position["exit_time"] = get_ist_timestamp()
                     matching_position["closed_via"] = "SL_FILLED"
-                    
+                    journal_record(
+                        Phase.SL_FILLED,
+                        strategy["name"],
+                        f"Leg SL filled: instrument {instrument_id} @ {exit_price:.2f}",
+                        instrument_id=int(instrument_id),
+                        exit_price=float(exit_price),
+                        sl_tag=tag,
+                        app_order_id=app_order_id,
+                        symbol=matching_position.get("symbol"),
+                        entry_price=matching_position.get("entry_price"),
+                        order_status=order_status_raw,
+                    )
                     logger.debug(
                         f"✅ [{strategy['name']}] Position CLOSED via SL: "
                         f"Instrument {instrument_id}, Exit Price: {exit_price}"
@@ -1373,6 +1413,16 @@ def _sync_sl_order_status_and_capture_exits(
                         except Exception as e:
                             logger.error(f"Failed to log position exit: {e}")
                 else:
+                    journal_record(
+                        Phase.SL_FILLED,
+                        strategy["name"],
+                        f"Leg SL filled but exit price missing (instrument {instrument_id})",
+                        severity="WARNING",
+                        instrument_id=int(instrument_id),
+                        sl_tag=tag,
+                        app_order_id=app_order_id,
+                        order_status=order_status_raw,
+                    )
                     logger.warning(
                         "[%s] SL order shows filled-like status but no usable exit price (instrument %s status=%s)",
                         strategy["name"],
@@ -1385,6 +1435,15 @@ def _sync_sl_order_status_and_capture_exits(
         elif order_status in ("REJECTED", "CANCELLED"):
             # ⚠️ SL order failed - position is EXPOSED
             matching_position["sl_status"] = order_status
+            _journal_monitor_throttled(
+                strategy["name"],
+                Phase.SL_REJECTED,
+                f"SL order {order_status} for instrument {instrument_id} (leg still open)",
+                severity="WARNING",
+                instrument_id=int(instrument_id),
+                sl_tag=tag,
+                app_order_id=app_order_id,
+            )
             logger.warning(
                 f"⚠️  [{strategy['name']}] SL order {order_status}: "
                 f"Instrument {instrument_id} (position still exposed)"
@@ -1407,6 +1466,25 @@ def _hint_survivor_sl_to_cost(strategy: dict, msg: str) -> None:
 
 
 _SURVIVOR_SL_TO_COST_LOG_THROTTLE: Dict[str, float] = {}
+_MONITOR_JOURNAL_THROTTLE: Dict[str, float] = {}
+
+
+def _journal_monitor_throttled(
+    strategy_name: str,
+    phase: Phase,
+    message: str,
+    *,
+    interval_sec: float = 90.0,
+    severity: str = "INFO",
+    **details: Any,
+) -> None:
+    """Avoid duplicate monitor-phase journal lines every MTM tick."""
+    key = f"{strategy_name}|{phase.value}|{message[:160]}"
+    now = time.time()
+    if now - _MONITOR_JOURNAL_THROTTLE.get(key, 0) < interval_sec:
+        return
+    _MONITOR_JOURNAL_THROTTLE[key] = now
+    journal_record(phase, strategy_name, message, severity=severity, **details)
 
 
 def _survivor_sl_to_cost_warn_throttled(
@@ -1472,6 +1550,12 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         return
     if not strategy.get("sl_orders"):
         _hint_survivor_sl_to_cost(strategy, "Waiting: no SL orders in state (need entry SL tags).")
+        _journal_monitor_throttled(
+            strategy["name"],
+            Phase.SURVIVOR_SL_TO_COST,
+            "Waiting: no SL orders in state",
+            severity="WARNING",
+        )
         return
     if client is None:
         _hint_survivor_sl_to_cost(strategy, "No broker client (DEMO?).")
@@ -1479,16 +1563,11 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
 
     positions = strategy.get("positions") or []
     if len(positions) != 2:
-        _hint_survivor_sl_to_cost(strategy, f"Need exactly 2 legs; have {len(positions)}.")
         return
 
     closed = [p for p in positions if p.get("exit_price") is not None]
     open_pos = [p for p in positions if p.get("exit_price") is None]
     if len(closed) != 1 or len(open_pos) != 1:
-        _hint_survivor_sl_to_cost(
-            strategy,
-            f"Need 1 closed + 1 open leg (have {len(closed)} closed, {len(open_pos)} open).",
-        )
         return
     peer_via = closed[0].get("closed_via")
     if peer_via not in _SURVIVOR_PEER_CLOSED_VIA_OK:
@@ -1505,11 +1584,20 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             f"Peer closed_via={peer_via!r}; using fallback (1 closed + 1 open) to attempt survivor SL-to-cost.",
         )
 
+    peer = closed[0]
     survivor = open_pos[0]
     instrument_id = survivor.get("instrument_id")
     entry_price = survivor.get("entry_price")
     if instrument_id is None or entry_price is None or float(entry_price) <= 0:
         _hint_survivor_sl_to_cost(strategy, "Survivor leg missing instrument_id or entry_price.")
+        journal_record(
+            Phase.SURVIVOR_SL_TO_COST,
+            strategy["name"],
+            "Survivor leg missing instrument_id or entry_price",
+            severity="WARNING",
+            peer_instrument_id=peer.get("instrument_id"),
+            survivor_instrument_id=instrument_id,
+        )
         return
 
     sl_orders = strategy.get("sl_orders", []) or []
@@ -1520,13 +1608,25 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         app_order_id = so.get("app_order_id")
         if not tag or app_order_id is None:
             continue
-        if sl_tag_map.get(tag) == instrument_id:
+        try:
+            mapped_iid = int(sl_tag_map.get(tag) or 0)
+        except (TypeError, ValueError):
+            mapped_iid = 0
+        if mapped_iid == int(instrument_id):
             survivor_sl = (int(app_order_id), str(tag))
             break
     if not survivor_sl:
         _hint_survivor_sl_to_cost(
             strategy,
             "No SL order tag maps to survivor instrument (check sl_tag_map vs survivor leg).",
+        )
+        journal_record(
+            Phase.SURVIVOR_SL_TO_COST,
+            strategy["name"],
+            "No SL order maps to survivor instrument",
+            severity="WARNING",
+            survivor_instrument_id=int(instrument_id),
+            sl_tag_map_keys=list(sl_tag_map.keys())[:4],
         )
         return
 
@@ -1564,6 +1664,14 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             strategy,
             f"Survivor SL app_order_id={app_order_id} not in order book (sync delay or cancelled).",
         )
+        _journal_monitor_throttled(
+            strategy["name"],
+            Phase.SURVIVOR_SL_TO_COST,
+            f"Survivor SL order {app_order_id} not in order book",
+            severity="WARNING",
+            app_order_id=app_order_id,
+            survivor_tag=tag,
+        )
         return
 
     order_status = (order_detail.get("OrderStatus") or "").replace(" ", "").upper()
@@ -1579,6 +1687,14 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         _hint_survivor_sl_to_cost(
             strategy,
             f"Survivor SL status={order_status!r} — not active; cannot modify.",
+        )
+        _journal_monitor_throttled(
+            strategy["name"],
+            Phase.SURVIVOR_SL_TO_COST,
+            f"Survivor SL status={order_status!r} — cannot modify",
+            severity="WARNING",
+            app_order_id=app_order_id,
+            survivor_tag=tag,
         )
         return
 
@@ -1603,6 +1719,21 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         or "DAY"
     )
     disclosed_qty = int(order_detail.get("OrderDisclosedQuantity", 0) or 0)
+    journal_record(
+        Phase.SURVIVOR_SL_TO_COST,
+        strategy["name"],
+        f"Peer leg closed ({peer.get('closed_via')}); tightening survivor SL to cost",
+        peer_instrument_id=peer.get("instrument_id"),
+        peer_exit_price=peer.get("exit_price"),
+        peer_closed_via=peer.get("closed_via"),
+        survivor_instrument_id=int(instrument_id),
+        survivor_entry=float(entry_price),
+        app_order_id=app_order_id,
+        survivor_tag=tag,
+        new_limit=limit_price,
+        new_trigger=trigger,
+        qty=qty,
+    )
     try:
         logger.warning(
             "[%s] Survivor SL-to-cost ATTEMPT: modify_order STOPLIMIT app_order_id=%s tag=%s "
@@ -1645,6 +1776,15 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             _hint_survivor_sl_to_cost(
                 strategy,
                 f"modify_order API no result: {resp_str[:200]}",
+            )
+            journal_record(
+                Phase.SURVIVOR_SL_TO_COST,
+                strategy["name"],
+                "Broker rejected survivor SL modify (no result)",
+                severity="ERROR",
+                app_order_id=app_order_id,
+                survivor_tag=tag,
+                api_response=resp_str[:500],
             )
             return
         # Verify broker-side price update in order book before marking done.
@@ -1692,11 +1832,32 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
                 verify_reason,
             )
             _hint_survivor_sl_to_cost(strategy, f"verify failed: {verify_reason}"[:220])
+            journal_record(
+                Phase.SURVIVOR_SL_TO_COST,
+                strategy["name"],
+                f"Modify accepted but verify failed: {verify_reason}",
+                severity="WARNING",
+                app_order_id=app_order_id,
+                expected_limit=limit_price,
+                expected_trigger=trigger,
+            )
             return
         update_strategy(
             strategy["name"],
             survivor_sl_adjusted_to_cost=True,
             survivor_sl_to_cost_hint="Done: survivor SL tightened to cost.",
+        )
+        journal_record(
+            Phase.SURVIVOR_SL_TO_COST,
+            strategy["name"],
+            f"Survivor SL tightened to cost @ {limit_price:.2f} (trigger {trigger:.2f})",
+            app_order_id=app_order_id,
+            survivor_tag=tag,
+            survivor_instrument_id=int(instrument_id),
+            entry_price=float(entry_price),
+            limit_price=limit_price,
+            trigger_price=trigger,
+            verified=True,
         )
         logger.warning(
             "[%s] Survivor SL-to-cost OK: instrument=%s limit=%.2f trigger=%.2f (entry=%.2f)",
@@ -1713,6 +1874,14 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
             e,
         )
         _hint_survivor_sl_to_cost(strategy, f"modify_order failed: {e!s}"[:220])
+        journal_record(
+            Phase.SURVIVOR_SL_TO_COST,
+            strategy["name"],
+            f"modify_order failed: {e!s}"[:200],
+            severity="ERROR",
+            app_order_id=app_order_id,
+            survivor_tag=tag,
+        )
 
 
 def _rebuild_sl_links_from_order_book_for_restored_strategy(
@@ -1783,6 +1952,13 @@ def _rebuild_sl_links_from_order_book_for_restored_strategy(
     if not sl_orders:
         return False
     update_strategy(strategy["name"], sl_orders=sl_orders, sl_tag_map=sl_tag_map)
+    journal_record(
+        Phase.RESTORE_SL_LINKS,
+        strategy["name"],
+        f"Restored {len(sl_orders)} SL link(s) from broker order book after restart",
+        sl_orders=sl_orders,
+        sl_tag_map=sl_tag_map,
+    )
     logger.warning(
         "[%s] Restored SL links from broker order book: %s order(s)",
         strategy["name"],
@@ -1892,11 +2068,31 @@ def _check_leg_target_and_close(
             )
             target_triggered.add(instrument_id)
             update_strategy(strategy["name"], target_triggered_instruments=list(target_triggered))
+            journal_record(
+                Phase.LEG_TARGET_HIT,
+                strategy["name"],
+                f"Leg target {float(LEG_TARGET_PCT):.1f}% hit; SL modified to marketable LIMIT",
+                instrument_id=instrument_id,
+                profit_pct=round(profit_pct, 2),
+                entry_price=entry_f,
+                ltp=ltp_f,
+                limit_price=float(limit_px),
+                app_order_id=app_order_id,
+                sl_tag=tag,
+            )
             logger.debug(
                 "✅ [%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%); modified SL to marketable LIMIT (limit=%s)",
                 strategy["name"], float(LEG_TARGET_PCT), instrument_id, profit_pct, limit_px,
             )
         except Exception as e:
+            journal_record(
+                Phase.LEG_TARGET_HIT,
+                strategy["name"],
+                f"Leg target hit but SL modify failed: {e!s}"[:200],
+                severity="ERROR",
+                instrument_id=instrument_id,
+                profit_pct=round(profit_pct, 2),
+            )
             logger.error(
                 "Failed to modify SL to LIMIT for leg target [%s] instrument %s: %s",
                 strategy["name"], instrument_id, e,
@@ -1992,6 +2188,15 @@ def _sync_strategy_positions_from_broker(
             pos["exit_price"] = float(exit_price)
             pos["exit_time"] = now_ts
             pos["closed_via"] = "BROKER_SYNC"
+            journal_record(
+                Phase.POSITION_SYNC,
+                strategy.get("name", ""),
+                f"Leg closed via broker sync: instrument {instrument_id} @ {float(exit_price):.2f}",
+                instrument_id=instrument_id,
+                exit_price=float(exit_price),
+                symbol=pos.get("symbol"),
+                entry_price=pos.get("entry_price"),
+            )
 
             if db_id and db_id > 0:
                 try:
@@ -2222,6 +2427,12 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
                 positions=[],
                 sl_orders=[],
                 sl_tag_map={},
+            )
+            journal_record(
+                Phase.PORTFOLIO_SL,
+                strategy.get("name", ""),
+                "Portfolio SL hit — strategy closed and positions squared off",
+                portfolio_mtm=overall,
             )
 
 
