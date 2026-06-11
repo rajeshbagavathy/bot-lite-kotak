@@ -1048,16 +1048,18 @@ def _square_off_bot_positions(
 ) -> int:
     """Market-close broker rows for instruments the bot opened (not manual/other F&O)."""
     bot_ids = collect_bot_tracked_instrument_ids()
-    if not bot_ids:
-        logger.info("EOD: no bot-tracked instruments to square off")
-        return 0
+    square_all = not bot_ids
+    if square_all:
+        logger.warning(
+            "EOD: no bot-tracked instrument IDs in memory — squaring off ALL non-zero positions"
+        )
     placed = 0
     for pos in broker_positions or []:
         try:
             iid = int(pos.get("ExchangeInstrumentId") or 0)
         except (TypeError, ValueError):
             continue
-        if iid not in bot_ids:
+        if not square_all and iid not in bot_ids:
             continue
         try:
             qty = int(pos.get("Quantity") or 0)
@@ -1199,6 +1201,15 @@ def _eod_squareoff_and_cleanup(client: Any, index_config) -> None:
     """Square off bot F&O positions and cancel bot SL orders at configured EOD time."""
     if not EOD_SQUAREOFF_ENABLED:
         return
+    if client is not None and index_config is not None and not collect_bot_tracked_instrument_ids():
+        from state import STATE as _STATE
+
+        expiry = (_STATE.get("index") or {}).get("expiry")
+        try:
+            _load_strategy_state(client, index_config, expiry=expiry)
+            logger.warning("EOD: reloaded strategy state from DB before square-off")
+        except Exception:
+            logger.exception("EOD: strategy state reload failed")
     if client is None:
         msg = f"EOD square-off ({EOD_SQUAREOFF_TIME} IST): demo mode — no broker calls"
         mark_eod_halt_started(msg)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import re
 from typing import Optional, Set, Tuple
 
 from config import EOD_SQUAREOFF_TIME, EOD_VERIFY_UNTIL
@@ -116,6 +117,9 @@ def collect_bot_tracked_instrument_ids() -> Set[int]:
     return ids
 
 
+_BOT_SL_TAG_RE = re.compile(r"^[A-Za-z0-9_]+_SL_\d+$")
+
+
 def is_bot_sl_order_tag(tag: str) -> bool:
     tag_s = str(tag or "")
     if not tag_s:
@@ -123,7 +127,11 @@ def is_bot_sl_order_tag(tag: str) -> bool:
     for name in STRATEGY_STATE:
         if tag_s.startswith(f"{name}_SL_"):
             return True
-    return False
+    if STRATEGY_STATE:
+        return False
+    if tag_s.upper().startswith("MANUAL"):
+        return False
+    return bool(_BOT_SL_TAG_RE.match(tag_s))
 
 
 def is_cancellable_order_status(status: str) -> bool:
