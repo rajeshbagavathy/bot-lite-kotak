@@ -9,9 +9,9 @@ from typing import Any, Dict, List, Optional
 import pytz
 
 try:
-    from config import LEG_TARGET_PCT, DB_PATH
+    from config import LEG_TARGET_PCT_NON_EXPIRY, DB_PATH
 except ImportError:
-    LEG_TARGET_PCT = 65.0
+    LEG_TARGET_PCT_NON_EXPIRY = 50.0
     DB_PATH = "trades.db"
 
 logger = logging.getLogger("xts-bot-lite")
@@ -838,7 +838,9 @@ def get_closed_trades(strategy_name: Optional[str] = None, days: int = 7) -> Lis
         return []
 
 
-def restore_positions_for_strategy(strategy_id: int) -> List[Dict[str, Any]]:
+def restore_positions_for_strategy(
+    strategy_id: int, leg_target_pct: Optional[float] = None
+) -> List[Dict[str, Any]]:
     """Restore positions for a strategy from database."""
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -855,10 +857,11 @@ def restore_positions_for_strategy(strategy_id: int) -> List[Dict[str, Any]]:
         rows = cursor.fetchall()
         conn.close()
         
+        target_pct = float(leg_target_pct if leg_target_pct is not None else LEG_TARGET_PCT_NON_EXPIRY)
         positions = []
         for row in rows:
             entry = float(row["entry_price"]) if row["entry_price"] is not None else 0.0
-            target_price = round(entry * (1 - LEG_TARGET_PCT / 100.0), 2) if entry > 0 else None
+            target_price = round(entry * (1 - target_pct / 100.0), 2) if entry > 0 else None
             pos: Dict[str, Any] = {
                 "symbol": row["symbol"],
                 "instrument_id": row["instrument_id"],
@@ -941,7 +944,7 @@ def restore_sl_orders_for_strategy(strategy_name: str) -> Dict[str, Any]:
         return {"sl_orders": [], "sl_tag_map": {}}
 
 
-def restore_todays_strategies() -> List[Dict[str, Any]]:
+def restore_todays_strategies(leg_target_pct: Optional[float] = None) -> List[Dict[str, Any]]:
     """Restore today's strategies from database (OPEN, CLOSED, calm wait, skipped).
     
     Returns list of strategy data with positions for strategies that:
@@ -980,7 +983,7 @@ def restore_todays_strategies() -> List[Dict[str, Any]]:
                 "lots": r["lots"],
                 "leg_sl_pct": r["leg_sl_pct"],
                 "strategy_sl": r["strategy_sl"],
-                "positions": restore_positions_for_strategy(r["id"]),
+                "positions": restore_positions_for_strategy(r["id"], leg_target_pct=leg_target_pct),
                 "sl_orders": sl_restore["sl_orders"],
                 "sl_tag_map": sl_restore["sl_tag_map"],
                 "gatekeeper_started_at": r.get("gatekeeper_started_at"),

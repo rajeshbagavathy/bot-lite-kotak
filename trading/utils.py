@@ -5,7 +5,16 @@ import datetime
 import math
 from typing import Any, Optional, Tuple
 
-from config import INDEX_CONFIGS, MARGIN_REQUIRED_PER_LOT_NON_EXPIRY, MARGIN_TIGHT_BUFFER_MIN, MIN_MARGIN_TO_TRADE, get_today_strategies, margin_required_per_lot_expiry
+from config import (
+    INDEX_CONFIGS,
+    LEG_TARGET_PCT_EXPIRY,
+    LEG_TARGET_PCT_NON_EXPIRY,
+    MARGIN_REQUIRED_PER_LOT_NON_EXPIRY,
+    MARGIN_TIGHT_BUFFER_MIN,
+    MIN_MARGIN_TO_TRADE,
+    get_today_strategies,
+    margin_required_per_lot_expiry,
+)
 from db import get_ist_now
 from trading.context import STRATEGY_STATE
 from trading.state_bridge import set_spot
@@ -55,6 +64,13 @@ def is_expiry_day(expiry: str) -> bool:
     except ValueError:
         return False
     return get_ist_now().date() == expiry_date
+
+
+def leg_target_pct(expiry: Optional[str] = None) -> float:
+    """Leg profit target %: 80% on expiry day, 50% on non-expiry (configurable via env)."""
+    if expiry and is_expiry_day(expiry):
+        return float(LEG_TARGET_PCT_EXPIRY)
+    return float(LEG_TARGET_PCT_NON_EXPIRY)
 
 
 def compute_effective_lots_from_margin(

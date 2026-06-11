@@ -12,7 +12,6 @@ from config import (
     EOD_SQUAREOFF_TIME,
     ITM_STRIKES_NIFTY,
     ITM_STRIKES_SENSEX,
-    LEG_TARGET_PCT,
     STRIKE_PREMIUM_BUFFER_NIFTY,
     STRIKE_PREMIUM_BUFFER_SENSEX,
     STRIKE_PREMIUM_TARGET_NIFTY,
@@ -35,7 +34,7 @@ from trading.strategy.gatekeeper import (
 from trading.strategy.margin import ensure_margin_or_skip_strategy as _ensure_margin_or_skip_strategy
 from trading.strategy.strikes import find_strike_by_premium
 from trading.state_bridge import update_strategy
-from trading.utils import get_atm_strike as _get_atm_strike, is_expiry_day
+from trading.utils import get_atm_strike as _get_atm_strike, is_expiry_day, leg_target_pct
 
 logger = logging.getLogger("xts-bot-lite")
 
@@ -335,8 +334,9 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
         pe_strike=pe_strike,
     )
 
+    effective_leg_target_pct = leg_target_pct(expiry)
     protection = complete_entry_with_sl_protection(
-        client, index_config, strategy, placed_entry, effective_leg_sl_pct, LEG_TARGET_PCT,
+        client, index_config, strategy, placed_entry, effective_leg_sl_pct, effective_leg_target_pct,
     )
     if not protection.ok:
         return
@@ -345,4 +345,5 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
         sl_orders=protection.sl_orders,
         positions=protection.positions,
         sl_tag_map=protection.sl_tag_map,
+        leg_target_pct=effective_leg_target_pct,
     )

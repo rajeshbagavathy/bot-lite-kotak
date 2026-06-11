@@ -18,10 +18,13 @@ from db import count_spot_market_rows, fetch_spot_market_rows
 from calm_zone_service import get_calm_zone_health_snapshot
 
 try:
-    from config import CALM_ZONE_BAR_UNIX_OFFSET_SEC, LEG_TARGET_PCT
+    from config import CALM_ZONE_BAR_UNIX_OFFSET_SEC
+    from trading.utils import leg_target_pct
 except ImportError:
-    LEG_TARGET_PCT = 65.0
     CALM_ZONE_BAR_UNIX_OFFSET_SEC = 0
+
+    def leg_target_pct(expiry=None):
+        return 50.0
 
 
 def _default_bot_log_path() -> str:
@@ -1846,12 +1849,15 @@ def create_app(username: str, password: str) -> Flask:
             cursor.execute("SELECT * FROM positions ORDER BY id DESC")
             rows = cursor.fetchall()
             conn.close()
+            snap = get_snapshot()
+            expiry = (snap.get("index") or {}).get("expiry")
+            target_pct = leg_target_pct(expiry)
             out = []
             for row in rows:
                 d = dict(row)
                 ep = d.get("entry_price")
                 if ep is not None and float(ep) > 0:
-                    d["target_price"] = round(float(ep) * (1 - LEG_TARGET_PCT / 100.0), 2)
+                    d["target_price"] = round(float(ep) * (1 - target_pct / 100.0), 2)
                 else:
                     d["target_price"] = None
                 out.append(d)

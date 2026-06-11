@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from config import LEG_TARGET_PCT
+from config import LEG_TARGET_PCT_NON_EXPIRY
 from db import get_ist_timestamp, log_position, update_order_status
 from trading.compat import resolve
 from trading.journal import Phase, record as journal
@@ -145,7 +145,7 @@ def complete_entry_with_sl_protection(
     name = strategy["name"]
     entry_ids = [int(p["app_order_id"]) for p in placed_entry if p.get("app_order_id") is not None]
     instruments = [int(p["instrument_id"]) for p in placed_entry if p.get("instrument_id") is not None]
-    target_pct = float(leg_target_pct if leg_target_pct is not None else LEG_TARGET_PCT)
+    target_pct = float(leg_target_pct if leg_target_pct is not None else LEG_TARGET_PCT_NON_EXPIRY)
 
     time.sleep(5)
     filled, wait_status = wait_for_entry_fills(client, name, entry_ids, len(placed_entry))

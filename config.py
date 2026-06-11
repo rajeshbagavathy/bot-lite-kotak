@@ -251,8 +251,8 @@ ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "2"))
 LEG_SL_PCT_NON_EXPIRY = float(os.getenv("LEG_SL_PCT_NON_EXPIRY", "20.0"))
 # Leg target %: if a leg's profit (as % of executed sell order premium / entry_price) reaches this, close that leg by modifying SL to market.
 # Target is calculated on executed sell order premium: profit_pct = (entry_price - ltp) / entry_price * 100.
-# Default is 60% (can be overridden via LEG_TARGET_PCT env).
-LEG_TARGET_PCT = float(os.getenv("LEG_TARGET_PCT", "60.0"))
+LEG_TARGET_PCT_EXPIRY = float(os.getenv("LEG_TARGET_PCT_EXPIRY", "80.0"))
+LEG_TARGET_PCT_NON_EXPIRY = float(os.getenv("LEG_TARGET_PCT_NON_EXPIRY", "50.0"))
 
 # Fractional buffer for market-style LIMIT orders (e.g. 0.01 = 1%). BUY: LTP*(1+s), SELL: LTP*(1-s).
 MARKETABLE_LIMIT_SLIPPAGE_PCT = float(os.getenv("MARKETABLE_LIMIT_SLIPPAGE_PCT", "0.01"))

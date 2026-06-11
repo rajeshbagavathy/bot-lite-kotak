@@ -1715,6 +1715,22 @@ class KotakNeoClient:
         self._ensure()
         self._api.cancel_order(str(app_order_id), amo="NO", isVerify=False)
 
+    def _find_kotak_order_row(self, app_order_id: int) -> Optional[dict]:
+        """Raw Kotak order_report row for *app_order_id* (nOrdNo), or None."""
+        try:
+            book = self._api.order_report()
+        except Exception:
+            logger.exception("Kotak order_report failed for modify lookup")
+            return None
+        data = book.get("data") if isinstance(book, dict) else None
+        if not isinstance(data, list):
+            return None
+        oid_s = str(app_order_id)
+        for row in data:
+            if str(row.get("nOrdNo") or "") == oid_s:
+                return row
+        return None
+
     def cancel_all_orders(self, index_config: IndexConfig, instrument_id: int) -> None:
         self._ensure()
         book = self._api.order_report()
@@ -1748,16 +1764,59 @@ class KotakNeoClient:
         client_id: Optional[str] = None,
     ) -> Any:
         del client_id  # XTS-only; Kotak ignores
+        del tag  # Kotak modify API has no tag field
         self._ensure()
         kot_pt = _map_xts_order_type_to_kotak_pt(order_type)
-        tp = str(round(float(stop_price), 2)) if float(stop_price or 0) > 0 else "0"
+        stop_f = float(stop_price or 0)
+        limit_str = str(round(float(limit_price), 2))
+        qty_str = str(int(quantity))
+        validity_str = str(time_in_force or "DAY")
+        tp = str(round(stop_f, 2)) if stop_f > 0 else "0"
         mod = ModifyOrder(self._api.api_client)
+
+        # SL -> plain LIMIT (leg target / strategy close): modification_with_orderid keeps the
+        # existing trigger when tp="0", so the broker order price never updates. Use quick_modification.
+        if kot_pt == "L" and stop_f <= 0:
+            row = self._find_kotak_order_row(int(app_order_id))
+            if not row:
+                return {
+                    "Message": (
+                        f"The Given Order Number is {app_order_id} and it is not matching "
+                        f"with anyOrder of the orders"
+                    )
+                }
+            st = (row.get("ordSt") or row.get("stat") or "").lower().replace(" ", "")
+            if st in ("rejected", "cancelled", "complete", "traded"):
+                label = "Traded" if st == "complete" else st
+                return {
+                    "Error": f"The Given Order Status is {label}",
+                    "Reason": row.get("rejRsn"),
+                }
+            return mod.quick_modification(
+                order_id=str(app_order_id),
+                price=limit_str,
+                order_type="L",
+                quantity=qty_str,
+                validity=validity_str,
+                instrument_token=str(row.get("tok") or ""),
+                exchange_segment=str(row.get("exSeg") or ""),
+                product=str(product_type or row.get("prod") or "MIS"),
+                trading_symbol=str(row.get("trdSym") or ""),
+                transaction_type=str(row.get("trnsTp") or "B"),
+                trigger_price="0",
+                dd="NA",
+                market_protection="0",
+                disclosed_quantity=str(int(disclosed_quantity or 0)),
+                filled_quantity="0",
+                amo="NO",
+            )
+
         return mod.modification_with_orderid(
             order_id=str(app_order_id),
-            price=str(round(float(limit_price), 2)),
+            price=limit_str,
             order_type=kot_pt,
-            quantity=str(int(quantity)),
-            validity=str(time_in_force or "DAY"),
+            quantity=qty_str,
+            validity=validity_str,
             instrument_token=None,
             exchange_segment=None,
             product=product_type,

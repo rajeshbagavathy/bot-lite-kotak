@@ -107,7 +107,6 @@ from config import (
     ITM_STRIKES_NIFTY,
     ITM_STRIKES_SENSEX,
     LEG_SL_PCT_NON_EXPIRY,
-    LEG_TARGET_PCT,
     MARKETABLE_LIMIT_SLIPPAGE_PCT,
     MARGIN_BUFFER_EXPIRY,
     MARGIN_BUFFER_NON_EXPIRY,
@@ -185,6 +184,7 @@ from state import (
 from ui import create_app, ensure_http_access_not_logged
 from brokers.factory import create_trading_client
 from xts_client import marketable_limit_price
+from trading.utils import leg_target_pct
 
 logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
@@ -193,13 +193,13 @@ _LAST_PORTFOLIO_MTM_LOG: float = 0.0
 _EOD_LAST_VERIFY_TS: float = 0.0
 
 
-def _strategy_state_entry(cfg) -> dict:
+def _strategy_state_entry(cfg, expiry: Optional[str] = None) -> dict:
     return {
         "name": cfg.name,
         "time": cfg.time,
         "lots": cfg.lots,
         "leg_sl_pct": cfg.leg_sl_pct,
-        "leg_target_pct": LEG_TARGET_PCT,
+        "leg_target_pct": leg_target_pct(expiry),
         "strategy_sl": cfg.strategy_sl,
         "status": "PENDING",
         "mtm": 0.0,
@@ -249,10 +249,15 @@ def _merge_restored_strategy(restored_strategy: dict) -> Dict[str, Any]:
     return merge_kw
 
 
-def _load_strategy_state(client: Any, index_config) -> None:
+def _load_strategy_state(client: Any, index_config, expiry: Optional[str] = None) -> None:
     """Build STRATEGY_STATE for today's index and push to UI snapshot."""
+    if expiry is None:
+        from state import STATE as _STATE
+
+        expiry = (_STATE.get("index") or {}).get("expiry")
+    target_pct = leg_target_pct(expiry)
     new_state = {
-        cfg.name: _strategy_state_entry(cfg) for cfg in get_today_strategies(index_config.name)
+        cfg.name: _strategy_state_entry(cfg, expiry) for cfg in get_today_strategies(index_config.name)
     }
     STRATEGY_STATE.clear()
     STRATEGY_STATE.update(new_state)
@@ -262,7 +267,7 @@ def _load_strategy_state(client: Any, index_config) -> None:
             restore_order_book = client.get_order_book()
         except Exception as e:
             logger.error("Failed to fetch order book for SL restore-link bootstrap: %s", e)
-    for restored_strategy in restore_todays_strategies():
+    for restored_strategy in restore_todays_strategies(leg_target_pct=target_pct):
         strategy_name = restored_strategy["strategy_name"]
         if strategy_name not in STRATEGY_STATE:
             continue
@@ -1982,17 +1987,24 @@ def _rebuild_sl_links_from_order_book_for_restored_strategy(
 
 
 def _check_leg_target_and_close(
-    client: Any, index_config, strategy: dict, ltp_map: Dict[int, float]
+    client: Any,
+    index_config,
+    strategy: dict,
+    ltp_map: Dict[int, float],
+    expiry: Optional[str] = None,
 ) -> None:
     """
-    If any leg's profit from collected premium reaches LEG_TARGET_PCT (e.g. 65%),
-    close that leg by modifying its SL order to marketable LIMIT (single action: leg closed + SL order executed).
-    Target is calculated on executed sell order premium (entry_price): profit_pct = (entry_price - ltp) / entry_price * 100.
+  If any leg's profit from collected premium reaches the leg target % (80% expiry day, 50% non-expiry),
+  close that leg **only** by modifying its existing open SL order to a marketable LIMIT price.
+  No separate exit/square-off order is placed; the SL fill closes the leg and completes the order.
+    Target is calculated on executed sell order premium (entry_price): profit_pct = (entry_price - ltp) / entry * 100.
     """
     if strategy["status"] != "OPEN" or not strategy.get("sl_orders"):
         return
     if client is None:
         return
+
+    target_pct = float(strategy.get("leg_target_pct") or leg_target_pct(expiry))
 
     sl_orders = strategy.get("sl_orders", []) or []
     sl_tag_map = strategy.get("sl_tag_map", {}) or {}
@@ -2034,8 +2046,6 @@ def _check_leg_target_and_close(
         if instrument_id is None or entry_price is None or float(entry_price) <= 0:
             continue
         instrument_id = int(instrument_id)
-        if instrument_id in target_triggered:
-            continue
 
         ltp = ltp_map.get(instrument_id)
         if ltp is None:
@@ -2047,7 +2057,7 @@ def _check_leg_target_and_close(
             continue
         # Short position: profit when LTP drops. Profit % = (entry - ltp) / entry * 100
         profit_pct = (entry_f - ltp_f) / entry_f * 100.0
-        if profit_pct < float(LEG_TARGET_PCT):
+        if profit_pct < target_pct:
             continue
 
         sl_info = instrument_to_sl.get(instrument_id)
@@ -2068,8 +2078,17 @@ def _check_leg_target_and_close(
             MARKETABLE_LIMIT_SLIPPAGE_PCT,
             float(index_config.tick_size),
         )
+        tick = float(index_config.tick_size)
+        tol = max(tick, 0.05) + 0.01
+        cur_limit = _extract_first_float(order_detail, "OrderPrice", "LimitPrice")
+        if instrument_id in target_triggered:
+            # Modify already accepted: wait for this SL to fill (position closes via order book).
+            if cur_limit is not None and abs(cur_limit - float(limit_px)) <= tol:
+                continue
+            # Stale target_triggered (modify never applied) — retry below.
+
         try:
-            client.modify_order(
+            resp = client.modify_order(
                 app_order_id=app_order_id,
                 product_type=order_detail.get("ProductType"),
                 order_type=client.interactive.ORDER_TYPE_LIMIT,
@@ -2080,12 +2099,41 @@ def _check_leg_target_and_close(
                 time_in_force=order_detail.get("TimeInForce"),
                 tag=tag,
             )
+            try:
+                resp_str = json.dumps(resp, default=str)[:500]
+            except Exception:
+                resp_str = repr(resp)[:500]
+            if not _broker_modify_order_ok(resp):
+                journal_record(
+                    Phase.LEG_TARGET_HIT,
+                    strategy["name"],
+                    f"Leg target {target_pct:.1f}% hit but broker rejected SL modify",
+                    severity="ERROR",
+                    instrument_id=instrument_id,
+                    profit_pct=round(profit_pct, 2),
+                    entry_price=entry_f,
+                    ltp=ltp_f,
+                    limit_price=float(limit_px),
+                    app_order_id=app_order_id,
+                    sl_tag=tag,
+                    api_response=resp_str,
+                )
+                logger.error(
+                    "[%s] Leg target SL modify rejected instrument %s: %s",
+                    strategy["name"],
+                    instrument_id,
+                    resp_str,
+                )
+                continue
             target_triggered.add(instrument_id)
             update_strategy(strategy["name"], target_triggered_instruments=list(target_triggered))
             journal_record(
                 Phase.LEG_TARGET_HIT,
                 strategy["name"],
-                f"Leg target {float(LEG_TARGET_PCT):.1f}% hit; SL modified to marketable LIMIT",
+                (
+                    f"Leg target {target_pct:.1f}% hit; "
+                    f"modified existing SL {tag} to marketable LIMIT {limit_px:.2f} (awaiting SL fill)"
+                ),
                 instrument_id=instrument_id,
                 profit_pct=round(profit_pct, 2),
                 entry_price=entry_f,
@@ -2093,10 +2141,17 @@ def _check_leg_target_and_close(
                 limit_price=float(limit_px),
                 app_order_id=app_order_id,
                 sl_tag=tag,
+                api_response=resp_str,
             )
-            logger.debug(
-                "✅ [%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%); modified SL to marketable LIMIT (limit=%s)",
-                strategy["name"], float(LEG_TARGET_PCT), instrument_id, profit_pct, limit_px,
+            logger.warning(
+                "[%s] Leg target %.1f%% hit (instrument %s, profit %.1f%%): "
+                "modified existing SL to marketable LIMIT %s (app_order_id=%s)",
+                strategy["name"],
+                target_pct,
+                instrument_id,
+                profit_pct,
+                limit_px,
+                app_order_id,
             )
         except Exception as e:
             journal_record(
@@ -2374,7 +2429,7 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
 
         # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to marketable LIMIT
         if not eod_active:
-            _check_leg_target_and_close(client, index_config, strategy, ltp_map)
+            _check_leg_target_and_close(client, index_config, strategy, ltp_map, expiry=expiry)
         
         # Sync strategy positions with broker positions to keep state real-time
         _sync_strategy_positions_from_broker(client, strategy, positions, ltp_map, order_book=order_book)
@@ -2586,7 +2641,10 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
 
     _SCHEDULER_MINIMAL_MODE = False
     test_mode = os.getenv("TEST_FIRST_STRATEGY_IN_1MIN", "false").lower() == "true"
-    
+    target_pct = leg_target_pct(expiry)
+    for strategy in STRATEGY_STATE.values():
+        update_strategy(strategy["name"], leg_target_pct=target_pct)
+
     for idx, strategy in enumerate(STRATEGY_STATE.values()):
         if idx == 0 and test_mode:
             logger.debug("TEST MODE: First strategy in 1 minute")
@@ -2664,7 +2722,7 @@ def _complete_kotak_bootstrap() -> None:
     try:
         index_config, expiry = _pick_index_and_expiry(client)
         set_index(index_config.name, expiry)
-        _load_strategy_state(client, index_config)
+        _load_strategy_state(client, index_config, expiry=expiry)
         _wait_for_kotak_trading_session(client)
         if not _JOBS_SCHEDULED_FLAG:
             _schedule_jobs(client, index_config, expiry)
@@ -2703,7 +2761,7 @@ def _retry_pick_expiry(client: Any, auth: dict) -> None:
             
             logger.debug(f"✓ Expiry found! Index: {index_config.name} | Expiry: {expiry}")
             set_index(index_config.name, expiry)
-            _load_strategy_state(client, index_config)
+            _load_strategy_state(client, index_config, expiry=expiry)
 
             _wait_for_kotak_trading_session(client)
             if not _JOBS_SCHEDULED_FLAG:
@@ -2784,7 +2842,7 @@ def main() -> None:
     global _MAIN_LOOP_LAST_TICK
     STRATEGY_STATE.clear()
     if index_config is not None:
-        _load_strategy_state(client, index_config)
+        _load_strategy_state(client, index_config, expiry=expiry)
 
     init_state(STRATEGY_STATE)
     init_trading_flags(USE_PREMIUM_BASED_STRIKE, STRATEGY_SL_ENABLED, TRADE_NON_EXPIRY_DAY)
