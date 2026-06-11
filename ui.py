@@ -1138,11 +1138,16 @@ DASHBOARD_TEMPLATE = """
         }
 
         const stratVals = Object.values(stateStrategies);
+        const botMeta = state.bot || {};
+        const eodHalt = !!botMeta.eod_halt;
+        const eodBanner = botMeta.eod_banner ? String(botMeta.eod_banner) : '';
         const portfolioSlHalt = stratVals.length > 0 && stratVals.every(s => s.status === 'CLOSED')
           && stratVals.some(s => String(s.message || '').includes('Portfolio SL hit'));
         const allDisabled = stratVals.length > 0 && stratVals.every(s => s.status === 'DISABLED');
         const dashBanner = document.getElementById('dash-disabled-banner');
-        if (portfolioSlHalt && dashBanner) {
+        if (eodHalt && eodBanner && dashBanner) {
+          dashBanner.innerHTML = '<div class="disabled-banner">' + escHtml(eodBanner) + '</div>';
+        } else if (portfolioSlHalt && dashBanner) {
           dashBanner.innerHTML = '<div class="disabled-banner">Trading halted: portfolio stop-loss hit. Strategies are closed in state. The main loop may still run (see Scheduler health below).</div>';
         } else if (allDisabled) {
           dashBanner.innerHTML = '<div class="disabled-banner">Trading is disabled today (non-expiry day). No strategies will be executed.</div>';
@@ -1155,7 +1160,7 @@ DASHBOARD_TEMPLATE = """
           || s.status === 'WAITING_FOR_CALM'
           || s.status === 'SKIPPED_VOLATILITY'
         );
-        if (stratWarning && dashBanner && !portfolioSlHalt) {
+        if (stratWarning && dashBanner && !portfolioSlHalt && !eodHalt) {
           const msg = stratWarning.message || stratWarning.status || 'Check strategy status';
           const label = String(msg).includes('MARGIN_NOT_AVAILABLE')
             ? 'Margin gate warning'
@@ -1234,7 +1239,6 @@ DASHBOARD_TEMPLATE = """
           `;
         }
 
-        const botMeta = state.bot || {};
         const survEn = botMeta.survivor_sl_to_cost_enabled;
         const survivorCostEl = document.getElementById('survivor-cost-card');
         if (survivorCostEl) {
@@ -1612,6 +1616,10 @@ HTML_TEMPLATE = """
       return Number(num).toFixed(2);
     }
 
+    function escHtml(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
     async function loadFlags() {
       try {
         const res = await fetch('/api/settings', { cache: 'no-store', credentials: 'same-origin' });
@@ -1671,9 +1679,14 @@ HTML_TEMPLATE = """
       const portfolio = data.portfolio || {};
       const strategies = data.strategies || {};
 
+      const botMeta = data.bot || {};
+      const eodHalt = !!botMeta.eod_halt;
+      const eodBanner = botMeta.eod_banner ? String(botMeta.eod_banner) : '';
       const allDisabled = Object.values(strategies).length > 0 && Object.values(strategies).every(s => s.status === 'DISABLED');
       const bannerEl = document.getElementById('disabled-banner');
-      if (allDisabled) {
+      if (eodHalt && eodBanner && bannerEl) {
+        bannerEl.innerHTML = '<div class="disabled-banner">' + escHtml(eodBanner) + '</div>';
+      } else if (allDisabled) {
         bannerEl.innerHTML = '<div class="disabled-banner">Trading is disabled today (non-expiry day). No strategies will be executed.</div>';
       } else {
         bannerEl.innerHTML = '';
@@ -1684,7 +1697,7 @@ HTML_TEMPLATE = """
           || s.status === 'WAITING_FOR_CALM'
           || s.status === 'SKIPPED_VOLATILITY'
         );
-        if (stratWarning && bannerEl) {
+        if (stratWarning && bannerEl && !eodHalt) {
           const msg = stratWarning.message || stratWarning.status || 'Check strategy status';
           const label = String(msg).includes('MARGIN_NOT_AVAILABLE')
             ? 'Margin gate warning'

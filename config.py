@@ -210,6 +210,12 @@ def get_today_strategies(index_name: str) -> list[StrategyConfig]:
     return []
 
 PORTFOLIO_SL_LIMIT = -80000.0
+
+# EOD: square off bot-tracked F&O positions and cancel bot SL orders (IST wall clock).
+EOD_SQUAREOFF_ENABLED = os.getenv("EOD_SQUAREOFF_ENABLED", "True").lower() in ("true", "1", "yes")
+EOD_SQUAREOFF_TIME = os.getenv("EOD_SQUAREOFF_TIME", "15:10")
+EOD_VERIFY_UNTIL = os.getenv("EOD_VERIFY_UNTIL", "15:20")
+EOD_VERIFY_INTERVAL_SEC = int(os.getenv("EOD_VERIFY_INTERVAL_SEC", "15"))
 # Set to True to enable trading on non-expiry days; False disables all strategies on non-expiry.
 TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "True").lower() in ("true", "1", "yes")
 

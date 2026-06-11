@@ -9,6 +9,7 @@ from typing import Any, List
 from config import (
     CALM_ZONE_GATEKEEPER_POLL_SECONDS,
     CALM_ZONE_WAIT_TIMEOUT_MINUTES,
+    EOD_SQUAREOFF_TIME,
     ITM_STRIKES_NIFTY,
     ITM_STRIKES_SENSEX,
     LEG_TARGET_PCT,
@@ -22,6 +23,7 @@ from db import get_ist_now, get_ist_timestamp, log_order, log_strategy_execution
 from state import get_trading_flag_or
 from trading.compat import resolve
 from trading.context import STRATEGY_STATE
+from trading.eod import is_eod_halt
 from trading.journal import Phase, record as journal
 from trading.orders.close import cancel_order_logged, close_positions_for_instruments
 from trading.orders.lifecycle import complete_entry_with_sl_protection
@@ -54,6 +56,14 @@ def execute_strategy(client: Any, index_config, expiry: str, strategy, force: bo
     if not force and get_ist_now().strftime("%H:%M:%S") < strategy["time"]:
         return
     name = strategy["name"]
+    if is_eod_halt():
+        update_strategy(
+            name,
+            status="SKIPPED_VOLATILITY",
+            message=f"Skipped: EOD halt ({EOD_SQUAREOFF_TIME} IST)",
+            skip_reason="EOD_HALT",
+        )
+        return
     lock = _strategy_exec_lock(name)
     if not lock.acquire(blocking=False):
         journal(

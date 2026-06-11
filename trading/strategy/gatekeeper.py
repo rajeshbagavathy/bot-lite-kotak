@@ -23,6 +23,7 @@ from db import (
 )
 from trading.compat import resolve
 from trading.context import STRATEGY_STATE
+from trading.eod import is_eod_halt
 from trading.journal import Phase, record as journal
 from trading.state_bridge import update_strategy
 
@@ -130,6 +131,8 @@ def strategy_entry_window(strategy: dict, now: Optional[datetime.datetime] = Non
 
 def process_waiting_for_calm(client: Any, index_config, expiry: str, execute_fn) -> None:
     """Poll WAITING_FOR_CALM strategies; *execute_fn* is ``execute_strategy``."""
+    if is_eod_halt():
+        return
     now = get_ist_now()
     now_ts = now.timestamp()
     for strategy in STRATEGY_STATE.values():

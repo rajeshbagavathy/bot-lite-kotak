@@ -81,6 +81,20 @@ from trading.context import STRATEGY_STATE
 from trading.strategy.executor import execute_strategy as _execute_strategy_modular
 from trading.strategy.gatekeeper import process_waiting_for_calm as _process_waiting_for_calm_modular
 from trading.orders.sl import verify_sl_orders_live as _verify_sl_orders_live
+from trading.eod import (
+    collect_bot_tracked_instrument_ids,
+    eod_banner_message,
+    eod_squareoff_schedule_at,
+    eod_verify_active,
+    is_at_or_past_eod_time,
+    is_at_or_past_eod_verify_until,
+    is_bot_sl_order_tag,
+    is_cancellable_order_status,
+    is_eod_halt,
+    mark_eod_halt_started,
+    mark_eod_verify_complete,
+    set_eod_banner,
+)
 
 from config import (
     INDEX_CONFIGS,
@@ -102,6 +116,9 @@ from config import (
     MIN_MARGIN_TO_TRADE,
     HEDGE_ON_EVERY_STRATEGY,
     margin_required_per_lot_expiry,
+    EOD_SQUAREOFF_ENABLED,
+    EOD_SQUAREOFF_TIME,
+    EOD_VERIFY_INTERVAL_SEC,
     PORTFOLIO_SL_LIMIT,
     SOURCE,
     STRATEGY_SL_ENABLED,
@@ -173,6 +190,7 @@ logger = logging.getLogger("xts-bot-lite")
 APP_START_TIME = get_ist_now()
 _LAST_MTM_LOG: Dict[str, float] = {}  # strategy_name -> last log timestamp (for throttling)
 _LAST_PORTFOLIO_MTM_LOG: float = 0.0
+_EOD_LAST_VERIFY_TS: float = 0.0
 
 
 def _strategy_state_entry(cfg) -> dict:
@@ -700,7 +718,7 @@ def _catch_up_missed_scheduled_strategies(client: Any, index_config, expiry: str
     time today. Run eligible strategies once when the process starts inside
     ``[slot, slot + CALM_ZONE_WAIT_TIMEOUT_MINUTES]`` so restarts still honor the gatekeeper window.
     """
-    if _SCHEDULER_MINIMAL_MODE:
+    if _SCHEDULER_MINIMAL_MODE or is_eod_halt():
         return
     now = get_ist_now()
     for strategy in STRATEGY_STATE.values():
@@ -981,6 +999,246 @@ def _square_off_all(client: Any, index_config, positions: List[dict], reason: st
     logger.warning("Square-off all positions: %s", reason)
     for pos in positions:
         _place_close_order(client, index_config, pos, "SQUAREOFF")
+
+
+def _update_eod_banner_state() -> None:
+    set_bot_runtime_flags(
+        eod_halt=is_eod_halt(),
+        eod_banner=eod_banner_message(),
+        eod_squareoff_time=EOD_SQUAREOFF_TIME,
+    )
+
+
+def _square_off_bot_positions(
+    client: Any, index_config, broker_positions: List[dict], reason: str
+) -> int:
+    """Market-close broker rows for instruments the bot opened (not manual/other F&O)."""
+    bot_ids = collect_bot_tracked_instrument_ids()
+    if not bot_ids:
+        logger.info("EOD: no bot-tracked instruments to square off")
+        return 0
+    placed = 0
+    for pos in broker_positions or []:
+        try:
+            iid = int(pos.get("ExchangeInstrumentId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if iid not in bot_ids:
+            continue
+        try:
+            qty = int(pos.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty == 0:
+            continue
+        logger.warning("EOD square-off %s: instrument %s qty %s", reason, iid, qty)
+        _place_close_order(client, index_config, pos, "EOD_SQ")
+        placed += 1
+    return placed
+
+
+def _cancel_bot_open_sl_orders(client: Any, order_book: Optional[List[dict]] = None) -> int:
+    """Cancel pending bot SL orders (tags ``<strategy>_SL_<instrument>``)."""
+    cancelled = 0
+    for strategy in STRATEGY_STATE.values():
+        for sl_order in strategy.get("sl_orders", []) or []:
+            try:
+                client.cancel_order(sl_order["app_order_id"], sl_order["tag"])
+                cancelled += 1
+            except Exception:
+                logger.exception("EOD: failed to cancel SL %s", sl_order)
+    if order_book is None:
+        try:
+            order_book = client.get_order_book()
+        except Exception:
+            logger.exception("EOD: failed to fetch order book for SL cancel sweep")
+            return cancelled
+    seen_ids = set()
+    for order in order_book or []:
+        tag = str(order.get("OrderUniqueIdentifier") or "")
+        if not is_bot_sl_order_tag(tag):
+            continue
+        status = str(order.get("OrderStatus") or "").upper()
+        if not is_cancellable_order_status(status):
+            continue
+        app_order_id = order.get("AppOrderID")
+        if app_order_id is None:
+            continue
+        try:
+            oid = int(app_order_id)
+        except (TypeError, ValueError):
+            continue
+        if oid in seen_ids:
+            continue
+        seen_ids.add(oid)
+        try:
+            client.cancel_order(oid, tag)
+            cancelled += 1
+        except Exception:
+            logger.exception("EOD: failed to cancel open SL from book tag=%s", tag)
+    return cancelled
+
+
+def _count_remaining_bot_exposure(
+    client: Any, order_book: Optional[List[dict]] = None
+) -> Tuple[int, int]:
+    bot_ids = collect_bot_tracked_instrument_ids()
+    open_positions = 0
+    try:
+        broker_positions = client.get_positions()
+    except Exception:
+        logger.exception("EOD verify: get_positions failed")
+        broker_positions = []
+    for pos in broker_positions or []:
+        try:
+            iid = int(pos.get("ExchangeInstrumentId") or 0)
+            qty = int(pos.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            continue
+        if iid in bot_ids and qty != 0:
+            open_positions += 1
+    if order_book is None:
+        try:
+            order_book = client.get_order_book()
+        except Exception:
+            logger.exception("EOD verify: get_order_book failed")
+            order_book = []
+    open_sl = 0
+    for order in order_book or []:
+        tag = str(order.get("OrderUniqueIdentifier") or "")
+        if not is_bot_sl_order_tag(tag):
+            continue
+        if is_cancellable_order_status(str(order.get("OrderStatus") or "")):
+            open_sl += 1
+    return open_positions, open_sl
+
+
+def _finalize_eod_strategy_states(reason: str) -> None:
+    exit_time = get_ist_timestamp()
+    for strategy in STRATEGY_STATE.values():
+        st = strategy.get("status")
+        name = strategy.get("name", "")
+        if st in ("OPEN", "CLOSING"):
+            db_id = strategy.get("db_id")
+            if db_id and db_id > 0 and st == "OPEN":
+                log_trade_closed(
+                    name,
+                    strategy.get("strike"),
+                    strategy.get("entry_time"),
+                    exit_time,
+                    strategy.get("realized", 0.0),
+                    strategy.get("mtm", 0.0),
+                    reason,
+                )
+            update_strategy(
+                name,
+                status="CLOSED",
+                message=reason,
+                sl_orders=[],
+                sl_tag_map={},
+            )
+        elif st in ("PENDING", "WAITING_FOR_CALM", "ERROR"):
+            update_strategy(
+                name,
+                status="SKIPPED_VOLATILITY",
+                message=f"Skipped: {reason}",
+                skip_reason="EOD_HALT",
+            )
+
+
+def _eod_squareoff_and_cleanup(client: Any, index_config) -> None:
+    """Square off bot F&O positions and cancel bot SL orders at configured EOD time."""
+    if not EOD_SQUAREOFF_ENABLED:
+        return
+    if client is None:
+        msg = f"EOD square-off ({EOD_SQUAREOFF_TIME} IST): demo mode — no broker calls"
+        mark_eod_halt_started(msg)
+        _finalize_eod_strategy_states(msg)
+        _update_eod_banner_state()
+        return
+    if is_eod_halt() and not eod_verify_active():
+        return
+    reason = f"EOD square-off ({EOD_SQUAREOFF_TIME} IST)"
+    if not is_eod_halt():
+        mark_eod_halt_started(f"{reason} in progress…")
+        _update_eod_banner_state()
+        logger.warning("Starting %s", reason)
+    try:
+        positions = client.get_positions()
+    except Exception:
+        logger.exception("EOD: failed to fetch positions")
+        positions = []
+    try:
+        order_book = client.get_order_book()
+    except Exception:
+        logger.exception("EOD: failed to fetch order book")
+        order_book = []
+    closed = _square_off_bot_positions(client, index_config, positions, reason)
+    cancelled = _cancel_bot_open_sl_orders(client, order_book=order_book)
+    _finalize_eod_strategy_states(reason)
+    logger.warning("EOD pass: placed %s close order(s), cancelled %s SL order(s)", closed, cancelled)
+    open_pos, open_sl = _count_remaining_bot_exposure(client, order_book=None)
+    if open_pos == 0 and open_sl == 0:
+        mark_eod_verify_complete(
+            f"{reason} complete. Bot positions closed and SL orders cancelled."
+        )
+    else:
+        set_eod_banner(
+            f"{reason}: {open_pos} position(s) and {open_sl} SL order(s) still open — retrying…"
+        )
+    _update_eod_banner_state()
+
+
+def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
+    global _EOD_LAST_VERIFY_TS
+    if not EOD_SQUAREOFF_ENABLED or client is None or index_config is None:
+        return
+    if is_eod_halt():
+        if not eod_verify_active():
+            return
+        now = get_ist_now()
+        if is_at_or_past_eod_verify_until(now):
+            open_pos, open_sl = _count_remaining_bot_exposure(client)
+            if open_pos or open_sl:
+                mark_eod_verify_complete(
+                    f"EOD square-off ({EOD_SQUAREOFF_TIME} IST): "
+                    f"{open_pos} position(s) and {open_sl} SL order(s) still open — check broker manually."
+                )
+            else:
+                mark_eod_verify_complete(
+                    f"EOD square-off ({EOD_SQUAREOFF_TIME} IST) complete. "
+                    "Bot positions closed and SL orders cancelled."
+                )
+            _update_eod_banner_state()
+            return
+        if time.time() - _EOD_LAST_VERIFY_TS < float(EOD_VERIFY_INTERVAL_SEC):
+            return
+        _EOD_LAST_VERIFY_TS = time.time()
+        open_pos, open_sl = _count_remaining_bot_exposure(client)
+        if open_pos == 0 and open_sl == 0:
+            mark_eod_verify_complete(
+                f"EOD square-off ({EOD_SQUAREOFF_TIME} IST) complete. "
+                "Bot positions closed and SL orders cancelled."
+            )
+            _update_eod_banner_state()
+            return
+        try:
+            positions = client.get_positions()
+            order_book = client.get_order_book()
+        except Exception:
+            logger.exception("EOD verify retry failed")
+            return
+        _square_off_bot_positions(client, index_config, positions, "EOD verify retry")
+        _cancel_bot_open_sl_orders(client, order_book=order_book)
+        open_pos, open_sl = _count_remaining_bot_exposure(client)
+        set_eod_banner(
+            f"EOD square-off ({EOD_SQUAREOFF_TIME} IST): "
+            f"{open_pos} position(s) and {open_sl} SL order(s) still open — retrying…"
+        )
+        _update_eod_banner_state()
+        return
+    if is_at_or_past_eod_time():
+        _eod_squareoff_and_cleanup(client, index_config)
 
 
 def _sync_sl_order_status_and_capture_exits(
@@ -1785,6 +2043,9 @@ def _sync_strategy_positions_from_broker(
 def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
     from state import STATE as _STATE
 
+    _maybe_run_eod_squareoff(client, index_config)
+    eod_active = is_eod_halt()
+
     expiry = (_STATE.get("index") or {}).get("expiry")
     warm_chain = getattr(client, "warm_option_chain", None)
     if callable(warm_chain) and expiry:
@@ -1893,14 +2154,16 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
         _sync_sl_order_status_and_capture_exits(client, strategy, order_book=order_book)
 
         # **LEG TARGET**: If any leg has reached target % profit, close it by modifying SL to marketable LIMIT
-        _check_leg_target_and_close(client, index_config, strategy, ltp_map)
+        if not eod_active:
+            _check_leg_target_and_close(client, index_config, strategy, ltp_map)
         
         # Sync strategy positions with broker positions to keep state real-time
         _sync_strategy_positions_from_broker(client, strategy, positions, ltp_map, order_book=order_book)
 
         # **SURVIVOR SL**: After one leg is closed (order-book SL_FILLED or broker sync), tighten survivor SL to cost.
         # Runs after broker sync so BROKER_SYNC closes are visible the same tick.
-        _adjust_survivor_sl_to_cost_after_peer_sl(client, index_config, strategy, order_book=order_book)
+        if not eod_active:
+            _adjust_survivor_sl_to_cost_after_peer_sl(client, index_config, strategy, order_book=order_book)
         
         # Compute strategy MTM from local strategy positions (exit_price -> realized, else LTP -> unrealized)
         # Do this BEFORE we potentially clear positions during closure.
@@ -1918,7 +2181,7 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
             s_total = float(strategy.get("mtm", 0.0) or 0.0)
         
         # **CHECK**: If all positions are closed via SL orders, close strategy (logs to trades_closed)
-        if strategy["status"] == "OPEN" and _check_all_positions_closed(strategy):
+        if not eod_active and strategy["status"] == "OPEN" and _check_all_positions_closed(strategy):
             logger.debug(f"✅ [{strategy['name']}] All positions closed via SL orders - closing strategy")
             _close_strategy(
                 client, index_config, strategy, positions,
@@ -1928,7 +2191,8 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
         # Per-strategy SL: only when enabled and strategy_sl > 0.
         strategy_sl_val = strategy.get("strategy_sl")
         if (
-            get_trading_flag_or("strategy_sl_enabled", STRATEGY_SL_ENABLED)
+            not eod_active
+            and get_trading_flag_or("strategy_sl_enabled", STRATEGY_SL_ENABLED)
             and strategy["status"] == "OPEN"
             and strategy_sl_val is not None
             and float(strategy_sl_val) > 0
@@ -1936,7 +2200,7 @@ def _monitor_mtm(client: Any, index_config, portfolio_sl: float) -> None:
         ):
             _close_strategy(client, index_config, strategy, positions, "Strategy SL hit")
 
-    if overall <= portfolio_sl:
+    if not eod_active and overall <= portfolio_sl:
         # State-only halt: strategies closed below. We intentionally do not schedule.clear() here;
         # the MTM monitor job keeps firing until process exit (see portfolio_sl_note in scheduler diagnostics).
         _square_off_all(client, index_config, positions, "Portfolio SL hit")
@@ -2013,6 +2277,7 @@ def _job_display_label(job: Any) -> str:
         "_execute_strategy": "Execute strategy",
         "_update_available_margin": "Update available margin",
         "cleanup_old_data": "Daily DB cleanup (midnight IST)",
+        "_eod_squareoff_and_cleanup": "EOD square-off (bot F&O + SL cancel)",
     }
     base = titles.get(name, name)
     if isinstance(fn, functools.partial) and name == "_execute_strategy":
@@ -2119,9 +2384,16 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
     )
     schedule.every(60).seconds.do(_update_available_margin, client=client)
     schedule.every().day.at("00:00").do(cleanup_old_data)
+    if EOD_SQUAREOFF_ENABLED:
+        schedule.every().day.at(eod_squareoff_schedule_at()).do(
+            _eod_squareoff_and_cleanup, client=client, index_config=index_config
+        )
     _JOBS_SCHEDULED_FLAG = True
     register_scheduler_snapshot_with_state()
     _update_available_margin(client)
+    if EOD_SQUAREOFF_ENABLED and is_at_or_past_eod_time() and not is_eod_halt():
+        logger.warning("Startup catch-up: running EOD square-off (past %s IST)", EOD_SQUAREOFF_TIME)
+        _eod_squareoff_and_cleanup(client, index_config)
 
 
 def _kotak_session_ready(client: Any) -> bool:
