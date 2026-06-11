@@ -41,9 +41,19 @@ def is_at_or_past_eod_time(now: Optional[datetime.datetime] = None) -> bool:
 
 
 def is_at_or_past_eod_verify_until(now: Optional[datetime.datetime] = None) -> bool:
+    """True at/after EOD_VERIFY_UNTIL (default 15:19 IST) — hard stop for retry loop."""
     t = (now or get_ist_now()).time()
     h, m = _parse_hhmm(EOD_VERIFY_UNTIL)
     return (t.hour, t.minute) >= (h, m)
+
+
+def is_within_eod_retry_window(now: Optional[datetime.datetime] = None) -> bool:
+    """True between EOD_SQUAREOFF_TIME (inclusive) and EOD_VERIFY_UNTIL (exclusive)."""
+    t = (now or get_ist_now()).time()
+    key = (t.hour, t.minute)
+    sh, sm = _parse_hhmm(EOD_SQUAREOFF_TIME)
+    eh, em = _parse_hhmm(EOD_VERIFY_UNTIL)
+    return (sh, sm) <= key < (eh, em)
 
 
 def is_eod_halt() -> bool:
@@ -137,3 +147,35 @@ def is_bot_sl_order_tag(tag: str) -> bool:
 def is_cancellable_order_status(status: str) -> bool:
     key = str(status or "").replace(" ", "").replace("_", "").upper()
     return key in _OPEN_ORDER_STATUSES
+
+
+def count_remaining_bot_exposure(
+    broker_positions: list,
+    order_book: list,
+) -> Tuple[int, int]:
+    """
+    Count open bot positions and cancellable SL orders still on the book.
+    If strategy state has no instrument IDs, count all non-zero broker positions.
+    """
+    bot_ids = collect_bot_tracked_instrument_ids()
+    count_all_positions = not bot_ids
+    open_positions = 0
+    for pos in broker_positions or []:
+        try:
+            iid = int(pos.get("ExchangeInstrumentId") or 0)
+            qty = int(pos.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty == 0:
+            continue
+        if not count_all_positions and iid not in bot_ids:
+            continue
+        open_positions += 1
+    open_sl = 0
+    for order in order_book or []:
+        tag = str(order.get("OrderUniqueIdentifier") or "")
+        if not is_bot_sl_order_tag(tag):
+            continue
+        if is_cancellable_order_status(str(order.get("OrderStatus") or "")):
+            open_sl += 1
+    return open_positions, open_sl

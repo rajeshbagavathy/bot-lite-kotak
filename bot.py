@@ -83,6 +83,7 @@ from trading.strategy.gatekeeper import process_waiting_for_calm as _process_wai
 from trading.orders.sl import verify_sl_orders_live as _verify_sl_orders_live
 from trading.eod import (
     collect_bot_tracked_instrument_ids,
+    count_remaining_bot_exposure as _count_remaining_bot_exposure_from_book,
     eod_banner_message,
     eod_squareoff_schedule_at,
     eod_verify_active,
@@ -91,6 +92,7 @@ from trading.eod import (
     is_bot_sl_order_tag,
     is_cancellable_order_status,
     is_eod_halt,
+    is_within_eod_retry_window,
     mark_eod_halt_started,
     mark_eod_verify_complete,
     set_eod_banner,
@@ -118,6 +120,7 @@ from config import (
     EOD_SQUAREOFF_ENABLED,
     EOD_SQUAREOFF_TIME,
     EOD_VERIFY_INTERVAL_SEC,
+    EOD_VERIFY_UNTIL,
     PORTFOLIO_SL_LIMIT,
     SOURCE,
     STRATEGY_SL_ENABLED,
@@ -1118,35 +1121,18 @@ def _cancel_bot_open_sl_orders(client: Any, order_book: Optional[List[dict]] = N
 def _count_remaining_bot_exposure(
     client: Any, order_book: Optional[List[dict]] = None
 ) -> Tuple[int, int]:
-    bot_ids = collect_bot_tracked_instrument_ids()
-    open_positions = 0
     try:
         broker_positions = client.get_positions()
     except Exception:
         logger.exception("EOD verify: get_positions failed")
         broker_positions = []
-    for pos in broker_positions or []:
-        try:
-            iid = int(pos.get("ExchangeInstrumentId") or 0)
-            qty = int(pos.get("Quantity") or 0)
-        except (TypeError, ValueError):
-            continue
-        if iid in bot_ids and qty != 0:
-            open_positions += 1
     if order_book is None:
         try:
             order_book = client.get_order_book()
         except Exception:
             logger.exception("EOD verify: get_order_book failed")
             order_book = []
-    open_sl = 0
-    for order in order_book or []:
-        tag = str(order.get("OrderUniqueIdentifier") or "")
-        if not is_bot_sl_order_tag(tag):
-            continue
-        if is_cancellable_order_status(str(order.get("OrderStatus") or "")):
-            open_sl += 1
-    return open_positions, open_sl
+    return _count_remaining_bot_exposure_from_book(broker_positions, order_book)
 
 
 def _finalize_eod_strategy_states(reason: str) -> None:
@@ -1198,8 +1184,10 @@ def _finalize_eod_strategy_states(reason: str) -> None:
 
 
 def _eod_squareoff_and_cleanup(client: Any, index_config) -> None:
-    """Square off bot F&O positions and cancel bot SL orders at configured EOD time."""
+    """Square off bot F&O positions and cancel bot SL orders (15:10–15:19 IST retry window)."""
     if not EOD_SQUAREOFF_ENABLED:
+        return
+    if not is_within_eod_retry_window() and not (is_eod_halt() and eod_verify_active()):
         return
     if client is not None and index_config is not None and not collect_bot_tracked_instrument_ids():
         from state import STATE as _STATE
@@ -1256,6 +1244,10 @@ def _eod_squareoff_and_cleanup(client: Any, index_config) -> None:
 
 
 def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
+    """
+    EOD square-off driver: starts at EOD_SQUAREOFF_TIME (15:10), retries every
+    EOD_VERIFY_INTERVAL_SEC until clean or hard stop at EOD_VERIFY_UNTIL (15:19).
+    """
     global _EOD_LAST_VERIFY_TS
     if not EOD_SQUAREOFF_ENABLED or client is None or index_config is None:
         return
@@ -1267,15 +1259,17 @@ def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
             open_pos, open_sl = _count_remaining_bot_exposure(client)
             if open_pos or open_sl:
                 mark_eod_verify_complete(
-                    f"EOD square-off ({EOD_SQUAREOFF_TIME} IST): "
+                    f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST): "
                     f"{open_pos} position(s) and {open_sl} SL order(s) still open — check broker manually."
                 )
             else:
                 mark_eod_verify_complete(
-                    f"EOD square-off ({EOD_SQUAREOFF_TIME} IST) complete. "
+                    f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST) complete. "
                     "Bot positions closed and SL orders cancelled."
                 )
             _update_eod_banner_state()
+            return
+        if not is_within_eod_retry_window(now):
             return
         if time.time() - _EOD_LAST_VERIFY_TS < float(EOD_VERIFY_INTERVAL_SEC):
             return
@@ -1283,7 +1277,7 @@ def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
         open_pos, open_sl = _count_remaining_bot_exposure(client)
         if open_pos == 0 and open_sl == 0:
             mark_eod_verify_complete(
-                f"EOD square-off ({EOD_SQUAREOFF_TIME} IST) complete. "
+                f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST) complete. "
                 "Bot positions closed and SL orders cancelled."
             )
             _update_eod_banner_state()
@@ -1298,13 +1292,18 @@ def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
         _cancel_bot_open_sl_orders(client, order_book=order_book)
         open_pos, open_sl = _count_remaining_bot_exposure(client)
         set_eod_banner(
-            f"EOD square-off ({EOD_SQUAREOFF_TIME} IST): "
+            f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST): "
             f"{open_pos} position(s) and {open_sl} SL order(s) still open — retrying…"
         )
         _update_eod_banner_state()
         return
-    if is_at_or_past_eod_time():
+    if is_within_eod_retry_window():
         _eod_squareoff_and_cleanup(client, index_config)
+
+
+def _eod_scheduler_tick(client: Any, index_config) -> None:
+    """Periodic EOD retry tick (used when full MTM monitor is not scheduled)."""
+    _maybe_run_eod_squareoff(client, index_config)
 
 
 def _sync_sl_order_status_and_capture_exits(
@@ -2645,9 +2644,23 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
             update_strategy(strategy["name"], status="DISABLED", message="No trading on non-expiry day")
         schedule.every(60).seconds.do(_update_available_margin, client=client)
         schedule.every().day.at("00:00").do(cleanup_old_data)
+        if EOD_SQUAREOFF_ENABLED:
+            schedule.every().day.at(eod_squareoff_schedule_at()).do(
+                _eod_squareoff_and_cleanup, client=client, index_config=index_config
+            )
+            schedule.every(max(1, int(EOD_VERIFY_INTERVAL_SEC))).seconds.do(
+                _eod_scheduler_tick, client=client, index_config=index_config
+            )
         _JOBS_SCHEDULED_FLAG = True
         register_scheduler_snapshot_with_state()
         _update_available_margin(client)
+        if EOD_SQUAREOFF_ENABLED and is_within_eod_retry_window() and not is_eod_halt():
+            logger.warning(
+                "Startup catch-up: running EOD square-off (within %s–%s IST window)",
+                EOD_SQUAREOFF_TIME,
+                EOD_VERIFY_UNTIL,
+            )
+            _eod_squareoff_and_cleanup(client, index_config)
         return
 
     _SCHEDULER_MINIMAL_MODE = False
@@ -2685,8 +2698,12 @@ def _schedule_jobs(client: Any, index_config, expiry: str) -> None:
     _JOBS_SCHEDULED_FLAG = True
     register_scheduler_snapshot_with_state()
     _update_available_margin(client)
-    if EOD_SQUAREOFF_ENABLED and is_at_or_past_eod_time() and not is_eod_halt():
-        logger.warning("Startup catch-up: running EOD square-off (past %s IST)", EOD_SQUAREOFF_TIME)
+    if EOD_SQUAREOFF_ENABLED and is_within_eod_retry_window() and not is_eod_halt():
+        logger.warning(
+            "Startup catch-up: running EOD square-off (within %s–%s IST window)",
+            EOD_SQUAREOFF_TIME,
+            EOD_VERIFY_UNTIL,
+        )
         _eod_squareoff_and_cleanup(client, index_config)
 
 

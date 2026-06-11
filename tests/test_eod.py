@@ -1,16 +1,23 @@
 """Tests for EOD square-off helpers and bot integration."""
+import datetime
 import unittest
 from unittest.mock import MagicMock, patch
 
 import bot
+import pytz
 from trading.context import STRATEGY_STATE
 from trading.eod import (
     collect_bot_tracked_instrument_ids,
+    count_remaining_bot_exposure,
+    is_at_or_past_eod_verify_until,
     is_bot_sl_order_tag,
     is_cancellable_order_status,
     is_eod_halt,
+    is_within_eod_retry_window,
     reset_eod_state,
 )
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 
 class TestEodHelpers(unittest.TestCase):
@@ -41,6 +48,32 @@ class TestEodHelpers(unittest.TestCase):
     def test_is_cancellable_order_status(self):
         self.assertTrue(is_cancellable_order_status("NEW"))
         self.assertFalse(is_cancellable_order_status("FILLED"))
+
+    def test_eod_retry_window_1510_to_1519(self):
+        d = datetime.date(2026, 6, 3)
+        t_start = _IST.localize(datetime.datetime.combine(d, datetime.time(15, 10)))
+        t_mid = _IST.localize(datetime.datetime.combine(d, datetime.time(15, 15)))
+        t_stop = _IST.localize(datetime.datetime.combine(d, datetime.time(15, 19)))
+        t_after = _IST.localize(datetime.datetime.combine(d, datetime.time(15, 20)))
+        self.assertTrue(is_within_eod_retry_window(t_start))
+        self.assertTrue(is_within_eod_retry_window(t_mid))
+        self.assertFalse(is_within_eod_retry_window(t_stop))
+        self.assertFalse(is_within_eod_retry_window(t_after))
+        self.assertTrue(is_at_or_past_eod_verify_until(t_stop))
+        self.assertFalse(is_at_or_past_eod_verify_until(t_mid))
+
+    def test_count_remaining_all_positions_when_state_empty(self):
+        STRATEGY_STATE.clear()
+        positions = [
+            {"ExchangeInstrumentId": 111, "Quantity": -65},
+            {"ExchangeInstrumentId": 999, "Quantity": -30},
+        ]
+        book = [
+            {"OrderUniqueIdentifier": "X_H_0946_SL_111", "OrderStatus": "NEW"},
+        ]
+        open_pos, open_sl = count_remaining_bot_exposure(positions, book)
+        self.assertEqual(open_pos, 2)
+        self.assertEqual(open_sl, 1)
 
 
 class TestEodSquareOffBot(unittest.TestCase):
@@ -74,6 +107,18 @@ class TestEodSquareOffBot(unittest.TestCase):
         self.assertEqual(placed, 1)
         client.place_market_order.assert_called_once()
 
+    def test_square_off_all_when_no_tracked_ids(self):
+        STRATEGY_STATE.clear()
+        client = MagicMock()
+        index_config = MagicMock()
+        positions = [
+            {"ExchangeInstrumentId": "111", "Quantity": "-65", "ProductType": "MIS"},
+            {"ExchangeInstrumentId": "999", "Quantity": "-65", "ProductType": "MIS"},
+        ]
+        placed = bot._square_off_bot_positions(client, index_config, positions, "test")
+        self.assertEqual(placed, 2)
+        self.assertEqual(client.place_market_order.call_count, 2)
+
     def test_cancel_bot_open_sl_orders(self):
         client = MagicMock()
         order_book = [
@@ -84,10 +129,11 @@ class TestEodSquareOffBot(unittest.TestCase):
         self.assertEqual(n, 2)
         self.assertEqual(client.cancel_order.call_count, 2)
 
+    @patch("bot.is_within_eod_retry_window", return_value=True)
     @patch("bot._update_eod_banner_state")
     @patch("bot.log_trade_closed")
     @patch("bot.update_strategy")
-    def test_eod_squareoff_and_cleanup(self, mock_update, mock_log_closed, _banner):
+    def test_eod_squareoff_and_cleanup(self, mock_update, mock_log_closed, _banner, _window):
         client = MagicMock()
         index_config = MagicMock()
         client.get_positions.return_value = [
