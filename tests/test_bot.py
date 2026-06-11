@@ -1822,7 +1822,37 @@ class TestAdjustSurvivorSlToCost(unittest.TestCase):
 
     @patch("bot.update_strategy")
     @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
-    def test_tightens_survivor_sl_to_cost(self, mock_update):
+    @patch("bot._broker_modify_order_ok", return_value=True)
+    def test_survivor_adjust_with_trigger_pending_status(self, _ok, _upd):
+        """Kotak SL orders in 'trigger pending' must be modifiable for cost tighten."""
+        mock_client = MagicMock()
+        mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"
+        mock_client.interactive.PRODUCT_MIS = "MIS"
+        mock_client.interactive.VALIDITY_DAY = "DAY"
+        strategy = self._strategy_two_leg()
+        verified_book = [
+            {
+                "AppOrderID": 202,
+                "OrderUniqueIdentifier": "N_T_1031_SL_222",
+                "OrderStatus": "TRIGGERPENDING",
+                "OrderQuantity": 65,
+                "ProductType": "MIS",
+                "OrderPrice": 100.0,
+                "OrderStopPrice": 99.5,
+            }
+        ]
+        mock_client.get_order_book.return_value = verified_book
+        mock_client.modify_order.return_value = {"stat": "Ok"}
+        with patch("bot.logger"):
+            bot._adjust_survivor_sl_to_cost_after_peer_sl(
+                mock_client, self.index_config, strategy, order_book=verified_book
+            )
+        mock_client.modify_order.assert_called_once()
+
+    @patch("bot.update_strategy")
+    @patch("bot.SURVIVOR_SL_TO_COST_ENABLED", True)
+    @patch("bot._broker_modify_order_ok", return_value=True)
+    def test_tightens_survivor_sl_to_cost(self, _ok, mock_update):
         mock_client = MagicMock()
         mock_client.modify_order.return_value = {"result": {"AppOrderID": 202}}
         mock_client.interactive.ORDER_TYPE_STOPLIMIT = "STOPLIMIT"

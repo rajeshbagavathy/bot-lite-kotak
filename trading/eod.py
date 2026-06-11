@@ -12,7 +12,9 @@ _EOD_HALT: bool = False
 _EOD_VERIFY_ACTIVE: bool = False
 _EOD_BANNER: Optional[str] = None
 
-_OPEN_ORDER_STATUSES = frozenset({"NEW", "REPLACED", "PENDING", "PARTIALLYFILLED"})
+_OPEN_ORDER_STATUSES = frozenset(
+    {"NEW", "REPLACED", "PENDING", "PARTIALLYFILLED", "OPEN", "TRIGGERPENDING"}
+)
 
 
 def _parse_hhmm(value: str) -> Tuple[int, int]:
@@ -125,4 +127,5 @@ def is_bot_sl_order_tag(tag: str) -> bool:
 
 
 def is_cancellable_order_status(status: str) -> bool:
-    return str(status or "").upper() in _OPEN_ORDER_STATUSES
+    key = str(status or "").replace(" ", "").replace("_", "").upper()
+    return key in _OPEN_ORDER_STATUSES

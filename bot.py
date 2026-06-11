@@ -508,6 +508,27 @@ def _order_book_status_is_filled(status_raw: Optional[str]) -> bool:
     )
 
 
+def _normalize_order_status_key(status_raw: Optional[str]) -> str:
+    return (status_raw or "").replace(" ", "").replace("_", "").upper()
+
+
+_MODIFIABLE_SL_ORDER_STATUSES = frozenset(
+    {
+        "NEW",
+        "REPLACED",
+        "PENDING",
+        "OPEN",
+        "PARTIALLYFILLED",
+        "TRIGGERPENDING",
+    }
+)
+
+
+def _is_modifiable_sl_order_status(status_raw: Optional[str]) -> bool:
+    """True if a stop/limit SL order can still be modified (Kotak trigger pending included)."""
+    return _normalize_order_status_key(status_raw) in _MODIFIABLE_SL_ORDER_STATUSES
+
+
 # Closed-leg reasons that still imply one straddle leg is gone; tighten survivor SL to cost.
 # RESTORED: exit_price loaded from DB on restart (closed_via not persisted in SQLite).
 _SURVIVOR_PEER_CLOSED_VIA_OK = frozenset({"SL_FILLED", "BROKER_SYNC", "RESTORED"})
@@ -891,9 +912,9 @@ def _close_strategy_via_open_sl_orders(client: Any, index_config, strategy: dict
             )
             continue
 
-        order_status = order_detail.get("OrderStatus", "").upper()
+        order_status = order_detail.get("OrderStatus", "")
 
-        if order_status in ("NEW", "REPLACED"):
+        if _is_modifiable_sl_order_status(order_status):
             iid: Optional[int] = None
             if tag and tag in sl_tag_map:
                 try:
@@ -910,11 +931,11 @@ def _close_strategy_via_open_sl_orders(client: Any, index_config, strategy: dict
                         except (TypeError, ValueError):
                             continue
             pending.append((app_order_id, tag, order_detail, iid))
-        elif order_status == "FILLED":
+        elif _order_book_status_is_filled(order_status):
             logger.debug(
                 f"ℹ️  [{strategy['name']}] SL already FILLED, skipping: {tag}"
             )
-        elif order_status in ("CANCELLED", "REJECTED"):
+        elif _normalize_order_status_key(order_status) in ("CANCELLED", "REJECTED"):
             logger.warning(
                 f"⚠️  [{strategy['name']}] SL order {order_status}: {tag} "
                 f"(position exposed, manual intervention may be needed)"
@@ -1449,12 +1470,13 @@ def _sync_sl_order_status_and_capture_exits(
                 f"Instrument {instrument_id} (position still exposed)"
             )
         
-        elif order_status.replace(" ", "").replace("_", "") in (
+        elif _normalize_order_status_key(order_status) in (
             "PENDING",
             "OPEN",
             "PARTIALLYFILLED",
             "NEW",
             "REPLACED",
+            "TRIGGERPENDING",
         ):
             # ⏳ SL order still active - position still OPEN
             matching_position["sl_status"] = "WAITING"
@@ -1674,16 +1696,8 @@ def _adjust_survivor_sl_to_cost_after_peer_sl(
         )
         return
 
-    order_status = (order_detail.get("OrderStatus") or "").replace(" ", "").upper()
-    _open_sl = {
-        "NEW",
-        "REPLACED",
-        "PENDING",
-        "OPEN",
-        "PARTIALLYFILLED",
-        "PARTIALLY_FILLED",
-    }
-    if order_status not in _open_sl:
+    order_status = order_detail.get("OrderStatus", "")
+    if not _is_modifiable_sl_order_status(order_status):
         _hint_survivor_sl_to_cost(
             strategy,
             f"Survivor SL status={order_status!r} — not active; cannot modify.",
@@ -2043,8 +2057,8 @@ def _check_leg_target_and_close(
         order_detail = order_book_by_id.get(app_order_id) or order_book_by_tag.get(tag)
         if not order_detail:
             continue
-        order_status = (order_detail.get("OrderStatus") or "").replace(" ", "").upper()
-        if order_status not in ("NEW", "REPLACED"):
+        order_status = order_detail.get("OrderStatus", "")
+        if not _is_modifiable_sl_order_status(order_status):
             continue
 
         order_side = order_detail.get("OrderSide") or client.interactive.TRANSACTION_TYPE_BUY

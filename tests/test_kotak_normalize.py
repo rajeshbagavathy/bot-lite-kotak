@@ -42,6 +42,20 @@ class TestKotakOrderNormalize(unittest.TestCase):
         self.assertEqual(n["OrderUniqueIdentifier"], "MYTAG")
         self.assertEqual(n["ProductType"], "NRML")
 
+    def test_trigger_pending_maps_to_new(self):
+        row = {
+            "nOrdNo": "123",
+            "ordSt": "trigger pending",
+            "stat": "trigger pending",
+            "trnsTp": "B",
+            "prcTp": "SL",
+            "qty": 20,
+            "tok": "999",
+            "GuiOrdId": "TAG_SL",
+        }
+        n = kotak_order_to_normalized(row)
+        self.assertEqual(n["OrderStatus"], "NEW")
+
 
 class TestKotakPlaceOrderParse(unittest.TestCase):
     def test_n_ord_no(self):

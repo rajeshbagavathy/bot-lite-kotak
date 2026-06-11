@@ -26,11 +26,12 @@ def _safe_float(v: Any) -> Optional[float]:
 
 def _kotak_ord_st_to_order_status(ord_st: Optional[str], stat: Optional[str]) -> str:
     raw = (ord_st or stat or "").strip().lower()
+    key = raw.replace(" ", "").replace("_", "")
     m = {
         "open": "NEW",
         "new": "NEW",
         "pending": "PENDING",
-        "trigger pending": "NEW",
+        "triggerpending": "NEW",
         "replaced": "REPLACED",
         "complete": "FILLED",
         "traded": "FILLED",
@@ -38,10 +39,8 @@ def _kotak_ord_st_to_order_status(ord_st: Optional[str], stat: Optional[str]) ->
         "cancelled": "CANCELLED",
         "rejected": "REJECTED",
         "partiallyfilled": "PARTIALLYFILLED",
-        "partially filled": "PARTIALLYFILLED",
     }
-    key = raw.replace(" ", "").replace("_", "")
-    return m.get(key, raw.upper() or "UNKNOWN")
+    return m.get(key, key.upper() if key else "UNKNOWN")
 
 
 def _trns_tp_to_side(tp: Optional[str]) -> str:
