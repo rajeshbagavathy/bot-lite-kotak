@@ -1143,13 +1143,16 @@ DASHBOARD_TEMPLATE = """
         const stratVals = Object.values(stateStrategies);
         const botMeta = state.bot || {};
         const eodHalt = !!botMeta.eod_halt;
+        const eodVerifyActive = !!botMeta.eod_verify_active;
+        const eodBrokerClean = botMeta.eod_broker_clean !== false && Number(botMeta.eod_broker_open_positions || 0) === 0 && Number(botMeta.eod_broker_open_sl || 0) === 0;
         const eodBanner = botMeta.eod_banner ? String(botMeta.eod_banner) : '';
         const portfolioSlHalt = stratVals.length > 0 && stratVals.every(s => s.status === 'CLOSED')
           && stratVals.some(s => String(s.message || '').includes('Portfolio SL hit'));
         const allDisabled = stratVals.length > 0 && stratVals.every(s => s.status === 'DISABLED');
         const dashBanner = document.getElementById('dash-disabled-banner');
         if (eodHalt && eodBanner && dashBanner) {
-          dashBanner.innerHTML = '<div class="disabled-banner">' + escHtml(eodBanner) + '</div>';
+          const eodCls = (eodVerifyActive && !eodBrokerClean) ? 'warn-box' : 'disabled-banner';
+          dashBanner.innerHTML = '<div class="' + eodCls + '">' + escHtml(eodBanner) + '</div>';
         } else if (portfolioSlHalt && dashBanner) {
           dashBanner.innerHTML = '<div class="disabled-banner">Trading halted: portfolio stop-loss hit. Strategies are closed in state. The main loop may still run (see Scheduler health below).</div>';
         } else if (allDisabled) {
@@ -1684,11 +1687,14 @@ HTML_TEMPLATE = """
 
       const botMeta = data.bot || {};
       const eodHalt = !!botMeta.eod_halt;
+      const eodVerifyActive = !!botMeta.eod_verify_active;
+      const eodBrokerClean = botMeta.eod_broker_clean !== false && Number(botMeta.eod_broker_open_positions || 0) === 0 && Number(botMeta.eod_broker_open_sl || 0) === 0;
       const eodBanner = botMeta.eod_banner ? String(botMeta.eod_banner) : '';
       const allDisabled = Object.values(strategies).length > 0 && Object.values(strategies).every(s => s.status === 'DISABLED');
       const bannerEl = document.getElementById('disabled-banner');
       if (eodHalt && eodBanner && bannerEl) {
-        bannerEl.innerHTML = '<div class="disabled-banner">' + escHtml(eodBanner) + '</div>';
+        const eodCls = (eodVerifyActive && !eodBrokerClean) ? 'warn-box' : 'disabled-banner';
+        bannerEl.innerHTML = '<div class="' + eodCls + '">' + escHtml(eodBanner) + '</div>';
       } else if (allDisabled) {
         bannerEl.innerHTML = '<div class="disabled-banner">Trading is disabled today (non-expiry day). No strategies will be executed.</div>';
       } else {
@@ -1718,6 +1724,10 @@ HTML_TEMPLATE = """
       Object.values(strategies).forEach((s) => {
         const row = document.createElement('tr');
         const mtmClass = s.mtm < 0 ? 'negative' : 'positive';
+        let statusLabel = s.status || '-';
+        if (eodVerifyActive && !eodBrokerClean && (s.status === 'OPEN' || s.status === 'CLOSING')) {
+          statusLabel = s.status + ' (EOD closing…)';
+        }
         row.innerHTML = `
           <td>${s.name}</td>
           <td>${s.time}</td>
@@ -1725,7 +1735,7 @@ HTML_TEMPLATE = """
           <td>${s.leg_sl_pct}</td>
           <td>${s.leg_target_pct != null ? s.leg_target_pct : '-'}</td>
           <td>${fmt(s.strategy_sl)}</td>
-          <td>${s.status || '-'}</td>
+          <td>${statusLabel}</td>
           <td class="${mtmClass}">${fmt(s.mtm)}</td>
           <td>${s.strike || '-'}</td>
         `;

@@ -229,6 +229,17 @@ def init_db() -> None:
             cursor.execute("ALTER TABLE strategies ADD COLUMN next_gatekeeper_check_at REAL")
         if "skip_reason" not in strat_cols:
             cursor.execute("ALTER TABLE strategies ADD COLUMN skip_reason TEXT")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_tracked_instruments (
+                execution_date TEXT NOT NULL,
+                instrument_id INTEGER NOT NULL,
+                strategy_name TEXT,
+                source TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (execution_date, instrument_id)
+            )
+        """)
         
         # Positions table - stores entry/exit positions per strategy
         cursor.execute("""
@@ -527,6 +538,70 @@ def mark_strategy_skipped_volatility_db(strategy_id: int, strategy_name: str, sk
         logger.error("mark_strategy_skipped_volatility_db failed: %s", e)
 
 
+def register_bot_instrument(
+    instrument_id: int,
+    strategy_name: str,
+    source: str,
+) -> None:
+    """Persist instrument ID for EOD square-off (survives restart; includes hedges)."""
+    try:
+        iid = int(instrument_id)
+    except (TypeError, ValueError):
+        return
+    if iid <= 0:
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO bot_tracked_instruments
+            (execution_date, instrument_id, strategy_name, source)
+            VALUES (?, ?, ?, ?)
+            """,
+            (get_ist_date(), iid, str(strategy_name or ""), str(source or "")[:32]),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error("register_bot_instrument failed: %s", e)
+
+
+def load_bot_tracked_instrument_ids_for_today() -> set:
+    """Instrument IDs registered today (orders, positions, hedges) for EOD tracking."""
+    ids: set = set()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        today = get_ist_date()
+        cursor.execute(
+            "SELECT instrument_id FROM bot_tracked_instruments WHERE execution_date = ?",
+            (today,),
+        )
+        for row in cursor.fetchall():
+            try:
+                ids.add(int(row[0]))
+            except (TypeError, ValueError):
+                continue
+        cursor.execute(
+            """
+            SELECT DISTINCT instrument_id FROM orders
+            WHERE instrument_id IS NOT NULL AND instrument_id > 0
+              AND created_at >= ? AND created_at < ?
+            """,
+            (f"{today} 00:00:00", f"{today} 23:59:59"),
+        )
+        for row in cursor.fetchall():
+            try:
+                ids.add(int(row[0]))
+            except (TypeError, ValueError):
+                continue
+        conn.close()
+    except Exception as e:
+        logger.error("load_bot_tracked_instrument_ids_for_today failed: %s", e)
+    return ids
+
+
 def log_position(
     strategy_id: int,
     symbol: str,
@@ -536,18 +611,30 @@ def log_position(
     entry_time: str,
 ) -> None:
     """Log entry position."""
+    strategy_name = ""
     try:
         conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO positions 
+        cursor.execute(
+            "SELECT strategy_name FROM strategies WHERE id = ?",
+            (int(strategy_id),),
+        )
+        row = cursor.fetchone()
+        if row:
+            strategy_name = str(row["strategy_name"] or "")
+        cursor.execute(
+            """
+            INSERT INTO positions
             (strategy_id, symbol, instrument_id, quantity, entry_price, entry_time)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (strategy_id, symbol, instrument_id, quantity, entry_price, entry_time))
-        
+            """,
+            (strategy_id, symbol, instrument_id, quantity, entry_price, entry_time),
+        )
         conn.commit()
         conn.close()
+        if strategy_name:
+            register_bot_instrument(int(instrument_id), strategy_name, "position")
     except Exception as e:
         logger.error(f"Failed to log position: {e}")
 
@@ -576,6 +663,14 @@ def log_order(
         
         conn.commit()
         conn.close()
+        tag_s = str(order_tag or "")
+        if "_HEDGE_" in tag_s:
+            src = "hedge"
+        elif "_SL_" in tag_s:
+            src = "sl"
+        else:
+            src = "order"
+        register_bot_instrument(int(instrument_id), strategy_name, src)
     except Exception as e:
         logger.error(f"Failed to log order: {e}")
 

@@ -3,15 +3,19 @@ from __future__ import annotations
 
 import datetime
 import re
-from typing import Optional, Set, Tuple
+import time
+from typing import Dict, Optional, Set, Tuple
 
-from config import EOD_SQUAREOFF_TIME, EOD_VERIFY_UNTIL
+from config import EOD_CLOSE_STALE_RETRY_SEC, EOD_SQUAREOFF_TIME, EOD_VERIFY_UNTIL
 from db import get_ist_now
 from trading.context import STRATEGY_STATE
 
 _EOD_HALT: bool = False
 _EOD_VERIFY_ACTIVE: bool = False
 _EOD_BANNER: Optional[str] = None
+_EOD_CLOSE_PENDING: Dict[int, dict] = {}
+_EOD_BROKER_OPEN_POSITIONS: int = 0
+_EOD_BROKER_OPEN_SL: int = 0
 
 _OPEN_ORDER_STATUSES = frozenset(
     {"NEW", "REPLACED", "PENDING", "PARTIALLYFILLED", "OPEN", "TRIGGERPENDING"}
@@ -88,15 +92,60 @@ def mark_eod_verify_complete(message: str) -> None:
 
 def reset_eod_state() -> None:
     """Test helper: clear in-process EOD flags."""
-    global _EOD_HALT, _EOD_VERIFY_ACTIVE, _EOD_BANNER
+    global _EOD_HALT, _EOD_VERIFY_ACTIVE, _EOD_BANNER, _EOD_CLOSE_PENDING
+    global _EOD_BROKER_OPEN_POSITIONS, _EOD_BROKER_OPEN_SL
     _EOD_HALT = False
     _EOD_VERIFY_ACTIVE = False
     _EOD_BANNER = None
+    _EOD_CLOSE_PENDING = {}
+    _EOD_BROKER_OPEN_POSITIONS = 0
+    _EOD_BROKER_OPEN_SL = 0
+
+
+def eod_broker_exposure_counts() -> Tuple[int, int]:
+    """Last counted open broker positions / SL orders during EOD verify."""
+    return _EOD_BROKER_OPEN_POSITIONS, _EOD_BROKER_OPEN_SL
+
+
+def set_eod_broker_exposure_counts(open_positions: int, open_sl: int) -> None:
+    global _EOD_BROKER_OPEN_POSITIONS, _EOD_BROKER_OPEN_SL
+    _EOD_BROKER_OPEN_POSITIONS = int(open_positions)
+    _EOD_BROKER_OPEN_SL = int(open_sl)
+
+
+def should_place_eod_close(instrument_id: int, signed_qty: int) -> bool:
+    """Skip duplicate EOD close while broker still shows the same signed exposure (pending fill)."""
+    if signed_qty == 0:
+        return False
+    prev = _EOD_CLOSE_PENDING.get(int(instrument_id))
+    if not prev:
+        return True
+    if int(prev.get("signed_qty") or 0) != int(signed_qty):
+        return True
+    placed_at = float(prev.get("placed_at") or 0)
+    return (time.time() - placed_at) >= float(EOD_CLOSE_STALE_RETRY_SEC)
+
+
+def record_eod_close_placed(instrument_id: int, signed_qty: int) -> None:
+    _EOD_CLOSE_PENDING[int(instrument_id)] = {
+        "signed_qty": int(signed_qty),
+        "placed_at": time.time(),
+    }
+
+
+def note_eod_position_flat(instrument_id: int) -> None:
+    _EOD_CLOSE_PENDING.pop(int(instrument_id), None)
 
 
 def collect_bot_tracked_instrument_ids() -> Set[int]:
-    """Instrument IDs the bot opened today (straddle legs, hedges, SL map)."""
+    """Instrument IDs the bot opened today (straddle legs, hedges, SL map, DB registry)."""
     ids: Set[int] = set()
+    try:
+        from db import load_bot_tracked_instrument_ids_for_today
+
+        ids.update(load_bot_tracked_instrument_ids_for_today())
+    except Exception:
+        pass
     for strategy in STRATEGY_STATE.values():
         for raw in strategy.get("instrument_ids") or []:
             try:
@@ -152,13 +201,15 @@ def is_cancellable_order_status(status: str) -> bool:
 def count_remaining_bot_exposure(
     broker_positions: list,
     order_book: list,
+    *,
+    eod_verify: bool = False,
 ) -> Tuple[int, int]:
     """
     Count open bot positions and cancellable SL orders still on the book.
-    If strategy state has no instrument IDs, count all non-zero broker positions.
+    During EOD verify, count all non-zero broker positions (not only in-memory IDs).
     """
     bot_ids = collect_bot_tracked_instrument_ids()
-    count_all_positions = not bot_ids
+    count_all_positions = bool(eod_verify) or not bot_ids
     open_positions = 0
     for pos in broker_positions or []:
         try:

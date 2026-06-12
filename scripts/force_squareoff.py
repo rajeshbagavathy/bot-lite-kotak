@@ -86,18 +86,31 @@ def main() -> int:
             qty = int(pos.get("Quantity") or 0)
         except (TypeError, ValueError):
             qty = 0
-        if qty == 0:
-            continue
         try:
             iid = int(pos.get("ExchangeInstrumentId") or 0)
         except (TypeError, ValueError):
             iid = 0
+        if qty == 0:
+            if not args.dry_run:
+                from trading.eod import note_eod_position_flat
+
+                note_eod_position_flat(iid)
+            continue
         if not use_all and iid not in bot_ids:
             continue
+        if not args.dry_run:
+            from trading.eod import should_place_eod_close, record_eod_close_placed
+
+            if not should_place_eod_close(iid, qty):
+                print(f"SKIP (pending fill)  id={iid} qty={qty}")
+                continue
         sym = pos.get("TradingSymbol") or iid
         print(f"CLOSE  qty={qty}  id={iid}  symbol={sym}  product={pos.get('ProductType')}")
         if not args.dry_run:
+            from trading.eod import record_eod_close_placed
+
             _place_close_order(client, index_config, pos, "FORCE_SQ")
+            record_eod_close_placed(iid, qty)
             closed += 1
             time.sleep(0.3)
 

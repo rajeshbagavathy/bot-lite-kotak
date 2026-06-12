@@ -217,6 +217,8 @@ EOD_SQUAREOFF_TIME = os.getenv("EOD_SQUAREOFF_TIME", "15:10")
 # Hard stop for EOD retry loop (IST). Retries run from EOD_SQUAREOFF_TIME until this time (exclusive).
 EOD_VERIFY_UNTIL = os.getenv("EOD_VERIFY_UNTIL", "15:19")
 EOD_VERIFY_INTERVAL_SEC = int(os.getenv("EOD_VERIFY_INTERVAL_SEC", "15"))
+# Re-place EOD close on same signed qty only after this many seconds (broker position lag).
+EOD_CLOSE_STALE_RETRY_SEC = int(os.getenv("EOD_CLOSE_STALE_RETRY_SEC", "45"))
 # Set to True to enable trading on non-expiry days; False disables all strategies on non-expiry.
 TRADE_NON_EXPIRY_DAY = os.getenv("TRADE_NON_EXPIRY_DAY", "True").lower() in ("true", "1", "yes")
 

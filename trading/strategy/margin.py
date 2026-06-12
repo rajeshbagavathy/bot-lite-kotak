@@ -23,6 +23,7 @@ from state import update_portfolio_margin
 from trading.compat import resolve
 from trading.journal import Phase, record as journal
 from trading.strategy.strikes import find_hedge_by_target_premium
+from db import log_order
 from trading.state_bridge import update_strategy
 from trading.utils import (
     _hedge_qty_from_orders,
@@ -214,6 +215,7 @@ def ensure_margin_or_skip_strategy(
                     order_rec = {"app_order_id": oid, "tag": tag, "instrument_id": iid, "quantity": qty, "side": side}
                     placed_now.append(order_rec)
                     all_hedge_orders.append(order_rec)
+                    log_order(name, int(oid), tag, iid, "", int(qty), "MARKET", "BUY")
                     if side == "PE":
                         strat_pe += int(qty)
                     elif side == "CE":

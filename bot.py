@@ -85,6 +85,7 @@ from trading.eod import (
     collect_bot_tracked_instrument_ids,
     count_remaining_bot_exposure as _count_remaining_bot_exposure_from_book,
     eod_banner_message,
+    eod_broker_exposure_counts,
     eod_squareoff_schedule_at,
     eod_verify_active,
     is_at_or_past_eod_time,
@@ -95,7 +96,11 @@ from trading.eod import (
     is_within_eod_retry_window,
     mark_eod_halt_started,
     mark_eod_verify_complete,
+    note_eod_position_flat,
+    record_eod_close_placed,
     set_eod_banner,
+    set_eod_broker_exposure_counts,
+    should_place_eod_close,
 )
 
 from config import (
@@ -1039,20 +1044,33 @@ def _square_off_all(client: Any, index_config, positions: List[dict], reason: st
 
 
 def _update_eod_banner_state() -> None:
+    open_pos, open_sl = eod_broker_exposure_counts()
     set_bot_runtime_flags(
         eod_halt=is_eod_halt(),
+        eod_verify_active=eod_verify_active(),
         eod_banner=eod_banner_message(),
         eod_squareoff_time=EOD_SQUAREOFF_TIME,
+        eod_verify_until=EOD_VERIFY_UNTIL,
+        eod_broker_open_positions=open_pos,
+        eod_broker_open_sl=open_sl,
+        eod_broker_clean=(open_pos == 0 and open_sl == 0),
     )
 
 
 def _square_off_bot_positions(
-    client: Any, index_config, broker_positions: List[dict], reason: str
+    client: Any,
+    index_config,
+    broker_positions: List[dict],
+    reason: str,
+    *,
+    eod_mode: bool = False,
 ) -> int:
     """Market-close broker rows for instruments the bot opened (not manual/other F&O)."""
     bot_ids = collect_bot_tracked_instrument_ids()
-    square_all = not bot_ids
-    if square_all:
+    square_all = bool(eod_mode) or not bot_ids
+    if square_all and eod_mode:
+        logger.debug("EOD: squaring all non-zero broker positions (tracked IDs=%d)", len(bot_ids))
+    elif square_all:
         logger.warning(
             "EOD: no bot-tracked instrument IDs in memory — squaring off ALL non-zero positions"
         )
@@ -1069,9 +1087,21 @@ def _square_off_bot_positions(
         except (TypeError, ValueError):
             qty = 0
         if qty == 0:
+            if eod_mode:
+                note_eod_position_flat(iid)
+            continue
+        if eod_mode and not should_place_eod_close(iid, qty):
+            logger.info(
+                "EOD skip duplicate close %s: instrument %s qty %s (pending fill)",
+                reason,
+                iid,
+                qty,
+            )
             continue
         logger.warning("EOD square-off %s: instrument %s qty %s", reason, iid, qty)
         _place_close_order(client, index_config, pos, "EOD_SQ")
+        if eod_mode:
+            record_eod_close_placed(iid, qty)
         placed += 1
     return placed
 
@@ -1119,7 +1149,10 @@ def _cancel_bot_open_sl_orders(client: Any, order_book: Optional[List[dict]] = N
 
 
 def _count_remaining_bot_exposure(
-    client: Any, order_book: Optional[List[dict]] = None
+    client: Any,
+    order_book: Optional[List[dict]] = None,
+    *,
+    eod_verify: bool = False,
 ) -> Tuple[int, int]:
     try:
         broker_positions = client.get_positions()
@@ -1132,7 +1165,20 @@ def _count_remaining_bot_exposure(
         except Exception:
             logger.exception("EOD verify: get_order_book failed")
             order_book = []
-    return _count_remaining_bot_exposure_from_book(broker_positions, order_book)
+    open_pos, open_sl = _count_remaining_bot_exposure_from_book(
+        broker_positions, order_book, eod_verify=eod_verify
+    )
+    if eod_verify:
+        set_eod_broker_exposure_counts(open_pos, open_sl)
+    return open_pos, open_sl
+
+
+def _finish_eod_verify(reason: str, client: Any, message: str) -> None:
+    """Stop EOD retries and finalize strategy UI state only after broker check."""
+    mark_eod_verify_complete(message)
+    _finalize_eod_strategy_states(reason)
+    _count_remaining_bot_exposure(client, eod_verify=True)
+    _update_eod_banner_state()
 
 
 def _finalize_eod_strategy_states(reason: str) -> None:
@@ -1227,20 +1273,23 @@ def _eod_squareoff_and_cleanup(client: Any, index_config) -> None:
     except Exception:
         logger.exception("EOD: failed to fetch order book")
         order_book = []
-    closed = _square_off_bot_positions(client, index_config, positions, reason)
+    closed = _square_off_bot_positions(
+        client, index_config, positions, reason, eod_mode=True
+    )
     cancelled = _cancel_bot_open_sl_orders(client, order_book=order_book)
-    _finalize_eod_strategy_states(reason)
     logger.warning("EOD pass: placed %s close order(s), cancelled %s SL order(s)", closed, cancelled)
-    open_pos, open_sl = _count_remaining_bot_exposure(client, order_book=None)
+    open_pos, open_sl = _count_remaining_bot_exposure(client, order_book=None, eod_verify=True)
     if open_pos == 0 and open_sl == 0:
-        mark_eod_verify_complete(
-            f"{reason} complete. Bot positions closed and SL orders cancelled."
+        _finish_eod_verify(
+            reason,
+            client,
+            f"{reason} complete. Bot positions closed and SL orders cancelled.",
         )
     else:
         set_eod_banner(
             f"{reason}: {open_pos} position(s) and {open_sl} SL order(s) still open — retrying…"
         )
-    _update_eod_banner_state()
+        _update_eod_banner_state()
 
 
 def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
@@ -1256,31 +1305,34 @@ def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
             return
         now = get_ist_now()
         if is_at_or_past_eod_verify_until(now):
-            open_pos, open_sl = _count_remaining_bot_exposure(client)
+            open_pos, open_sl = _count_remaining_bot_exposure(client, eod_verify=True)
+            reason = f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST)"
             if open_pos or open_sl:
-                mark_eod_verify_complete(
-                    f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST): "
-                    f"{open_pos} position(s) and {open_sl} SL order(s) still open — check broker manually."
+                _finish_eod_verify(
+                    reason,
+                    client,
+                    f"{reason}: {open_pos} position(s) and {open_sl} SL order(s) still open — check broker manually.",
                 )
             else:
-                mark_eod_verify_complete(
-                    f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST) complete. "
-                    "Bot positions closed and SL orders cancelled."
+                _finish_eod_verify(
+                    reason,
+                    client,
+                    f"{reason} complete. Bot positions closed and SL orders cancelled.",
                 )
-            _update_eod_banner_state()
             return
         if not is_within_eod_retry_window(now):
             return
         if time.time() - _EOD_LAST_VERIFY_TS < float(EOD_VERIFY_INTERVAL_SEC):
             return
         _EOD_LAST_VERIFY_TS = time.time()
-        open_pos, open_sl = _count_remaining_bot_exposure(client)
+        open_pos, open_sl = _count_remaining_bot_exposure(client, eod_verify=True)
         if open_pos == 0 and open_sl == 0:
-            mark_eod_verify_complete(
+            _finish_eod_verify(
+                f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST)",
+                client,
                 f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST) complete. "
-                "Bot positions closed and SL orders cancelled."
+                "Bot positions closed and SL orders cancelled.",
             )
-            _update_eod_banner_state()
             return
         try:
             positions = client.get_positions()
@@ -1288,9 +1340,11 @@ def _maybe_run_eod_squareoff(client: Any, index_config) -> None:
         except Exception:
             logger.exception("EOD verify retry failed")
             return
-        _square_off_bot_positions(client, index_config, positions, "EOD verify retry")
+        _square_off_bot_positions(
+            client, index_config, positions, "EOD verify retry", eod_mode=True
+        )
         _cancel_bot_open_sl_orders(client, order_book=order_book)
-        open_pos, open_sl = _count_remaining_bot_exposure(client)
+        open_pos, open_sl = _count_remaining_bot_exposure(client, eod_verify=True)
         set_eod_banner(
             f"EOD square-off ({EOD_SQUAREOFF_TIME}–{EOD_VERIFY_UNTIL} IST): "
             f"{open_pos} position(s) and {open_sl} SL order(s) still open — retrying…"
