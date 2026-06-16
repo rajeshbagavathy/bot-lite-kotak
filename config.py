@@ -247,7 +247,7 @@ HEDGE_QTY_MULTIPLIER_EXPIRY = float(os.getenv("HEDGE_QTY_MULTIPLIER_EXPIRY", "2.
 HEDGE_QTY_MULTIPLIER_NON_EXPIRY = float(os.getenv("HEDGE_QTY_MULTIPLIER_NON_EXPIRY", "1.5"))
 # Before each straddle, buy far-OTM PE+CE hedges for this entry (incremental vs existing hedges).
 HEDGE_ON_EVERY_STRATEGY = os.getenv("HEDGE_ON_EVERY_STRATEGY", "True").lower() in ("true", "1", "yes")
-# ITM strikes away from ATM for expiry days (NIFTY: 2 → 25100 CE / 25300 PE @ spot 25200; SENSEX: 3). Non-expiry uses ATM.
+# Legacy (unused): fixed ITM offset on expiry was replaced by premium-based strike selection.
 ITM_STRIKES_NIFTY = int(os.getenv("ITM_STRIKES_NIFTY", "1"))
 ITM_STRIKES_SENSEX = int(os.getenv("ITM_STRIKES_SENSEX", "2"))
 # Leg SL % on non-expiry day (override per-strategy); expiry uses strategy leg_sl_pct.
@@ -260,9 +260,9 @@ LEG_TARGET_PCT_NON_EXPIRY = float(os.getenv("LEG_TARGET_PCT_NON_EXPIRY", "50.0")
 # Fractional buffer for market-style LIMIT orders (e.g. 0.01 = 1%). BUY: LTP*(1+s), SELL: LTP*(1-s).
 MARKETABLE_LIMIT_SLIPPAGE_PCT = float(os.getenv("MARKETABLE_LIMIT_SLIPPAGE_PCT", "0.01"))
 
-# Premium-based straddle strike selection (optional). If set, CE/PE strikes are chosen by option LTP, not ATM.
+# Premium-based straddle strike selection (default on expiry and non-expiry days).
 # NIFTY: target 100, buffer 15 → allowed range 85–115. SENSEX: target 300, buffer 40 → 260–340.
-# Within range, the strike with premium closest to target is picked. If no strike in range, strategy is skipped.
+# Within range, the strike with premium closest to target is picked. If no strike in range, strategy retries in calm window.
 USE_PREMIUM_BASED_STRIKE = os.getenv("USE_PREMIUM_BASED_STRIKE", "True").lower() in ("true", "1", "yes")
 STRIKE_PREMIUM_TARGET_NIFTY = float(os.getenv("STRIKE_PREMIUM_TARGET_NIFTY", "100"))
 STRIKE_PREMIUM_BUFFER_NIFTY = float(os.getenv("STRIKE_PREMIUM_BUFFER_NIFTY", "15"))

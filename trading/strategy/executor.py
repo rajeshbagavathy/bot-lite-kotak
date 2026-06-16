@@ -10,8 +10,6 @@ from config import (
     CALM_ZONE_GATEKEEPER_POLL_SECONDS,
     CALM_ZONE_WAIT_TIMEOUT_MINUTES,
     EOD_SQUAREOFF_TIME,
-    ITM_STRIKES_NIFTY,
-    ITM_STRIKES_SENSEX,
     STRIKE_PREMIUM_BUFFER_NIFTY,
     STRIKE_PREMIUM_BUFFER_SENSEX,
     STRIKE_PREMIUM_TARGET_NIFTY,
@@ -184,8 +182,7 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
         update_strategy(name, status="ERROR", message="Spot LTP unavailable")
         return
 
-    strike_diff = int(index_config.strike_diff)
-    use_premium_strike = get_trading_flag_or("use_premium_based_strike", USE_PREMIUM_BASED_STRIKE) and not is_expiry
+    use_premium_strike = get_trading_flag_or("use_premium_based_strike", USE_PREMIUM_BASED_STRIKE)
     if use_premium_strike:
         if index_config.name == "NIFTY":
             target, buffer = STRIKE_PREMIUM_TARGET_NIFTY, STRIKE_PREMIUM_BUFFER_NIFTY
@@ -217,12 +214,7 @@ def _execute_strategy_locked(client: Any, index_config, expiry: str, strategy, f
         ce_strike, ce_id = ce_result
         pe_strike, pe_id = pe_result
     else:
-        if is_expiry:
-            n = int(ITM_STRIKES_SENSEX) if index_config.name == "SENSEX" else int(ITM_STRIKES_NIFTY)
-            ce_strike = atm_strike - n * strike_diff
-            pe_strike = atm_strike + n * strike_diff
-        else:
-            ce_strike = pe_strike = atm_strike
+        ce_strike = pe_strike = atm_strike
         ce_id = client.get_option_instrument_id(index_config, expiry, "CE", ce_strike)
         pe_id = client.get_option_instrument_id(index_config, expiry, "PE", pe_strike)
         if not ce_id or not pe_id:

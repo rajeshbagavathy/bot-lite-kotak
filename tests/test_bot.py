@@ -348,10 +348,11 @@ class TestExecuteStrategy(unittest.TestCase):
         mock_update.assert_called_once_with("S0920", status="ERROR", message="Spot LTP unavailable")
 
     @patch("bot.should_execute_now", return_value=(True, "calm", {}))
+    @patch("trading.strategy.executor.get_trading_flag_or", return_value=False)
     @patch("bot.fetch_last_two_spot_bar_rows")
     @patch("bot.update_strategy")
     @patch("bot._get_atm_strike")
-    def test_option_instruments_not_found(self, mock_get_atm, mock_update, mock_two, _mock_gate):
+    def test_option_instruments_not_found(self, mock_get_atm, mock_update, mock_two, _flag, _mock_gate):
         """Test error handling when option instruments not found."""
         mock_two.return_value = [
             {"bar_time": "2026-04-08 09:20:00", "bar_unix": 1, "is_calmzone": 1},

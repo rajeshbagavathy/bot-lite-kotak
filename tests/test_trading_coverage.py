@@ -461,7 +461,8 @@ class TestExecutorCoverage(unittest.TestCase):
     @patch("bot.should_execute_now", return_value=(True, "calm", {}))
     @patch("bot._get_atm_strike", return_value=22000)
     @patch("trading.strategy.executor.is_expiry_day", return_value=True)
-    @patch("trading.strategy.executor.ITM_STRIKES_NIFTY", 1)
+    @patch("trading.strategy.executor.get_trading_flag_or", return_value=True)
+    @patch("trading.strategy.executor.find_strike_by_premium")
     @patch("bot._ensure_margin_or_skip_strategy", return_value=True)
     @patch("trading.strategy.executor.complete_entry_with_sl_protection")
     @patch("bot.update_strategy")
@@ -469,8 +470,8 @@ class TestExecutorCoverage(unittest.TestCase):
     @patch("trading.strategy.executor.log_order")
     @patch("time.time", return_value=1)
     @patch("time.sleep")
-    def test_execute_expiry_itm_path(self, _sleep, _time, _log, _log_strat, _upd, mock_prot, *_):
-        self.client.get_option_instrument_id.side_effect = [11, 22]
+    def test_execute_expiry_premium_path(self, _sleep, _time, _log, _log_strat, _upd, mock_prot, _margin, mock_find, *_):
+        mock_find.side_effect = [(21950, 11), (22050, 22)]
         self.client.get_ltp_map.return_value = {11: 1.0, 22: 1.0}
         self.client.place_market_order.side_effect = [1001, 1002]
         mock_prot.return_value = SlProtectionResult(ok=True, sl_orders=[], positions=[], sl_tag_map={})
@@ -479,6 +480,8 @@ class TestExecutorCoverage(unittest.TestCase):
             {"name": "S", "status": "PENDING", "time": "09:00:00", "lots": 1, "leg_sl_pct": 20},
             force=True,
         )
+        self.assertEqual(mock_find.call_count, 2)
+        self.assertEqual(self.client.place_market_order.call_count, 2)
 
     @patch("bot.should_execute_now", return_value=(False, "volatile", {"bar_time": "t"}))
     @patch("bot._get_atm_strike", return_value=22000)
