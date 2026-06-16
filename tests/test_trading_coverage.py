@@ -223,6 +223,22 @@ class TestStrikesCoverage(unittest.TestCase):
         out = find_strike_by_premium(self.client, self.cfg, "12FEB2026", "CE", 22000, 150, 100, 200, max_steps=1)
         self.assertEqual(out, (22000, 103))
 
+    def test_find_strike_uses_live_ltp_not_stale_chain(self):
+        """Stale chain LTP must not override live quotes (regression: CE sold @ ₹81 while band floor is ₹85)."""
+        ids = {22000: 101, 22050: 102, 21950: 103}
+        self.client.get_option_instrument_id.side_effect = lambda _cfg, _exp, _ot, strike: ids.get(int(strike))
+
+        def _stale_chain(*_args, **_kwargs):
+            return {("CE", 22000): 100.0, ("CE", 22050): 100.0}
+
+        self.client.chain_ltp_map = _stale_chain
+        self.client.get_ltp_map.return_value = {101: 81.0, 102: 97.0, 103: 120.0}
+        out = find_strike_by_premium(
+            self.client, self.cfg, "12FEB2026", "CE", 22000, 100, 85, 115, max_steps=1
+        )
+        self.assertEqual(out, (22050, 102))
+        self.client.get_ltp_map.assert_called()
+
     def test_find_hedge_uses_token_meta_hint(self):
         client = MagicMock()
         client._token_meta = {77: {"ltp_hint": 5.0, "trdSym": "NIFTYPE"}}

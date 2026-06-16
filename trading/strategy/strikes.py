@@ -202,9 +202,13 @@ def find_strike_by_premium(
     max_premium: float,
     max_steps: int = 30,
 ) -> Optional[Tuple[int, int]]:
+    """
+    Pick strike whose live option LTP is within [min_premium, max_premium] and closest to target.
+
+    Always uses batched live quotes — not scrip-search / chain-cache LTP hints (those are stale).
+    """
     strike_diff = int(index_config.strike_diff)
     ot = option_type.upper()
-    chain_ltps = _chain_ltp_lookup(client, index_config, expiry)
     strikes_to_check: List[int] = [atm_strike]
     for i in range(1, max_steps + 1):
         strikes_to_check.append(atm_strike + i * strike_diff)
@@ -216,44 +220,56 @@ def find_strike_by_premium(
             candidates.append((strike, int(instrument_id)))
     if not candidates:
         return None
-    need_quote: List[Tuple[int, int]] = []
-    best: Optional[Tuple[float, int, int]] = None
+
+    ltp_by_id = _batch_quote_ltps(client, index_config, [iid for _, iid in candidates])
+
+    best: Optional[Tuple[float, int, int, float]] = None
     for strike, instrument_id in candidates:
-        ltp = chain_ltps.get((ot, int(strike)))
-        if ltp is None:
-            ltp = _option_ltp_hint(client, instrument_id)
-        if ltp is None:
-            need_quote.append((strike, instrument_id))
-            continue
-        try:
-            ltp_val = float(ltp)
-        except (TypeError, ValueError):
+        ltp_val = ltp_by_id.get(instrument_id)
+        if ltp_val is None:
             continue
         if not (min_premium <= ltp_val <= max_premium):
             continue
         diff = abs(ltp_val - target_premium)
         if best is None or diff < best[0]:
-            best = (diff, strike, instrument_id)
-    if need_quote and best is None:
-        instruments = [
-            {"exchangeSegment": index_config.option_ltp_segment, "exchangeInstrumentID": iid}
-            for _, iid in need_quote
-        ]
-        ltp_map = client.get_ltp_map(instruments)
-        for strike, instrument_id in need_quote:
-            ltp = ltp_map.get(instrument_id)
-            if ltp is None:
-                continue
-            try:
-                ltp_val = float(ltp)
-            except (TypeError, ValueError):
-                continue
-            if not (min_premium <= ltp_val <= max_premium):
-                continue
-            diff = abs(ltp_val - target_premium)
-            if best is None or diff < best[0]:
-                best = (diff, strike, instrument_id)
+            best = (diff, strike, instrument_id, ltp_val)
+
     if best is None:
+        in_band = [
+            ltp_by_id[i]
+            for _, i in candidates
+            if i in ltp_by_id and min_premium <= ltp_by_id[i] <= max_premium
+        ]
+        sample = [
+            round(ltp_by_id[i], 2)
+            for _, i in candidates[:8]
+            if i in ltp_by_id
+        ]
+        logger.warning(
+            "No %s strike in ₹%.1f–₹%.1f within %d steps of ATM %s "
+            "(candidates=%d, quoted=%d, in_band=%d, sample_ltps=%s)",
+            ot,
+            min_premium,
+            max_premium,
+            max_steps,
+            atm_strike,
+            len(candidates),
+            len(ltp_by_id),
+            len(in_band),
+            sample,
+        )
         return None
-    _, strike, instrument_id = best
+
+    diff, strike, instrument_id, ltp_val = best
+    logger.info(
+        "Premium strike %s %s: live LTP=₹%.2f (target ₹%.0f, |diff|=₹%.2f, band ₹%.0f–₹%.0f, ATM %s)",
+        ot,
+        strike,
+        ltp_val,
+        target_premium,
+        diff,
+        min_premium,
+        max_premium,
+        atm_strike,
+    )
     return (strike, instrument_id)
